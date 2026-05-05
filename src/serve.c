@@ -1,14 +1,19 @@
 #include "common.h"
 #include "storage.h"
+#include "db.h"
+#include "zstream.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <getopt.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <sys/wait.h>
 #include <microhttpd.h>
 
 static char g_storage_root[ZEP_MAX_PATH] = "/var/lib/zep-air";
+static char g_db_path[ZEP_MAX_PATH]       = "/var/lib/zep-air/zep-air.db";
 static int  g_port = 8443;
 static char g_cert_path[ZEP_MAX_PATH] = "";
 static char g_key_path[ZEP_MAX_PATH] = "";
@@ -126,6 +131,128 @@ static char *read_file(const char *path, size_t *len) {
     return buf;
 }
 
+static void verify_snapshot(const char *cluster_key, const char *prefix) {
+    snapshot_meta_t meta;
+    memset(&meta, 0, sizeof(meta));
+
+    err_t ret = storage_read_meta(g_storage_root, cluster_key, prefix, &meta);
+    if (ret != ZEP_ERR_OK) return;
+
+    char *dir_path = NULL;
+    if (asprintf(&dir_path, "%s/%s/%s", g_storage_root, cluster_key, prefix) < 0) {
+        storage_meta_free(&meta);
+        return;
+    }
+
+    int found = 0;
+    for (int i = 0; i < meta.blob_count; i++) {
+        char *blob_path = NULL;
+        if (asprintf(&blob_path, "%s/%04d", dir_path, i) < 0) {
+            free(dir_path);
+            storage_meta_free(&meta);
+            return;
+        }
+        if (access(blob_path, R_OK) == 0) found++;
+        free(blob_path);
+    }
+
+    if (found < meta.blob_count) {
+        free(dir_path);
+        storage_meta_free(&meta);
+        return;
+    }
+
+    char *zst_path = NULL, *dec_path = NULL;
+    if (asprintf(&zst_path, "/tmp/zep-verify-%s.zst", prefix) < 0 ||
+        asprintf(&dec_path, "/tmp/zep-verify-%s.dec", prefix) < 0) {
+        free(dir_path);
+        free(zst_path);
+        storage_meta_free(&meta);
+        return;
+    }
+
+    FILE *zst = fopen(zst_path, "wb");
+    if (!zst) {
+        free(dir_path); free(zst_path); free(dec_path);
+        storage_meta_free(&meta); return;
+    }
+
+    for (int i = 0; i < meta.blob_count; i++) {
+        void *data = NULL;
+        size_t len = 0;
+        if (storage_read_blob(g_storage_root, cluster_key, prefix, i, &data, &len) != ZEP_ERR_OK) {
+            fclose(zst); unlink(zst_path);
+            free(dir_path); free(zst_path); free(dec_path);
+            storage_meta_free(&meta); return;
+        }
+        fwrite(data, 1, len, zst);
+        free(data);
+    }
+    fclose(zst);
+
+    char *cmd = NULL;
+    if (asprintf(&cmd, "zstd -d '%s' -o '%s' -f 2>/dev/null", zst_path, dec_path) < 0) {
+        unlink(zst_path);
+        free(dir_path); free(zst_path); free(dec_path);
+        storage_meta_free(&meta);
+        return;
+    }
+    int rc = system(cmd);
+    free(cmd);
+    if (rc != 0) {
+        unlink(zst_path);
+        free(dir_path); free(zst_path); free(dec_path);
+        storage_meta_free(&meta);
+        return;
+    }
+    unlink(zst_path);
+    free(zst_path);
+    free(dir_path);
+
+    FILE *dfp = fopen(dec_path, "rb");
+    if (!dfp) { unlink(dec_path); free(dec_path); storage_meta_free(&meta); return; }
+    fseek(dfp, 0, SEEK_END);
+    long dlen = ftell(dfp);
+    fseek(dfp, 0, SEEK_SET);
+    unsigned char *decomp = malloc((size_t)dlen);
+    if (!decomp) { fclose(dfp); unlink(dec_path); free(dec_path); storage_meta_free(&meta); return; }
+    fread(decomp, 1, (size_t)dlen, dfp);
+    fclose(dfp);
+    unlink(dec_path);
+    free(dec_path);
+
+    char toguid[ZEP_MAX_GUID_LEN] = {0};
+    char fromguid[ZEP_MAX_GUID_LEN] = {0};
+    ret = zstream_parse(decomp, (size_t)dlen, toguid, sizeof(toguid),
+                        fromguid, sizeof(fromguid));
+    free(decomp);
+
+    if (ret != ZEP_ERR_OK) {
+        fprintf(stderr, "verify: zstream_parse failed for %s/%s\n",
+                cluster_key, prefix);
+        storage_meta_free(&meta);
+        return;
+    }
+
+    sqlite3 *db = NULL;
+    if (db_open(g_db_path, &db) != ZEP_ERR_OK) {
+        storage_meta_free(&meta);
+        return;
+    }
+    db_init_tables(db);
+
+    const char *pusher = meta.host[0] ? meta.host : cluster_key;
+    db_chain_insert(db, cluster_key, toguid, fromguid, meta.snapshot, pusher);
+
+    if (g_verbose) {
+        printf("verify: cluster=%s toguid=%s fromguid=%s snap=%s\n",
+               cluster_key, toguid, fromguid, meta.snapshot);
+    }
+
+    db_close(db);
+    storage_meta_free(&meta);
+}
+
 static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                        const char *url, const char *method,
                                        const char *version, const char *upload_data,
@@ -180,6 +307,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     if (g_verbose) printf("PUT meta: %s/%s (%zu bytes)\n",
                                           ctx->prefix, "meta.json", ctx->body_len);
                     free(path);
+                    verify_snapshot(ctx->node, ctx->prefix);
                     return send_json(conn, 200, "{\"ok\":true}");
                 }
                 free(path);
@@ -198,6 +326,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 if (g_verbose) printf("PUT blob: %s/%04d (%zu bytes)\n",
                                        ctx->prefix, part, ctx->body_len);
                 free(path);
+                verify_snapshot(ctx->node, ctx->prefix);
                 return send_json(conn, 200, "{\"ok\":true}");
             }
             free(path);
@@ -295,6 +424,7 @@ static void usage_serve(const char *prog) {
     fprintf(stderr, "  -c, --cert FILE       TLS server certificate (PEM)\n");
     fprintf(stderr, "  -k, --key FILE        TLS server private key (PEM)\n");
     fprintf(stderr, "  -a, --ca FILE         CA certificate for client auth (optional)\n");
+    fprintf(stderr, "  -D, --db FILE         SQLite database path (default: /var/lib/zep-air/zep-air.db)\n");
     fprintf(stderr, "  -v, --verbose         Verbose output\n");
     fprintf(stderr, "  -h, --help            This help\n");
 }
@@ -306,19 +436,21 @@ int serve_main(int argc, char *argv[]) {
         {"cert",    required_argument, 0, 'c'},
         {"key",     required_argument, 0, 'k'},
         {"ca",      required_argument, 0, 'a'},
+        {"db",      required_argument, 0, 'D'},
         {"verbose", no_argument,       0, 'v'},
         {"help",    no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:vh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:D:vh", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'p': g_port = atoi(optarg); break;
             case 's': snprintf(g_storage_root, sizeof(g_storage_root), "%s", optarg); break;
             case 'c': snprintf(g_cert_path, sizeof(g_cert_path), "%s", optarg); break;
             case 'k': snprintf(g_key_path, sizeof(g_key_path), "%s", optarg); break;
             case 'a': snprintf(g_ca_path, sizeof(g_ca_path), "%s", optarg); break;
+            case 'D': snprintf(g_db_path, sizeof(g_db_path), "%s", optarg); break;
             case 'v': g_verbose = 1; break;
             case 'h': usage_serve(argv[0]); return 0;
             default:  usage_serve(argv[0]); return 1;

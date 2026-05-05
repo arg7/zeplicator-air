@@ -48,6 +48,15 @@ err_t db_init_tables(sqlite3 *db) {
         "  donor_node  TEXT NOT NULL,"
         "  blob_count  INTEGER NOT NULL,"
         "  stream_size INTEGER NOT NULL"
+        ");"
+        "CREATE TABLE IF NOT EXISTS cluster_chain ("
+        "  cluster_key TEXT NOT NULL,"
+        "  toguid      TEXT NOT NULL,"
+        "  fromguid    TEXT NOT NULL DEFAULT '0',"
+        "  snapshot    TEXT NOT NULL,"
+        "  pushed_by   TEXT NOT NULL,"
+        "  pushed_at   TEXT NOT NULL DEFAULT (datetime('now')),"
+        "  UNIQUE(cluster_key, toguid)"
         ");";
     char *err = NULL;
     int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
@@ -210,4 +219,66 @@ err_t db_list_pulled(sqlite3 *db, char ***guids, int *count) {
     *guids = list;
     *count = cnt;
     return ZEP_ERR_OK;
+}
+
+err_t db_chain_insert(sqlite3 *db, const char *cluster_key,
+                      const char *toguid, const char *fromguid,
+                      const char *snapshot, const char *pushed_by) {
+    const char *sql =
+        "INSERT OR IGNORE INTO cluster_chain "
+        "(cluster_key, toguid, fromguid, snapshot, pushed_by) "
+        "VALUES (?, ?, ?, ?, ?)";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_chain_insert: %s\n", sqlite3_errmsg(db));
+        return ZEP_ERR_DB;
+    }
+    sqlite3_bind_text(stmt, 1, cluster_key, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, toguid, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, fromguid, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 4, snapshot, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 5, pushed_by, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
+}
+
+err_t db_chain_latest(sqlite3 *db, const char *cluster_key,
+                      char *guid, size_t len) {
+    const char *sql =
+        "SELECT toguid FROM cluster_chain WHERE cluster_key = ? "
+        "ORDER BY rowid DESC LIMIT 1";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, cluster_key, -1, SQLITE_STATIC);
+    err_t ret = ZEP_ERR_NOT_FOUND;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        snprintf(guid, len, "%s", sqlite3_column_text(stmt, 0));
+        ret = ZEP_ERR_OK;
+    }
+    sqlite3_finalize(stmt);
+    return ret;
+}
+
+err_t db_chain_common(sqlite3 *db, const char *cluster_key,
+                      const char *client_guid,
+                      char *common_guid, size_t len) {
+    if (!client_guid || !client_guid[0] || strcmp(client_guid, "0") == 0)
+        return ZEP_ERR_NOT_FOUND;
+
+    const char *sql =
+        "SELECT toguid FROM cluster_chain WHERE cluster_key = ? AND toguid = ?";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, cluster_key, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, client_guid, -1, SQLITE_STATIC);
+    err_t ret = ZEP_ERR_NOT_FOUND;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        snprintf(common_guid, len, "%s", client_guid);
+        ret = ZEP_ERR_OK;
+    }
+    sqlite3_finalize(stmt);
+    return ret;
 }

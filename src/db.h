@@ -19,4 +19,13 @@ int   db_was_pulled(sqlite3 *db, const char *guid);
 err_t db_list_pushed(sqlite3 *db, char ***guids, int *count);
 err_t db_list_pulled(sqlite3 *db, char ***guids, int *count);
 
+err_t db_chain_insert(sqlite3 *db, const char *cluster_key,
+                      const char *toguid, const char *fromguid,
+                      const char *snapshot, const char *pushed_by);
+err_t db_chain_latest(sqlite3 *db, const char *cluster_key,
+                      char *guid, size_t len);
+err_t db_chain_common(sqlite3 *db, const char *cluster_key,
+                      const char *client_guid,
+                      char *common_guid, size_t len);
+
 #endif

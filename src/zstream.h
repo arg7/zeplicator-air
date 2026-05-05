@@ -1,0 +1,10 @@
+#ifndef ZEP_AIR_ZSTREAM_H
+#define ZEP_AIR_ZSTREAM_H
+
+#include "common.h"
+
+err_t zstream_parse(const void *data, size_t len,
+                    char *toguid, size_t toguid_len,
+                    char *fromguid, size_t fromguid_len);
+
+#endif

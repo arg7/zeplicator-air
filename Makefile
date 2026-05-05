@@ -10,7 +10,7 @@ all: zep-air zep-air-serve
 zep-air: src/main.c $(COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-zep-air-serve: src/serve.c src/storage.c src/db.c
+zep-air-serve: src/serve.c src/storage.c src/db.c src/zstream.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 clean:
