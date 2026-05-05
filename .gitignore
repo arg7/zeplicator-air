@@ -1,0 +1,22 @@
+# Build artifacts
+zep-air
+zep-air-serve
+*.o
+*.a
+*.so
+
+# Debug
+*.dSYM/
+
+# SQLite databases
+*.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temp
+/tmp/
