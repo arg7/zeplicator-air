@@ -120,11 +120,19 @@ err_t db_config_load(sqlite3 *db, zep_config_t *cfg) {
     db_config_get(db, "key_path",    cfg->key_path,    sizeof(cfg->key_path));
     db_config_get(db, "ca_path",     cfg->ca_path,     sizeof(cfg->ca_path));
     db_config_get(db, "key_password", cfg->key_password, sizeof(cfg->key_password));
+    db_config_get(db, "send_options", cfg->send_options, sizeof(cfg->send_options));
+    db_config_get(db, "recv_options", cfg->recv_options, sizeof(cfg->recv_options));
 
-    char buf[32];
-    if (db_config_get(db, "chunk_size", buf, sizeof(buf)) == ZEP_ERR_OK) {
-        long v = atol(buf);
-        if (v > 0) cfg->chunk_size = (size_t)v;
+    {
+        char buf[32];
+        if (db_config_get(db, "send_all_snap", buf, sizeof(buf)) == ZEP_ERR_OK)
+            cfg->send_all_snap = atoi(buf);
+        else cfg->send_all_snap = 0;
+
+        if (db_config_get(db, "chunk_size", buf, sizeof(buf)) == ZEP_ERR_OK) {
+            long v = atol(buf);
+            if (v > 0) cfg->chunk_size = (size_t)v;
+        }
     }
     return ZEP_ERR_OK;
 }

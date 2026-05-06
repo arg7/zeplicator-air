@@ -533,6 +533,45 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             return send_error(conn, 400, "Missing node name");
         }
 
+        if (strcmp(ctx->method, "GET") == 0 &&
+            strncmp(ctx->target_url, "/v1/admin/config", 16) == 0) {
+            const char *key = ctx->target_url + 16;
+            if (*key == '/') key++;
+            if (key[0]) {
+                char val[65536] = {0};
+                if (db_config_get(g_db, key, val, sizeof(val)) == ZEP_ERR_OK)
+                    return send_json(conn, 200, val);
+                return send_json(conn, 200, "null");
+            }
+            cJSON *obj = cJSON_CreateObject();
+            sqlite3_stmt *st = NULL;
+            sqlite3_prepare_v2(g_db,
+                "SELECT key, value FROM config ORDER BY key", -1, &st, NULL);
+            if (st) {
+                while (sqlite3_step(st) == SQLITE_ROW) {
+                    const char *k = (const char *)sqlite3_column_text(st, 0);
+                    const char *v = (const char *)sqlite3_column_text(st, 1);
+                    if (k) cJSON_AddStringToObject(obj, k, v ? v : "");
+                }
+                sqlite3_finalize(st);
+            }
+            char *js = cJSON_PrintUnformatted(obj);
+            cJSON_Delete(obj);
+            enum MHD_Result ret = send_json(conn, 200, js);
+            free(js);
+            return ret;
+        }
+
+        if (strcmp(ctx->method, "DELETE") == 0 &&
+            strncmp(ctx->target_url, "/v1/admin/config/", 17) == 0) {
+            const char *key = ctx->target_url + 17;
+            if (key[0]) {
+                db_config_set(g_db, key, "");
+                return send_json(conn, 200, "{\"ok\":true}");
+            }
+            return send_error(conn, 400, "Missing key");
+        }
+
         return send_error(conn, 404, "Admin endpoint not found");
     }
 
@@ -540,6 +579,19 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
     if ((strcmp(ctx->method, "POST") == 0 || strcmp(ctx->method, "PUT") == 0) &&
         strncmp(ctx->target_url, "/v1/admin/", 10) == 0) {
         const char *rest = ctx->target_url + 10;
+
+        if (strncmp(rest, "config/", 7) == 0) {
+            const char *key = rest + 7;
+            if (!key[0]) return send_error(conn, 400, "Missing key");
+            cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
+            if (json) {
+                cJSON *val = cJSON_GetObjectItem(json, "value");
+                if (val && cJSON_IsString(val))
+                    db_config_set(g_db, key, val->valuestring);
+                cJSON_Delete(json);
+            }
+            return send_json(conn, 200, "{\"ok\":true}");
+        }
 
         if (strncmp(rest, "suspend", 7) == 0) {
             const char *arg = rest + 7;

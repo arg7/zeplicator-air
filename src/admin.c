@@ -347,6 +347,50 @@ static int cmd_rollback(int argc, char *argv[]) {
     return do_get(path);
 }
 
+static int cmd_admin_config(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: zep-air-admin config <list|get|set|rm> [key] [value]\n");
+        return 1;
+    }
+    const char *sub = argv[1];
+
+    if (strcmp(sub, "list") == 0)
+        return do_get("/v1/admin/config");
+
+    if (argc < 3) { fprintf(stderr, "Missing key\n"); return 1; }
+    const char *key = argv[2];
+
+    if (strcmp(sub, "get") == 0) {
+        char path[512];
+        snprintf(path, sizeof(path), "/v1/admin/config/%s", key);
+        return do_get(path);
+    }
+
+    if (strcmp(sub, "set") == 0) {
+        if (argc < 4) { fprintf(stderr, "Missing value\n"); return 1; }
+        char *esc = malloc(strlen(argv[3]) * 2 + 1);
+        if (!esc) return 1;
+        json_escape(argv[3], esc, strlen(argv[3]) * 2 + 1);
+        char *body = NULL;
+        if (asprintf(&body, "{\"value\":\"%s\"}", esc) < 0) { free(esc); return 1; }
+        free(esc);
+        char path[512];
+        snprintf(path, sizeof(path), "/v1/admin/config/%s", key);
+        int rc = do_post(path, body);
+        free(body);
+        return rc;
+    }
+
+    if (strcmp(sub, "rm") == 0) {
+        char path[512];
+        snprintf(path, sizeof(path), "/v1/admin/config/%s", key);
+        return do_delete(path);
+    }
+
+    fprintf(stderr, "Unknown: %s\n", sub);
+    return 1;
+}
+
 static int cmd_admin_snap(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: zep-air-admin snap <create|destroy> --name <name>\n");
@@ -398,6 +442,7 @@ static void usage(const char *prog) {
         "  promote      Promote client to master (--node CN)\n"
         "  rollback     Cluster rollback to snapshot (--snap NAME)\n"
         "  snap         Manual snapshot create/destroy (--name NAME)\n"
+        "  config       Server config get/set/list/rm\n"
         "\n"
         "Global options:\n"
         "  --server, -s URL   Server URL (default: https://master.zep.lan:8443)\n"
@@ -427,7 +472,8 @@ int main(int argc, char *argv[]) {
             strcmp(argv[i], "resume") == 0 ||
             strcmp(argv[i], "promote") == 0 ||
             strcmp(argv[i], "rollback") == 0 ||
-            strcmp(argv[i], "snap") == 0) {
+            strcmp(argv[i], "snap") == 0 ||
+            strcmp(argv[i], "config") == 0) {
             argv2[argc2++] = argv[i];
             for (int j = i + 1; j < argc && argc2 < 63; j++)
                 argv2[argc2++] = argv[j];
@@ -488,6 +534,7 @@ int main(int argc, char *argv[]) {
     else if (strcmp(cmd, "promote") == 0)  rc = cmd_promote(sub_argc, sub_argv);
     else if (strcmp(cmd, "rollback") == 0) rc = cmd_rollback(sub_argc, sub_argv);
     else if (strcmp(cmd, "snap") == 0)     rc = cmd_admin_snap(sub_argc, sub_argv);
+    else if (strcmp(cmd, "config") == 0)   rc = cmd_admin_config(sub_argc, sub_argv);
     else if (strcmp(cmd, "cluster") == 0)  rc = cmd_cluster(sub_argc, sub_argv);
     else if (strcmp(cmd, "list-nodes") == 0) rc = cmd_list_nodes(sub_argc, sub_argv);
     else if (strcmp(cmd, "remove-node") == 0) rc = cmd_remove_node(sub_argc, sub_argv);
