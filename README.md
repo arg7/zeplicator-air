@@ -128,13 +128,15 @@ zep-air-admin \
 # Client — maps to its own local pool/fs, overrides retention
 zep-air-admin \
   --server https://master.zep.lan:8443 \
-  --cert pki/admin.crt --key pki/admin.key --ca pki/ca.crt \
+  --cert pki/admin.pem --ca pki/ca.crt \
   join --role client --cluster prod --node za-client-1 \
   --cert pki/za-client-1.crt \
   --map "tank-prod/data:vault/data(day:90,month:12), tank-prod/home:vault/home"
 ```
 
 ### 6. Configure nodes and run
+
+Each node has a local SQLite database (`zep-air.db` in the working directory, or `--db PATH`). Config is stored there, along with push/pull history. No central config — the server is only for sync, not configuration.
 
 **Master (`za-master`):**
 ```sh
@@ -218,6 +220,9 @@ zep-air rotate -f rpool/master         # direct local fs
 ```
 
 **`config`**
+
+Stores values in a local SQLite database (`./zep-air.db` by default, override with `--db`).
+
 ```
 zep-air config set key value
 zep-air config get key
