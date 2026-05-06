@@ -290,3 +290,21 @@ char *http_get_json(const http_config_t *cfg, const char *path) {
     }
     return rb.data;
 }
+
+err_t http_post_json(const http_config_t *cfg, const char *path, const char *body) {
+    char *url = NULL;
+    if (asprintf(&url, "%s%s", cfg->server_url, path) < 0)
+        return ZEP_ERR_SYS;
+
+    struct resp_buf rb = {0};
+    CURL *curl = http_init(cfg, url, &rb);
+    free(url);
+    if (!curl) return ZEP_ERR_NETWORK;
+
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+
+    int rc = http_do(curl);
+    free(rb.data);
+    return rc;
+}

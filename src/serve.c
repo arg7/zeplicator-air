@@ -661,6 +661,60 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         return ret;
     }
 
+    if (strcmp(ctx->method, "POST") == 0 &&
+        strcmp(ctx->target_url, "/v1/cron/ack") == 0) {
+        cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
+        if (json) {
+            cJSON *guid = cJSON_GetObjectItem(json, "guid");
+            if (guid && cJSON_IsString(guid) && ctx->node[0])
+                db_ack_guid(g_db, ctx->node, guid->valuestring);
+            cJSON_Delete(json);
+        }
+        return send_json(conn, 200, "{\"ok\":true}");
+    }
+
+    if (strcmp(ctx->method, "GET") == 0 &&
+        strncmp(ctx->target_url, "/v1/cron/protected", 18) == 0) {
+        cJSON *arr = cJSON_CreateArray();
+        const char *cluster_param = strchr(ctx->target_url + 18, '=');
+        if (!cluster_param) cluster_param = "";
+        else cluster_param++;
+
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(g_db,
+            "SELECT last_ack_guid FROM auth WHERE cluster = ?1 AND role = 'client'",
+            -1, &st, NULL);
+        if (st) {
+            sqlite3_bind_text(st, 1, cluster_param, -1, SQLITE_STATIC);
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                const char *guid = (const char *)sqlite3_column_text(st, 0);
+                if (guid && guid[0])
+                    cJSON_AddItemToArray(arr, cJSON_CreateString(guid));
+            }
+            sqlite3_finalize(st);
+        }
+        /* also protect latest guid in chain */
+        sqlite3_prepare_v2(g_db,
+            "SELECT toguid FROM cluster_chain WHERE cluster_key = ?1 "
+            "ORDER BY rowid DESC LIMIT 1",
+            -1, &st, NULL);
+        if (st) {
+            sqlite3_bind_text(st, 1, cluster_param, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                const char *guid = (const char *)sqlite3_column_text(st, 0);
+                if (guid && guid[0])
+                    cJSON_AddItemToArray(arr, cJSON_CreateString(guid));
+            }
+            sqlite3_finalize(st);
+        }
+
+        char *js = cJSON_PrintUnformatted(arr);
+        cJSON_Delete(arr);
+        enum MHD_Result ret = send_json(conn, 200, js);
+        free(js);
+        return ret;
+    }
+
     if (strcmp(ctx->method, "PUT") == 0) {
         if (ctx->parsed >= 3 && ctx->prefix[0] && ctx->file[0]) {
             storage_ensure_dir(g_storage_root, ctx->node, ctx->prefix);

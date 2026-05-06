@@ -39,5 +39,6 @@ err_t db_auth_list(sqlite3 *db, char ***names, int *count);
 err_t db_auth_remove(sqlite3 *db, const char *cn);
 err_t db_auth_get_role_by_fp(sqlite3 *db, const char *fingerprint,
                               char *role, size_t len);
+err_t db_ack_guid(sqlite3 *db, const char *cn, const char *guid);
 
 #endif

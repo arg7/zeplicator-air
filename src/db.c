@@ -65,6 +65,8 @@ err_t db_init_tables(sqlite3 *db) {
         "  role        TEXT NOT NULL DEFAULT 'client' CHECK(role IN ('server','admin','master','client')),"
         "  cluster     TEXT NOT NULL DEFAULT '',"
         "  mapping     TEXT NOT NULL DEFAULT '',"
+        "  last_ack_guid TEXT DEFAULT '',"
+        "  last_ack_at   TEXT DEFAULT '',"
         "  created_at  TEXT NOT NULL DEFAULT (datetime('now'))"
         ");";
     char *err = NULL;
@@ -388,4 +390,17 @@ err_t db_auth_get_role_by_fp(sqlite3 *db, const char *fingerprint,
     }
     sqlite3_finalize(stmt);
     return ret;
+}
+
+err_t db_ack_guid(sqlite3 *db, const char *cn, const char *guid) {
+    const char *sql =
+        "UPDATE auth SET last_ack_guid = ?, last_ack_at = datetime('now') WHERE cn = ?";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, cn, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
 }
