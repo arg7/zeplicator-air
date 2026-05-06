@@ -3,11 +3,11 @@
 #include "zfs.h"
 #include "pipeline.h"
 #include "storage.h"
+#include "http.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
-#include <libgen.h>
 
 static char g_db_path[ZEP_MAX_PATH] = "zep-air.db";
 
@@ -85,7 +85,14 @@ static int cmd_push(int argc, char *argv[]) {
     zep_config_t cfg;
     db_config_load(db, &cfg);
 
-    err_t ret = pipeline_push(db, &cfg, filesystem, label);
+    http_config_t http_cfg;
+    memset(&http_cfg, 0, sizeof(http_cfg));
+    snprintf(http_cfg.server_url, sizeof(http_cfg.server_url), "%s", cfg.server_url);
+    snprintf(http_cfg.cert_path, sizeof(http_cfg.cert_path), "%s", cfg.cert_path);
+    snprintf(http_cfg.key_path, sizeof(http_cfg.key_path), "%s", cfg.key_path);
+    snprintf(http_cfg.ca_path, sizeof(http_cfg.ca_path), "%s", cfg.ca_path);
+
+    err_t ret = pipeline_push(db, &cfg, &http_cfg, filesystem, label);
 
     db_close(db);
     return ret == ZEP_ERR_OK ? 0 : 1;
@@ -130,7 +137,14 @@ static int cmd_pull(int argc, char *argv[]) {
         snprintf(donor, sizeof(donor), "%s", cfg.node_name);
     }
 
-    err_t ret = pipeline_pull(db, &cfg, filesystem, donor);
+    http_config_t http_cfg;
+    memset(&http_cfg, 0, sizeof(http_cfg));
+    snprintf(http_cfg.server_url, sizeof(http_cfg.server_url), "%s", cfg.server_url);
+    snprintf(http_cfg.cert_path, sizeof(http_cfg.cert_path), "%s", cfg.cert_path);
+    snprintf(http_cfg.key_path, sizeof(http_cfg.key_path), "%s", cfg.key_path);
+    snprintf(http_cfg.ca_path, sizeof(http_cfg.ca_path), "%s", cfg.ca_path);
+
+    err_t ret = pipeline_pull(db, &cfg, &http_cfg, filesystem, donor);
 
     db_close(db);
     return ret == ZEP_ERR_OK ? 0 : 1;

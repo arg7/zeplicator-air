@@ -62,7 +62,9 @@ static err_t find_base_snapshot(const char *fs, const char *base_guid, char *sna
     return ZEP_ERR_NOT_FOUND;
 }
 
-err_t pipeline_push(sqlite3 *db, const zep_config_t *cfg, const char *fs, const char *label) {
+err_t pipeline_push(sqlite3 *db, const zep_config_t *cfg,
+                    const http_config_t *http_cfg,
+                    const char *fs, const char *label) {
     char base_guid[ZEP_MAX_GUID_LEN] = {0};
     char snap_name[ZEP_MAX_SNAPSHOT_NAME];
     char guid[ZEP_MAX_GUID_LEN];
@@ -75,8 +77,8 @@ err_t pipeline_push(sqlite3 *db, const zep_config_t *cfg, const char *fs, const 
         fprintf(stderr, "error: node_name not configured\n");
         return ZEP_ERR_DB;
     }
-    if (!cfg->storage_root[0]) {
-        fprintf(stderr, "error: storage_root not configured\n");
+    if (!http_cfg->server_url[0]) {
+        fprintf(stderr, "error: server_url not configured\n");
         return ZEP_ERR_DB;
     }
 
@@ -116,12 +118,6 @@ err_t pipeline_push(sqlite3 *db, const zep_config_t *cfg, const char *fs, const 
     char prefix[ZEP_MAX_PATH];
     snprintf(prefix, sizeof(prefix), "%010u-%s", inv, guid);
 
-    ret = storage_ensure_dir(cfg->storage_root, cfg->node_name, prefix);
-    if (ret != ZEP_ERR_OK) {
-        zfs_destroy_snapshot(snap_name);
-        return ret;
-    }
-
     FILE *send_fp = NULL;
     ret = zfs_send_open(fs, base_snap[0] ? base_snap : NULL, snap_name, &send_fp);
     if (ret != ZEP_ERR_OK) {
@@ -159,10 +155,10 @@ err_t pipeline_push(sqlite3 *db, const zep_config_t *cfg, const char *fs, const 
         blobs[blob_count].size = nread;
         snprintf(blobs[blob_count].part, sizeof(blobs[blob_count].part), "%04d", blob_count);
 
-        ret = storage_write_blob(cfg->storage_root, cfg->node_name, prefix,
-                                 blob_count, buf, nread);
+        ret = http_put_blob(http_cfg, cfg->node_name, prefix,
+                            blob_count, buf, nread);
         if (ret != ZEP_ERR_OK) {
-            fprintf(stderr, "push: failed to write blob %d\n", blob_count);
+            fprintf(stderr, "push: failed to upload blob %d\n", blob_count);
             break;
         }
 
@@ -195,9 +191,9 @@ err_t pipeline_push(sqlite3 *db, const zep_config_t *cfg, const char *fs, const 
     meta.blob_count = blob_count;
     meta.blobs = blobs;
 
-    ret = storage_write_meta(cfg->storage_root, cfg->node_name, prefix, &meta);
+    ret = http_put_meta(http_cfg, cfg->node_name, prefix, &meta);
     if (ret != ZEP_ERR_OK) {
-        fprintf(stderr, "push: failed to write meta.json\n");
+        fprintf(stderr, "push: failed to upload meta.json\n");
         free(blobs);
         zfs_destroy_snapshot(snap_name);
         return ret;
@@ -215,10 +211,12 @@ err_t pipeline_push(sqlite3 *db, const zep_config_t *cfg, const char *fs, const 
     return ZEP_ERR_OK;
 }
 
-err_t pipeline_pull(sqlite3 *db, const zep_config_t *cfg, const char *fs, const char *donor_node) {
+err_t pipeline_pull(sqlite3 *db, const zep_config_t *cfg,
+                    const http_config_t *http_cfg,
+                    const char *fs, const char *donor_node) {
     (void)db;
-    if (!cfg->storage_root[0]) {
-        fprintf(stderr, "error: storage_root not configured\n");
+    if (!http_cfg->server_url[0]) {
+        fprintf(stderr, "error: server_url not configured\n");
         return ZEP_ERR_DB;
     }
 
@@ -233,7 +231,7 @@ err_t pipeline_pull(sqlite3 *db, const zep_config_t *cfg, const char *fs, const 
 
     char **prefixes = NULL;
     int prefix_count = 0;
-    err_t ret = storage_list_prefixes(cfg->storage_root, node, 20, &prefixes, &prefix_count);
+    err_t ret = http_list_snapshots(http_cfg, node, 20, &prefixes, &prefix_count);
     if (ret != ZEP_ERR_OK) return ret;
 
     if (prefix_count == 0) {
@@ -247,7 +245,7 @@ err_t pipeline_pull(sqlite3 *db, const zep_config_t *cfg, const char *fs, const 
         snapshot_meta_t meta;
         memset(&meta, 0, sizeof(meta));
 
-        ret = storage_read_meta(cfg->storage_root, node, prefixes[i], &meta);
+        ret = http_get_meta(http_cfg, node, prefixes[i], &meta);
         if (ret != ZEP_ERR_OK) {
             fprintf(stderr, "pull: failed to read meta for %s\n", prefixes[i]);
             continue;
@@ -292,7 +290,7 @@ err_t pipeline_pull(sqlite3 *db, const zep_config_t *cfg, const char *fs, const 
         for (int b = 0; b < meta.blob_count && ok; b++) {
             void *data = NULL;
             size_t len = 0;
-            ret = storage_read_blob(cfg->storage_root, node, prefixes[i], b, &data, &len);
+                ret = http_get_blob(http_cfg, node, prefixes[i], b, &data, &len);
             if (ret != ZEP_ERR_OK) {
                 fprintf(stderr, "pull: failed to read blob %d\n", b);
                 ok = 0;
