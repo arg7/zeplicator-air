@@ -36,11 +36,11 @@ err_t zfs_send_open(const char *fs, const char *from_snap, const char *to_snap, 
     char cmd[2048];
     if (from_snap && from_snap[0]) {
         snprintf(cmd, sizeof(cmd),
-            "zfs send -p -i '%s' '%s' 2>>/tmp/zep-air-send.err | zstd -c",
+            "zfs send -p -i '%s' '%s' 2>/dev/null | zstd -c",
             from_snap, to_snap);
     } else {
         snprintf(cmd, sizeof(cmd),
-            "zfs send -p '%s' 2>>/tmp/zep-air-send.err | zstd -c",
+            "zfs send -p '%s' 2>/dev/null | zstd -c",
             to_snap);
     }
     *fp = popen(cmd, "r");
@@ -64,7 +64,7 @@ err_t zfs_recv_open(const char *fs, const char *snap, FILE **fp) {
     (void)snap;
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
-        "zstd -d 2>>/tmp/zep-air-recv.err | zfs recv -F -u '%s' 2>>/tmp/zep-air-recv.err",
+        "zstd -d 2>/dev/null | zfs recv -F -u '%s' 2>/dev/null",
         fs);
     *fp = popen(cmd, "w");
     if (!*fp) {
