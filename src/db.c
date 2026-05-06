@@ -58,11 +58,11 @@ err_t db_init_tables(sqlite3 *db) {
         "  pushed_at   TEXT NOT NULL DEFAULT (datetime('now')),"
         "  UNIQUE(cluster_key, toguid)"
         ");"
-        "CREATE TABLE IF NOT EXISTS certs ("
+        "CREATE TABLE IF NOT EXISTS auth ("
         "  cn          TEXT PRIMARY KEY,"
         "  fingerprint TEXT NOT NULL UNIQUE,"
         "  pem         TEXT NOT NULL,"
-        "  cert_type   TEXT NOT NULL DEFAULT 'client',"
+        "  role        TEXT NOT NULL DEFAULT 'client' CHECK(role IN ('server','admin','master','client')),"
         "  created_at  TEXT NOT NULL DEFAULT (datetime('now'))"
         ");";
     char *err = NULL;
@@ -291,15 +291,17 @@ err_t db_chain_common(sqlite3 *db, const char *cluster_key,
 }
 
 err_t db_cert_store(sqlite3 *db, const char *cn,
-                    const char *fingerprint, const char *pem_data) {
+                    const char *fingerprint, const char *pem_data,
+                    const char *role) {
     const char *sql =
-        "INSERT OR IGNORE INTO certs (cn, fingerprint, pem) VALUES (?, ?, ?)";
+        "INSERT OR IGNORE INTO auth (cn, fingerprint, pem, role) VALUES (?, ?, ?, ?)";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;
     sqlite3_bind_text(stmt, 1, cn, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, fingerprint, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 3, pem_data, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 4, role, -1, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
@@ -307,7 +309,7 @@ err_t db_cert_store(sqlite3 *db, const char *cn,
 
 err_t db_cert_lookup(sqlite3 *db, const char *cn,
                      char *fingerprint, size_t flen) {
-    const char *sql = "SELECT fingerprint FROM certs WHERE cn = ?";
+    const char *sql = "SELECT fingerprint FROM auth WHERE cn = ?";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;
@@ -323,4 +325,43 @@ err_t db_cert_lookup(sqlite3 *db, const char *cn,
 
 err_t db_ca_fingerprint(sqlite3 *db, char *fp, size_t len) {
     return db_cert_lookup(db, "Zep-Air testing", fp, len);
+}
+
+err_t db_auth_list(sqlite3 *db, char ***names, int *count) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT cn FROM auth ORDER BY role, cn", -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+
+    int cap = 16, cnt = 0;
+    char **list = calloc((size_t)cap, sizeof(char *));
+    if (!list) return ZEP_ERR_SYS;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (cnt >= cap) {
+            cap *= 2;
+            char **nl = realloc(list, (size_t)cap * sizeof(char *));
+            if (!nl) {
+                for (int j = 0; j < cnt; j++) free(list[j]);
+                free(list);
+                sqlite3_finalize(stmt);
+                return ZEP_ERR_SYS;
+            }
+            list = nl;
+        }
+        list[cnt++] = strdup((const char *)sqlite3_column_text(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    *names = list;
+    *count = cnt;
+    return ZEP_ERR_OK;
+}
+
+err_t db_auth_remove(sqlite3 *db, const char *cn) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM auth WHERE cn = ?", -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, cn, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
 }

@@ -5,7 +5,7 @@ LDFLAGS  = $(shell pkg-config --libs openssl libcurl sqlite3 libcjson libmicroht
 
 COMMON   = src/db.c src/zfs.c src/storage.c src/pipeline.c
 
-all: zep-air zep-air-serve
+all: zep-air zep-air-serve zep-air-admin
 
 zep-air: src/main.c $(COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
@@ -13,7 +13,10 @@ zep-air: src/main.c $(COMMON)
 zep-air-serve: src/serve.c src/storage.c src/db.c src/zstream.c src/auth.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+zep-air-admin: src/admin.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
 clean:
-	rm -f zep-air zep-air-serve
+	rm -f zep-air zep-air-serve zep-air-admin
 
 .PHONY: all clean

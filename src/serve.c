@@ -14,6 +14,9 @@
 #include <microhttpd.h>
 #include <openssl/x509.h>
 #include <openssl/ssl.h>
+#include <openssl/pem.h>
+#include <openssl/bio.h>
+#include <cjson/cJSON.h>
 
 static void ssl_ctx_setup(void *cls) {
     (void)cls;
@@ -315,6 +318,86 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         return MHD_YES;
     }
 
+    /* ── admin routes ── */
+    if (strncmp(ctx->target_url, "/v1/admin", 9) == 0) {
+        if (strcmp(ctx->method, "POST") == 0) {
+            if (strcmp(ctx->target_url, "/v1/admin/setup") == 0) {
+                cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
+                if (!json) return send_error(conn, 400, "Invalid JSON");
+
+                cJSON *ca = cJSON_GetObjectItem(json, "ca_cert");
+                cJSON *sc = cJSON_GetObjectItem(json, "server_cert");
+                cJSON *sk = cJSON_GetObjectItem(json, "server_key");
+                int ok = 0;
+                if (ca && cJSON_IsString(ca) && sc && cJSON_IsString(sc) && sk && cJSON_IsString(sk)) {
+                    FILE *f = fopen(g_ca_path[0] ? g_ca_path : "/var/lib/zep-air/pki/ca.crt", "w");
+                    if (f) { fputs(ca->valuestring, f); fclose(f); ok++; }
+                    f = fopen(g_cert_path[0] ? g_cert_path : "/var/lib/zep-air/pki/server.crt", "w");
+                    if (f) { fputs(sc->valuestring, f); fclose(f); ok++; }
+                    f = fopen(g_key_path[0] ? g_key_path : "/var/lib/zep-air/pki/server.key", "w");
+                    if (f) { fputs(sk->valuestring, f); fclose(f); ok++; }
+                }
+                cJSON_Delete(json);
+                return ok == 3 ? send_json(conn, 200, "{\"ok\":true}")
+                               : send_error(conn, 500, "Failed to store certs");
+            }
+
+            if (strcmp(ctx->target_url, "/v1/admin/nodes") == 0) {
+                cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
+                if (!json) return send_error(conn, 400, "Invalid JSON");
+                cJSON *cn = cJSON_GetObjectItem(json, "cn");
+                cJSON *role = cJSON_GetObjectItem(json, "role");
+                cJSON *pem = cJSON_GetObjectItem(json, "pem");
+                int ok = 0;
+                if (cn && cJSON_IsString(cn) && role && cJSON_IsString(role) &&
+                    pem && cJSON_IsString(pem)) {
+                    BIO *bio = BIO_new_mem_buf(pem->valuestring, -1);
+                    if (bio) {
+                        X509 *cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+                        BIO_free(bio);
+                        if (cert) {
+                            char *fp = auth_cert_fingerprint(cert);
+                            X509_free(cert);
+                            if (fp) {
+                                db_cert_store(g_db, cn->valuestring, fp, pem->valuestring, role->valuestring);
+                                free(fp);
+                                ok = 1;
+                            }
+                        }
+                    }
+                }
+                cJSON_Delete(json);
+                return ok ? send_json(conn, 200, "{\"ok\":true}")
+                          : send_error(conn, 400, "Bad request");
+            }
+        }
+
+        if (strcmp(ctx->method, "GET") == 0 && strcmp(ctx->target_url, "/v1/admin/nodes") == 0) {
+            char **names = NULL;
+            int count = 0;
+            db_auth_list(g_db, &names, &count);
+            cJSON *arr = cJSON_CreateArray();
+            for (int i = 0; i < count; i++) cJSON_AddItemToArray(arr, cJSON_CreateString(names[i]));
+            char *js = cJSON_PrintUnformatted(arr);
+            cJSON_Delete(arr);
+            enum MHD_Result ret = send_json(conn, 200, js);
+            free(js);
+            storage_free_list(names, count);
+            return ret;
+        }
+
+        if (strcmp(ctx->method, "DELETE") == 0 && strncmp(ctx->target_url, "/v1/admin/nodes/", 16) == 0) {
+            const char *cn = ctx->target_url + 16;
+            if (cn[0]) {
+                db_auth_remove(g_db, cn);
+                return send_json(conn, 200, "{\"ok\":true}");
+            }
+            return send_error(conn, 400, "Missing node name");
+        }
+
+        return send_error(conn, 404, "Admin endpoint not found");
+    }
+
     if (strcmp(ctx->method, "PUT") == 0) {
         if (ctx->parsed >= 3 && ctx->prefix[0] && ctx->file[0]) {
             storage_ensure_dir(g_storage_root, ctx->node, ctx->prefix);
@@ -515,7 +598,7 @@ int serve_main(int argc, char *argv[]) {
                     ca_fp = auth_cert_fingerprint(ca);
                     X509_free(ca);
                     if (ca_fp) {
-                        db_cert_store(g_db, "Zep-Air testing", ca_fp, "CA");
+                        db_cert_store(g_db, "Zep-Air testing", ca_fp, "CA", "server");
                         free(ca_fp);
                     }
                 }

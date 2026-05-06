@@ -116,7 +116,7 @@ err_t auth_verify_client(sqlite3 *db, X509 *client_cert,
             PEM_write_bio_X509(bio, client_cert);
             long pem_len = BIO_get_mem_data(bio, &pem_data);
             if (pem_len > 0 && pem_data) {
-                db_cert_store(db, cn, fp, pem_data);
+                db_cert_store(db, cn, fp, pem_data, "client");
             }
             BIO_free(bio);
         }
