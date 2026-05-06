@@ -2,6 +2,7 @@
 #include "storage.h"
 #include "db.h"
 #include "zstream.h"
+#include "auth.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,12 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <microhttpd.h>
+#include <openssl/x509.h>
+#include <openssl/ssl.h>
+
+static void ssl_ctx_setup(void *cls) {
+    (void)cls;
+}
 
 static char g_storage_root[ZEP_MAX_PATH] = "/var/lib/zep-air";
 static char g_db_path[ZEP_MAX_PATH]       = "/var/lib/zep-air/zep-air.db";
@@ -20,6 +27,7 @@ static char g_key_path[ZEP_MAX_PATH] = "";
 static char g_ca_path[ZEP_MAX_PATH] = "";
 static int  g_verbose = 0;
 static struct MHD_Daemon *g_daemon = NULL;
+static sqlite3 *g_db = NULL;
 
 struct conn_ctx {
     char method[8];
@@ -31,6 +39,7 @@ struct conn_ctx {
     size_t body_len;
     size_t body_cap;
     int parsed;
+    int authed;
 };
 
 static void conn_ctx_free(struct conn_ctx *ctx) {
@@ -267,12 +276,27 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         snprintf(ctx->method, sizeof(ctx->method), "%s", method);
         snprintf(ctx->target_url, sizeof(ctx->target_url), "%s", url);
 
+        const union MHD_ConnectionInfo *info = MHD_get_connection_info(
+            conn, MHD_CONNECTION_INFO_GNUTLS_CLIENT_CERT);
+        int has_cert = (info && info->client_cert) ? 1 : 0;
+
         if (strcmp(url, "/health") == 0) {
             return send_response(conn, 200, "text/plain", "ok", 2);
         }
 
+        if (!has_cert) {
+            return send_error(conn, 401, "Client certificate required");
+        }
+
+        ctx->authed = 1;
+        snprintf(ctx->node, sizeof(ctx->node), "cert-authenticated");
+
         parse_url(url, ctx);
         return MHD_YES;
+    }
+
+    if (!ctx->authed) {
+        return send_error(conn, 401, "Client certificate required");
     }
 
     if (*upload_data_size > 0) {
@@ -472,6 +496,34 @@ int serve_main(int argc, char *argv[]) {
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
+    if (db_open(g_db_path, &g_db) != ZEP_ERR_OK) {
+        free(cert_pem); free(key_pem); free(ca_pem);
+        return 1;
+    }
+    db_init_tables(g_db);
+
+    if (g_ca_path[0]) {
+        X509_STORE *ca_store = NULL;
+        if (auth_load_ca_cert(g_ca_path, &ca_store) == ZEP_ERR_OK) {
+            char *ca_fp = NULL;
+            X509 *ca = NULL;
+            FILE *caf = fopen(g_ca_path, "r");
+            if (caf) {
+                ca = PEM_read_X509(caf, NULL, NULL, NULL);
+                fclose(caf);
+                if (ca) {
+                    ca_fp = auth_cert_fingerprint(ca);
+                    X509_free(ca);
+                    if (ca_fp) {
+                        db_cert_store(g_db, "Zep-Air testing", ca_fp, "CA");
+                        free(ca_fp);
+                    }
+                }
+            }
+            X509_STORE_free(ca_store);
+        }
+    }
+
     unsigned int flags = MHD_USE_TLS | MHD_USE_AUTO | MHD_USE_INTERNAL_POLLING_THREAD;
 
     g_daemon = MHD_start_daemon(flags, (unsigned int)g_port, NULL, NULL,
@@ -480,6 +532,7 @@ int serve_main(int argc, char *argv[]) {
                                  MHD_OPTION_HTTPS_MEM_CERT, cert_pem,
                                  MHD_OPTION_HTTPS_MEM_KEY, key_pem,
                                  MHD_OPTION_HTTPS_MEM_TRUST, ca_pem,
+                                 MHD_OPTION_HTTPS_CERT_CALLBACK, &ssl_ctx_setup,
                                  MHD_OPTION_END);
 
     free(cert_pem);
@@ -500,6 +553,7 @@ int serve_main(int argc, char *argv[]) {
     }
 
     printf("\nServer stopped.\n");
+    db_close(g_db);
     return 0;
 }
 

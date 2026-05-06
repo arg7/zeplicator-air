@@ -57,6 +57,13 @@ err_t db_init_tables(sqlite3 *db) {
         "  pushed_by   TEXT NOT NULL,"
         "  pushed_at   TEXT NOT NULL DEFAULT (datetime('now')),"
         "  UNIQUE(cluster_key, toguid)"
+        ");"
+        "CREATE TABLE IF NOT EXISTS certs ("
+        "  cn          TEXT PRIMARY KEY,"
+        "  fingerprint TEXT NOT NULL UNIQUE,"
+        "  pem         TEXT NOT NULL,"
+        "  cert_type   TEXT NOT NULL DEFAULT 'client',"
+        "  created_at  TEXT NOT NULL DEFAULT (datetime('now'))"
         ");";
     char *err = NULL;
     int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
@@ -281,4 +288,39 @@ err_t db_chain_common(sqlite3 *db, const char *cluster_key,
     }
     sqlite3_finalize(stmt);
     return ret;
+}
+
+err_t db_cert_store(sqlite3 *db, const char *cn,
+                    const char *fingerprint, const char *pem_data) {
+    const char *sql =
+        "INSERT OR IGNORE INTO certs (cn, fingerprint, pem) VALUES (?, ?, ?)";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, cn, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, fingerprint, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, pem_data, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
+}
+
+err_t db_cert_lookup(sqlite3 *db, const char *cn,
+                     char *fingerprint, size_t flen) {
+    const char *sql = "SELECT fingerprint FROM certs WHERE cn = ?";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, cn, -1, SQLITE_STATIC);
+    err_t ret = ZEP_ERR_NOT_FOUND;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        snprintf(fingerprint, flen, "%s", sqlite3_column_text(stmt, 0));
+        ret = ZEP_ERR_OK;
+    }
+    sqlite3_finalize(stmt);
+    return ret;
+}
+
+err_t db_ca_fingerprint(sqlite3 *db, char *fp, size_t len) {
+    return db_cert_lookup(db, "Zep-Air testing", fp, len);
 }
