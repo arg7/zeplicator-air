@@ -58,19 +58,29 @@ err_t zfs_snapshot_create_cluster(const char *fs, const char *cluster,
 }
 
 err_t zfs_send_open(const char *fs, const char *from_snap, const char *to_snap,
-                    int send_all, const char *extra_opts, FILE **fp) {
+                    int send_all, const char *extra_opts,
+                    const char *zip_cmd, const char *buf_cmd, FILE **fp) {
     (void)fs;
-    char cmd[2048];
+    char cmd[4096];
+
     if (from_snap && from_snap[0]) {
         snprintf(cmd, sizeof(cmd),
-            "zfs send %s %s '%s' '%s' 2>/dev/null | zstd -c",
+            "zfs send %s %s '%s' '%s' 2>/dev/null%s%s%s%s",
             extra_opts ? extra_opts : "",
             send_all ? "-I" : "-i",
-            from_snap, to_snap);
+            from_snap, to_snap,
+            buf_cmd && buf_cmd[0] ? " | " : "",
+            buf_cmd && buf_cmd[0] ? buf_cmd : "",
+            zip_cmd && zip_cmd[0] ? " | " : "",
+            zip_cmd && zip_cmd[0] ? zip_cmd : "");
     } else {
         snprintf(cmd, sizeof(cmd),
-            "zfs send %s '%s' 2>/dev/null | zstd -c",
-            extra_opts ? extra_opts : "", to_snap);
+            "zfs send %s '%s' 2>/dev/null%s%s%s%s",
+            extra_opts ? extra_opts : "", to_snap,
+            buf_cmd && buf_cmd[0] ? " | " : "",
+            buf_cmd && buf_cmd[0] ? buf_cmd : "",
+            zip_cmd && zip_cmd[0] ? " | " : "",
+            zip_cmd && zip_cmd[0] ? zip_cmd : "");
     }
     *fp = popen(cmd, "r");
     if (!*fp) {
@@ -90,12 +100,28 @@ void zfs_send_close(FILE *fp) {
 }
 
 err_t zfs_recv_open(const char *fs, const char *snap,
-                    const char *extra_opts, FILE **fp) {
+                    const char *extra_opts,
+                    const char *unzip_cmd, const char *buf_cmd, FILE **fp) {
     (void)snap;
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd),
-        "zstd -d 2>/dev/null | zfs recv %s -F -u '%s' 2>/dev/null",
-        extra_opts ? extra_opts : "", fs);
+    char cmd[4096];
+
+    /* build: [unzip_cmd |] [buf_cmd |] zfs recv */
+    int pos = 0;
+    int need_pipe = 0;
+    if (unzip_cmd && unzip_cmd[0]) {
+        pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos, "%s", unzip_cmd);
+        need_pipe = 1;
+    }
+    if (buf_cmd && buf_cmd[0]) {
+        if (need_pipe) pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos, " | ");
+        pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos, "%s", buf_cmd);
+        need_pipe = 1;
+    }
+    if (need_pipe)
+        pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos, " | ");
+    snprintf(cmd + pos, sizeof(cmd) - (size_t)pos,
+             "zfs recv %s -F -u '%s' 2>/dev/null",
+             extra_opts ? extra_opts : "", fs);
     *fp = popen(cmd, "w");
     if (!*fp) {
         perror("popen zfs recv");

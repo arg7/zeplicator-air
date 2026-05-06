@@ -179,7 +179,9 @@ err_t pipeline_push(const zep_config_t *cfg,
 
     FILE *send_fp = NULL;
     ret = zfs_send_open(fs, base_snap[0] ? base_snap : NULL, snap_name,
-                        cfg->send_all_snap, cfg->send_options[0] ? cfg->send_options : NULL,
+                        cfg->send_all_snap,
+                        cfg->send_options[0] ? cfg->send_options : NULL,
+                        cfg->pipe_zip_cmd, cfg->pipe_send_buf_cmd,
                         &send_fp);
     if (ret != ZEP_ERR_OK) {
         zfs_destroy_snapshot(snap_name);
@@ -325,6 +327,7 @@ err_t pipeline_pull(const zep_config_t *cfg,
         FILE *recv_fp = NULL;
         ret = zfs_recv_open(fs, meta.snapshot,
                             cfg->recv_options[0] ? cfg->recv_options : NULL,
+                            cfg->pipe_unzip_cmd, cfg->pipe_recv_buf_cmd,
                             &recv_fp);
         if (ret != ZEP_ERR_OK) {
             fprintf(stderr, "pull: failed to open zfs recv\n");
