@@ -379,8 +379,12 @@ int main(int argc, char *argv[]) {
         usage(argv2[0]); return 0;
     }
     if (!g_cert_path[0] || !g_key_path[0] || !g_ca_path[0]) {
-        fprintf(stderr, "error: --cert, --key, and --ca are required\n");
-        return 1;
+        if (!g_cert_path[0] || !g_ca_path[0]) {
+            fprintf(stderr, "error: --cert and --ca are required\n");
+            return 1;
+        }
+        if (!g_key_path[0])
+            snprintf(g_key_path, sizeof(g_key_path), "%s", g_cert_path);
     }
 
     curl_global_init(CURL_GLOBAL_DEFAULT);

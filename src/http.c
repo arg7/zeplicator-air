@@ -38,7 +38,7 @@ static CURL *http_init(const http_config_t *cfg, const char *url,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, rb);
     curl_easy_setopt(curl, CURLOPT_SSLCERT, cfg->cert_path);
-    curl_easy_setopt(curl, CURLOPT_SSLKEY, cfg->key_path);
+    curl_easy_setopt(curl, CURLOPT_SSLKEY, cfg->key_path[0] ? cfg->key_path : cfg->cert_path);
     curl_easy_setopt(curl, CURLOPT_CAINFO, cfg->ca_path);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
