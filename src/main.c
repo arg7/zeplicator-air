@@ -18,10 +18,17 @@ static void usage(const char *prog) {
         "Usage: %s <command> [options]\n"
         "\n"
         "Commands:\n"
+        "  snap    Create local snapshots (no push)\n"
         "  push    Push a snapshot to the storage intermediary\n"
         "  pull    Pull snapshots from the storage intermediary\n"
         "  config  Manage configuration\n"
         "  status  Show replication status\n"
+        "\n"
+        "Snap options:\n"
+        "  --filesystem, -f FS    ZFS filesystem (optional, use mapping instead)\n"
+        "  --label, -l LABEL      Snapshot label (required)\n"
+        "  --db PATH              Database path (default: %s)\n"
+        "  [FS1 FS2 ...]          Cluster filesystem names (uses mapping)\n"
         "\n"
         "Push options:\n"
         "  --filesystem, -f FS    ZFS filesystem (optional, use mapping instead)\n"
@@ -49,7 +56,7 @@ static void usage(const char *prog) {
         "  key_path         Path to TLS client key\n"
         "  ca_path          Path to CA certificate\n"
         "  chunk_size       Max blob size in bytes (default: %d)\n",
-        ZEP_VERSION, prog, g_db_path, g_db_path, g_db_path, ZEP_DEFAULT_CHUNK_SZ);
+        ZEP_VERSION, prog, g_db_path, g_db_path, g_db_path, g_db_path, ZEP_DEFAULT_CHUNK_SZ);
 }
 
 static int cmd_push(int argc, char *argv[]) {
@@ -227,6 +234,96 @@ static int cmd_pull(int argc, char *argv[]) {
     return pulled > 0 ? 0 : 1;
 }
 
+static int cmd_snap(int argc, char *argv[]) {
+    char filesystem[ZEP_MAX_SNAPSHOT_NAME] = {0};
+    char label[64] = {0};
+
+    static struct option opts[] = {
+        {"filesystem", required_argument, 0, 'f'},
+        {"label",      required_argument, 0, 'l'},
+        {"db",         required_argument, 0, 'D'},
+        {"help",       no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
+    int opt;
+    while ((opt = getopt_long(argc, argv, "f:l:D:h", opts, NULL)) != -1) {
+        switch (opt) {
+            case 'f': snprintf(filesystem, sizeof(filesystem), "%s", optarg); break;
+            case 'l': snprintf(label, sizeof(label), "%s", optarg); break;
+            case 'D': snprintf(g_db_path, sizeof(g_db_path), "%s", optarg); break;
+            case 'h': usage(argv[0]); return 0;
+            default:  return 1;
+        }
+    }
+    if (!label[0]) {
+        fprintf(stderr, "error: --label is required\n");
+        return 1;
+    }
+
+    sqlite3 *db = NULL;
+    if (db_open(g_db_path, &db) != ZEP_ERR_OK) return 1;
+    db_init_tables(db);
+    zep_config_t cfg;
+    db_config_load(db, &cfg);
+
+    const char *cluster = cfg.cluster[0] ? cfg.cluster : "zep";
+    int created = 0;
+
+    if (filesystem[0]) {
+        char snap_name[ZEP_MAX_SNAPSHOT_NAME];
+        if (zfs_snapshot_create_cluster(filesystem, cluster, label,
+                                         snap_name, sizeof(snap_name)) == ZEP_ERR_OK) {
+            printf("Created: %s\n", snap_name);
+            created++;
+        }
+    } else if (optind < argc) {
+        for (int i = optind; i < argc; i++) {
+            char local_fs[ZEP_MAX_SNAPSHOT_NAME];
+            if (pipeline_resolve_fs(argv[i], cfg.mapping,
+                                    local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
+                char snap_name[ZEP_MAX_SNAPSHOT_NAME];
+                if (zfs_snapshot_create_cluster(local_fs, cluster, label,
+                                                 snap_name, sizeof(snap_name)) == ZEP_ERR_OK) {
+                    printf("Created: %s\n", snap_name);
+                    created++;
+                }
+            } else {
+                fprintf(stderr, "snap: no mapping for '%s'\n", argv[i]);
+            }
+        }
+    } else if (cfg.mapping[0]) {
+        const char *p = cfg.mapping;
+        while (*p) {
+            const char *colon = strchr(p, ':');
+            if (!colon) break;
+            char local_fs[ZEP_MAX_SNAPSHOT_NAME];
+            const char *start = colon + 1;
+            const char *end = strchr(start, ',');
+            if (!end) end = start + strlen(start);
+            const char *paren = strchr(start, '(');
+            size_t n = paren ? (size_t)(paren - start) : (size_t)(end - start);
+            if (n >= sizeof(local_fs)) n = sizeof(local_fs) - 1;
+            memcpy(local_fs, start, n);
+            local_fs[n] = '\0';
+            char snap_name[ZEP_MAX_SNAPSHOT_NAME];
+            if (zfs_snapshot_create_cluster(local_fs, cluster, label,
+                                             snap_name, sizeof(snap_name)) == ZEP_ERR_OK) {
+                printf("Created: %s\n", snap_name);
+                created++;
+            }
+            const char *comma = strchr(colon, ',');
+            p = comma ? comma + 1 : colon + strlen(colon);
+        }
+    } else {
+        fprintf(stderr, "error: no filesystem specified\n");
+        db_close(db);
+        return 1;
+    }
+
+    db_close(db);
+    return created > 0 ? 0 : 1;
+}
+
 static int cmd_config(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: zep-air config <set|get|list> [args]\n");
@@ -370,6 +467,7 @@ int main(int argc, char *argv[]) {
     char **sub_argv = (char **)argv2 + 1;
     int sub_argc = argc2 - 1;
 
+    if (strcmp(cmd, "snap") == 0)   return cmd_snap(sub_argc, sub_argv);
     if (strcmp(cmd, "push") == 0)   return cmd_push(sub_argc, sub_argv);
     if (strcmp(cmd, "pull") == 0)   return cmd_pull(sub_argc, sub_argv);
     if (strcmp(cmd, "config") == 0) return cmd_config(sub_argc, sub_argv);

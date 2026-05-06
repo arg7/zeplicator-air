@@ -5,6 +5,8 @@
 #include <stdio.h>
 
 err_t zfs_snapshot_create(const char *fs, const char *label, char *out_name, size_t out_len);
+err_t zfs_snapshot_create_cluster(const char *fs, const char *cluster,
+                                  const char *label, char *out_name, size_t out_len);
 err_t zfs_send_open(const char *fs, const char *from_snap, const char *to_snap, FILE **fp);
 void  zfs_send_close(FILE *fp);
 err_t zfs_recv_open(const char *fs, const char *snap, FILE **fp);
