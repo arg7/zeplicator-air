@@ -44,59 +44,53 @@ sudo make install
 
 ### 2. Create PKI
 
+Two helper scripts in `pki/` — `mk-ca.sh` creates the CA, server, and admin certs. `mk-node.sh` creates node certs.
+
 ```sh
-mkdir pki
+# Create CA, server cert (for zep-air-serve), and admin cert
+./pki/mk-ca.sh "/C=IT/O=CompEd/CN=Zep-Air testing" 3650 master.zep.lan
 
-# CA
-openssl genrsa -out pki/ca.key 4096
-openssl req -x509 -new -nodes -key pki/ca.key -sha256 -days 3650 \
-  -out pki/ca.crt -subj "/C=IT/O=CompEd/CN=Zep-Air testing"
-
-# Server cert
-openssl genrsa -out pki/server.key 2048
-openssl req -new -key pki/server.key -out pki/server.csr \
-  -subj "/C=IT/O=CompEd/CN=master.zep.lan"
-cat > pki/server.ext << 'EOF'
-basicConstraints=CA:FALSE
-keyUsage=digitalSignature,keyEncipherment
-extendedKeyUsage=serverAuth
-EOF
-openssl x509 -req -in pki/server.csr -CA pki/ca.crt -CAkey pki/ca.key \
-  -CAcreateserial -out pki/server.crt -days 365 -sha256 -extfile pki/server.ext
-
-# Admin cert
-openssl genrsa -out pki/admin.key 2048
-openssl req -new -key pki/admin.key -out pki/admin.csr \
-  -subj "/C=IT/O=CompEd/CN=admin"
-cat > pki/client.ext << 'EOF'
-basicConstraints=CA:FALSE
-keyUsage=digitalSignature,keyEncipherment
-extendedKeyUsage=clientAuth
-EOF
-openssl x509 -req -in pki/admin.csr -CA pki/ca.crt -CAkey pki/ca.key \
-  -CAcreateserial -out pki/admin.crt -days 365 -sha256 -extfile pki/client.ext
-
-# Node certs (one per node — repeat for each)
-for node in za-master za-client-1 za-client-2; do
-    openssl genrsa -out "pki/${node}.key" 2048
-    openssl req -new -key "pki/${node}.key" -out "pki/${node}.csr" \
-        -subj "/C=IT/O=CompEd/CN=${node}"
-    openssl x509 -req -in "pki/${node}.csr" -CA pki/ca.crt -CAkey pki/ca.key \
-        -CAcreateserial -out "pki/${node}.crt" -days 365 -sha256 -extfile pki/client.ext
-done
+# Create node certs (repeats for each node)
+./pki/mk-node.sh za-master
+./pki/mk-node.sh za-client-1
+./pki/mk-node.sh za-client-2
 ```
+
+Each invocation produces a combined `.pem` file (cert + key concatenated) — copy this single file to the node. No separate `.crt` / `.key` logistics.
+
+**Password-protected keys (recommended for admins):**
+
+```sh
+# Add -p to encrypt private keys with AES-256 (prompts for password)
+./pki/mk-ca.sh -p
+./pki/mk-node.sh za-master -p
+
+# All binaries accept -P / --password to decrypt at startup:
+zep-air-serve --cert server.pem --ca ca.crt -P 'thepassword'
+zep-air-admin --cert admin.pem --ca ca.crt -P 'thepassword'
+zep-air config set key_password 'thepassword'   # node agent reads from config
+```
+
+**What you get:**
+| File | Contents | Distribute to |
+|------|----------|---------------|
+| `ca.crt` | CA certificate (public) | All nodes |
+| `server.pem` | Server cert + key | `zep-air-serve` host |
+| `admin.pem` | Admin cert + key | Admin workstation |
+| `<CN>.pem` | Node cert + key | That specific node |
 
 ### 3. Server setup and start
 
 ```sh
 # One-time: register CA, server cert, and admin cert
 zep-air-serve --setup \
-  --cert pki/server.crt --key pki/server.key --ca pki/ca.crt \
-  --admin-cert pki/admin.crt
+  --cert pki/server.pem --ca pki/ca.crt \
+  --admin-cert pki/admin.pem
 
-# Start the server
+# Start the server (with encrypted key)
 zep-air-serve --port 8443 \
-  --cert pki/server.crt --key pki/server.key --ca pki/ca.crt &
+  --cert pki/server.pem --ca pki/ca.crt \
+  -P 'key-password' &
 ```
 
 ### 4. Define a cluster
@@ -116,7 +110,7 @@ EOF
 
 zep-air-admin \
   --server https://master.zep.lan:8443 \
-  --cert pki/admin.crt --key pki/admin.key --ca pki/ca.crt \
+  --cert pki/admin.pem --ca pki/ca.crt \
   cluster set --file cluster.json
 ```
 
@@ -126,7 +120,7 @@ zep-air-admin \
 # Master — maps cluster pool/fs to local pool/fs
 zep-air-admin \
   --server https://master.zep.lan:8443 \
-  --cert pki/admin.crt --key pki/admin.key --ca pki/ca.crt \
+  --cert pki/admin.pem --ca pki/ca.crt \
   join --role master --cluster prod --node za-master \
   --cert pki/za-master.crt \
   --map "tank-prod/data:rpool/master, tank-prod/home:rpool/master-home"
@@ -146,10 +140,10 @@ zep-air-admin \
 ```sh
 zep-air config set node_name za-master
 zep-air config set server_url https://master.zep.lan:8443
-zep-air config set cert_path pki/za-master.crt
-zep-air config set key_path  pki/za-master.key
+zep-air config set cert_path pki/za-master.pem
 zep-air config set ca_path   pki/ca.crt
 zep-air config set cluster prod
+# zep-air config set key_password 'password'  # if key is encrypted
 zep-air config set mapping "tank-prod/data:rpool/master, tank-prod/home:rpool/master-home"
 
 zep-air cron --daemon
@@ -159,10 +153,10 @@ zep-air cron --daemon
 ```sh
 zep-air config set node_name za-client-1
 zep-air config set server_url https://master.zep.lan:8443
-zep-air config set cert_path pki/za-client-1.crt
-zep-air config set key_path  pki/za-client-1.key
+zep-air config set cert_path pki/za-client-1.pem
 zep-air config set ca_path   pki/ca.crt
 zep-air config set cluster prod
+# zep-air config set key_password 'password'  # if key is encrypted
 zep-air config set mapping "tank-prod/data:vault/data(day:90), tank-prod/home:vault/home"
 
 zep-air cron --daemon
@@ -235,9 +229,10 @@ zep-air config list
 |-----|-------------|
 | `node_name` | This node's identity (must match cert CN) |
 | `server_url` | `zep-air-serve` URL (e.g. `https://srv:8443`) |
-| `cert_path` | Path to this node's TLS client cert |
-| `key_path` | Path to this node's TLS private key |
+| `cert_path` | Path to this node's TLS client cert (`.pem` or `.crt`) |
+| `key_path` | Path to private key (defaults to cert_path for combined `.pem`) |
 | `ca_path` | Path to CA certificate |
+| `key_password` | Password for encrypted private key |
 | `cluster` | Cluster name to operate on |
 | `mapping` | Pool/fs translation: `cluster_fs:local_fs(label:ret,...),...` |
 | `chunk_size` | Max blob size in bytes (default 10 MB) |
@@ -251,10 +246,11 @@ Options:
   --setup, -S           One-time: store CA, server, and admin certs in DB
   --port, -p PORT       Listen port (default 8443)
   --storage, -s DIR     Blob storage directory (default /var/lib/zep-air)
-  --cert, -c FILE       Server TLS certificate (PEM)
-  --key, -k FILE        Server TLS private key (PEM)
+  --cert, -c FILE       Server TLS certificate (PEM, combined cert+key)
+  --key, -k FILE        Server private key (defaults to --cert for .pem)
   --ca, -a FILE         CA certificate for client auth (PEM)
   --admin-cert FILE     Admin client cert for --setup mode (PEM)
+  --password, -P PASS   Password for encrypted private key
   --db, -D FILE         SQLite database path
   --verbose, -v         Verbose logging
 ```
@@ -266,9 +262,10 @@ zep-air-admin [global options] <command> [args]
 
 Global:
   --server, -s URL      Server URL
-  --cert, -c FILE       Admin client certificate
-  --key, -k FILE        Admin client key
+  --cert, -c FILE       Admin client certificate (PEM, combined cert+key)
+  --key, -k FILE        Private key (defaults to --cert for .pem)
   --ca, -C FILE         CA certificate
+  --password, -P PASS   Password for encrypted private key
 
 Commands:
   cluster set --file JSON   Define a cluster
