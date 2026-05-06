@@ -108,6 +108,8 @@ err_t db_config_load(sqlite3 *db, zep_config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->chunk_size = ZEP_DEFAULT_CHUNK_SZ;
 
+    db_config_get(db, "cluster",     cfg->cluster,    sizeof(cfg->cluster));
+    db_config_get(db, "mapping",     cfg->mapping,    sizeof(cfg->mapping));
     db_config_get(db, "storage_root", cfg->storage_root, sizeof(cfg->storage_root));
     db_config_get(db, "server_url",  cfg->server_url,  sizeof(cfg->server_url));
     db_config_get(db, "node_name",   cfg->node_name,   sizeof(cfg->node_name));

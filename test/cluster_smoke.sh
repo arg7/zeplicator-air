@@ -116,6 +116,24 @@ for user in za-master za-client-1 za-client-2; do
     sudo -u "$user" "$ZEP" --db "$db" config set ca_path "$PKI/ca.crt"
 done
 
+# ---- configure cluster + mapping ----
+sudo -u za-master "$ZEP" --db /tmp/zep-air/za-master.db config set cluster test
+sudo -u za-master "$ZEP" --db /tmp/zep-air/za-master.db config set mapping \
+    "za-pool-1/za-data-1:za-master-pool/master"
+sudo -u za-client-1 "$ZEP" --db /tmp/zep-air/za-client-1.db config set mapping \
+    "za-pool-1/za-data-1:za-client-1-pool/slave"
+sudo -u za-client-2 "$ZEP" --db /tmp/zep-air/za-client-2.db config set mapping \
+    "za-pool-1/za-data-1:za-client-2-pool/slave"
+
+# ---- register nodes via admin ----
+BASE="--server https://master.zep.lan:18443 --cert $PKI/admin.crt --key $PKI/admin.key --ca $PKI/ca.crt"
+"$ADMIN" $BASE join --role master --node za-master --cert "$PKI/za-master.crt" --cluster test \
+    --map "za-pool-1/za-data-1:za-master-pool/master" >/dev/null
+"$ADMIN" $BASE join --role client --node za-client-1 --cert "$PKI/za-client-1.crt" --cluster test \
+    --map "za-pool-1/za-data-1:za-client-1-pool/slave" >/dev/null
+"$ADMIN" $BASE join --role client --node za-client-2 --cert "$PKI/za-client-2.crt" --cluster test \
+    --map "za-pool-1/za-data-1:za-client-2-pool/slave" >/dev/null
+
 echo ""
 
 # ---- test 1: master push full ----

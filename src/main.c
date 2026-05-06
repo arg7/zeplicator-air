@@ -24,14 +24,16 @@ static void usage(const char *prog) {
         "  status  Show replication status\n"
         "\n"
         "Push options:\n"
-        "  --filesystem, -f FS    ZFS filesystem (required)\n"
+        "  --filesystem, -f FS    ZFS filesystem (optional, use mapping instead)\n"
         "  --label, -l LABEL      Snapshot label (required)\n"
         "  --db PATH              Database path (default: %s)\n"
+        "  [FS1 FS2 ...]          Cluster filesystem names (uses mapping)\n"
         "\n"
         "Pull options:\n"
-        "  --filesystem, -f FS    ZFS filesystem (required)\n"
+        "  --filesystem, -f FS    ZFS filesystem (optional, use mapping instead)\n"
         "  --donor, -d NODE       Donor node name\n"
         "  --db PATH              Database path (default: %s)\n"
+        "  [FS1 FS2 ...]          Cluster filesystem names (uses mapping)\n"
         "\n"
         "Config options:\n"
         "  set KEY VALUE          Set a configuration value\n"
@@ -73,8 +75,8 @@ static int cmd_push(int argc, char *argv[]) {
         }
     }
 
-    if (!filesystem[0] || !label[0]) {
-        fprintf(stderr, "error: --filesystem and --label are required\n");
+    if (!label[0]) {
+        fprintf(stderr, "error: --label is required\n");
         return 1;
     }
 
@@ -92,10 +94,49 @@ static int cmd_push(int argc, char *argv[]) {
     snprintf(http_cfg.key_path, sizeof(http_cfg.key_path), "%s", cfg.key_path);
     snprintf(http_cfg.ca_path, sizeof(http_cfg.ca_path), "%s", cfg.ca_path);
 
-    err_t ret = pipeline_push(db, &cfg, &http_cfg, filesystem, label);
+    int pushed = 0;
+
+    if (filesystem[0]) {
+        err_t ret = pipeline_push(db, &cfg, &http_cfg, filesystem, label);
+        if (ret == ZEP_ERR_OK) pushed++;
+    } else if (optind < argc) {
+        for (int i = optind; i < argc; i++) {
+            char local_fs[ZEP_MAX_SNAPSHOT_NAME];
+            if (pipeline_resolve_fs(argv[i], cfg.mapping,
+                                    local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
+                err_t ret = pipeline_push(db, &cfg, &http_cfg, local_fs, label);
+                if (ret == ZEP_ERR_OK) pushed++;
+            } else {
+                fprintf(stderr, "push: no mapping for '%s'\n", argv[i]);
+            }
+        }
+    } else if (cfg.mapping[0]) {
+        const char *p = cfg.mapping;
+        while (*p) {
+            const char *colon = strchr(p, ':');
+            if (!colon) break;
+            char local_fs[ZEP_MAX_SNAPSHOT_NAME];
+            const char *start = colon + 1;
+            const char *end = strchr(start, ',');
+            if (!end) end = start + strlen(start);
+            const char *paren = strchr(start, '(');
+            size_t n = paren ? (size_t)(paren - start) : (size_t)(end - start);
+            if (n >= sizeof(local_fs)) n = sizeof(local_fs) - 1;
+            memcpy(local_fs, start, n);
+            local_fs[n] = '\0';
+            err_t ret = pipeline_push(db, &cfg, &http_cfg, local_fs, label);
+            if (ret == ZEP_ERR_OK) pushed++;
+            const char *comma = strchr(colon, ',');
+            p = comma ? comma + 1 : colon + strlen(colon);
+        }
+    } else {
+        fprintf(stderr, "error: no filesystem specified (use -f, positional args, or configure mapping)\n");
+        db_close(db);
+        return 1;
+    }
 
     db_close(db);
-    return ret == ZEP_ERR_OK ? 0 : 1;
+    return pushed > 0 ? 0 : 1;
 }
 
 static int cmd_pull(int argc, char *argv[]) {
@@ -121,11 +162,6 @@ static int cmd_pull(int argc, char *argv[]) {
         }
     }
 
-    if (!filesystem[0]) {
-        fprintf(stderr, "error: --filesystem is required\n");
-        return 1;
-    }
-
     sqlite3 *db = NULL;
     if (db_open(g_db_path, &db) != ZEP_ERR_OK) return 1;
     db_init_tables(db);
@@ -137,6 +173,12 @@ static int cmd_pull(int argc, char *argv[]) {
         snprintf(donor, sizeof(donor), "%s", cfg.node_name);
     }
 
+    if (!filesystem[0] && optind >= argc && !cfg.mapping[0]) {
+        fprintf(stderr, "error: no filesystem specified (use -f, positional args, or configure mapping)\n");
+        db_close(db);
+        return 1;
+    }
+
     http_config_t http_cfg;
     memset(&http_cfg, 0, sizeof(http_cfg));
     snprintf(http_cfg.server_url, sizeof(http_cfg.server_url), "%s", cfg.server_url);
@@ -144,10 +186,45 @@ static int cmd_pull(int argc, char *argv[]) {
     snprintf(http_cfg.key_path, sizeof(http_cfg.key_path), "%s", cfg.key_path);
     snprintf(http_cfg.ca_path, sizeof(http_cfg.ca_path), "%s", cfg.ca_path);
 
-    err_t ret = pipeline_pull(db, &cfg, &http_cfg, filesystem, donor);
+    int pulled = 0;
+
+    if (filesystem[0]) {
+        err_t ret = pipeline_pull(db, &cfg, &http_cfg, filesystem, donor);
+        if (ret == ZEP_ERR_OK) pulled++;
+    } else if (optind < argc) {
+        for (int i = optind; i < argc; i++) {
+            char local_fs[ZEP_MAX_SNAPSHOT_NAME];
+            if (pipeline_resolve_fs(argv[i], cfg.mapping,
+                                    local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
+                err_t ret = pipeline_pull(db, &cfg, &http_cfg, local_fs, donor);
+                if (ret == ZEP_ERR_OK) pulled++;
+            } else {
+                fprintf(stderr, "pull: no mapping for '%s'\n", argv[i]);
+            }
+        }
+    } else if (cfg.mapping[0]) {
+        const char *p = cfg.mapping;
+        while (*p) {
+            const char *colon = strchr(p, ':');
+            if (!colon) break;
+            char local_fs[ZEP_MAX_SNAPSHOT_NAME];
+            const char *start = colon + 1;
+            const char *end = strchr(start, ',');
+            if (!end) end = start + strlen(start);
+            const char *paren = strchr(start, '(');
+            size_t n = paren ? (size_t)(paren - start) : (size_t)(end - start);
+            if (n >= sizeof(local_fs)) n = sizeof(local_fs) - 1;
+            memcpy(local_fs, start, n);
+            local_fs[n] = '\0';
+            err_t ret = pipeline_pull(db, &cfg, &http_cfg, local_fs, donor);
+            if (ret == ZEP_ERR_OK) pulled++;
+            const char *comma = strchr(colon, ',');
+            p = comma ? comma + 1 : colon + strlen(colon);
+        }
+    }
 
     db_close(db);
-    return ret == ZEP_ERR_OK ? 0 : 1;
+    return pulled > 0 ? 0 : 1;
 }
 
 static int cmd_config(int argc, char *argv[]) {

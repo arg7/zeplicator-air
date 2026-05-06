@@ -2,12 +2,72 @@
 #include "storage.h"
 #include "zfs.h"
 #include "db.h"
+#include "http.h"
 #include "common.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <openssl/evp.h>
+
+err_t pipeline_resolve_fs(const char *cluster_fs, const char *mapping,
+                          char *local_fs, size_t len) {
+    if (!cluster_fs || !mapping) return ZEP_ERR_NOT_FOUND;
+    const char *p = mapping;
+    while (*p) {
+        const char *colon = strchr(p, ':');
+        if (!colon) break;
+        size_t cf_len = (size_t)(colon - p);
+        if (strncmp(p, cluster_fs, cf_len) == 0 && (size_t)strlen(cluster_fs) == cf_len) {
+            const char *start = colon + 1;
+            const char *end = strchr(start, ',');
+            if (!end) end = start + strlen(start);
+            const char *paren = strchr(start, '(');
+            size_t n = paren ? (size_t)(paren - start) : (size_t)(end - start);
+            if (n >= len) n = len - 1;
+            memcpy(local_fs, start, n);
+            local_fs[n] = '\0';
+            return ZEP_ERR_OK;
+        }
+        const char *comma = strchr(colon, ',');
+        p = comma ? comma + 1 : colon + strlen(colon);
+    }
+    return ZEP_ERR_NOT_FOUND;
+}
+
+int pipeline_has_mapping(const char *cluster_fs, const char *mapping) {
+    char buf[512];
+    return pipeline_resolve_fs(cluster_fs, mapping, buf, sizeof(buf)) == ZEP_ERR_OK;
+}
+
+err_t pipeline_for_each_fs(const char *mapping,
+                           void (*cb)(const char *cluster_fs, const char *local_fs,
+                                      void *user), void *user) {
+    if (!mapping || !mapping[0]) return ZEP_ERR_NOT_FOUND;
+    const char *p = mapping;
+    while (*p) {
+        const char *colon = strchr(p, ':');
+        if (!colon) break;
+        char cf[256], lf[256];
+        size_t cf_len = (size_t)(colon - p);
+        if (cf_len >= sizeof(cf)) cf_len = sizeof(cf) - 1;
+        memcpy(cf, p, cf_len); cf[cf_len] = '\0';
+
+        const char *start = colon + 1;
+        const char *end = strchr(start, ',');
+        if (!end) end = start + strlen(start);
+        const char *paren = strchr(start, '(');
+        size_t lf_len = paren ? (size_t)(paren - start) : (size_t)(end - start);
+        if (lf_len >= sizeof(lf)) lf_len = sizeof(lf) - 1;
+        memcpy(lf, start, lf_len); lf[lf_len] = '\0';
+
+        cb(cf, lf, user);
+
+        const char *comma = strchr(colon, ',');
+        p = comma ? comma + 1 : colon + strlen(colon);
+    }
+    return ZEP_ERR_OK;
+}
 
 static void sha256_hex(const unsigned char *data, size_t len, char hex[65]) {
     unsigned char hash[EVP_MAX_MD_SIZE];

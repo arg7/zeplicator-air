@@ -48,6 +48,8 @@ typedef struct {
 } snapshot_meta_t;
 
 typedef struct {
+    char cluster[64];
+    char mapping[2048];
     char storage_root[ZEP_MAX_PATH];
     char server_url[512];
     char node_name[64];
