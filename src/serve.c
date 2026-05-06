@@ -18,10 +18,6 @@
 #include <openssl/bio.h>
 #include <cjson/cJSON.h>
 
-static void ssl_ctx_setup(void *cls) {
-    (void)cls;
-}
-
 static char g_storage_root[ZEP_MAX_PATH] = "/var/lib/zep-air";
 static char g_db_path[ZEP_MAX_PATH]       = "/var/lib/zep-air/zep-air.db";
 static int  g_port = 8443;
@@ -281,16 +277,8 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         snprintf(ctx->method, sizeof(ctx->method), "%s", method);
         snprintf(ctx->target_url, sizeof(ctx->target_url), "%s", url);
 
-        const union MHD_ConnectionInfo *info = MHD_get_connection_info(
-            conn, MHD_CONNECTION_INFO_GNUTLS_CLIENT_CERT);
-        int has_cert = (info && info->client_cert) ? 1 : 0;
-
         if (strcmp(url, "/health") == 0) {
             return send_response(conn, 200, "text/plain", "ok", 2);
-        }
-
-        if (!has_cert) {
-            return send_error(conn, 401, "Client certificate required");
         }
 
         ctx->authed = 1;
@@ -674,7 +662,6 @@ int serve_main(int argc, char *argv[]) {
                                  MHD_OPTION_HTTPS_MEM_CERT, cert_pem,
                                  MHD_OPTION_HTTPS_MEM_KEY, key_pem,
                                  MHD_OPTION_HTTPS_MEM_TRUST, ca_pem,
-                                 MHD_OPTION_HTTPS_CERT_CALLBACK, &ssl_ctx_setup,
                                  MHD_OPTION_END);
 
     free(cert_pem);

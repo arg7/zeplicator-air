@@ -178,7 +178,7 @@ static int cmd_join(int argc, char *argv[]) {
         {0, 0, 0, 0}
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "r:n:c:", opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+r:n:c:", opts, NULL)) != -1) {
         switch (opt) {
             case 'r': role = optarg; break;
             case 'n': node = optarg; break;
@@ -257,7 +257,16 @@ static void usage(const char *prog) {
 int main(int argc, char *argv[]) {
     const char *argv2[64];
     int argc2 = 0;
+
     for (int i = 0; i < argc && argc2 < 63; i++) {
+        if (strcmp(argv[i], "join") == 0 ||
+            strcmp(argv[i], "list-nodes") == 0 ||
+            strcmp(argv[i], "remove-node") == 0) {
+            argv2[argc2++] = argv[i];
+            for (int j = i + 1; j < argc && argc2 < 63; j++)
+                argv2[argc2++] = argv[j];
+            break;
+        }
         if (strcmp(argv[i], "--server") == 0 && i + 1 < argc) {
             snprintf(g_server, sizeof(g_server), "%s", argv[++i]);
         } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
