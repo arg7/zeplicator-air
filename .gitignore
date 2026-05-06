@@ -1,6 +1,7 @@
 # Build artifacts
 zep-air
 zep-air-serve
+zep-air-admin
 *.o
 *.a
 *.so
@@ -17,6 +18,14 @@ zep-air-serve
 *.swp
 *.swo
 *~
+
+# PKI generated files
+pki/*.crt
+pki/*.key
+pki/*.csr
+pki/*.ext
+pki/*.srl
+!pki/mk-*.sh
 
 # Temp
 /tmp/
