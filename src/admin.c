@@ -168,66 +168,6 @@ static int json_escape(const char *src, char *dst, size_t dst_len) {
     return (int)j;
 }
 
-static int cmd_setup(int argc, char *argv[]) {
-    char *ca_file = NULL, *cert_file = NULL, *key_file = NULL;
-
-    static struct option opts[] = {
-        {"ca",   required_argument, 0, 'C'},
-        {"cert", required_argument, 0, 'c'},
-        {"key",  required_argument, 0, 'k'},
-        {0, 0, 0, 0}
-    };
-    int opt;
-    while ((opt = getopt_long(argc, argv, "C:c:k:", opts, NULL)) != -1) {
-        switch (opt) {
-            case 'C': ca_file = optarg; break;
-            case 'c': cert_file = optarg; break;
-            case 'k': key_file = optarg; break;
-        }
-    }
-    if (!ca_file || !cert_file || !key_file) {
-        fprintf(stderr, "Usage: zep-air-admin setup --ca <ca.crt> --cert <server.crt> --key <server.key>\n");
-        return 1;
-    }
-
-    char *ca_pem = read_file_str(ca_file);
-    char *cert_pem = read_file_str(cert_file);
-    char *key_pem = read_file_str(key_file);
-    if (!ca_pem || !cert_pem || !key_pem) {
-        free(ca_pem); free(cert_pem); free(key_pem);
-        return 1;
-    }
-
-    char *ca_esc = malloc(strlen(ca_pem) * 2 + 1);
-    char *cert_esc = malloc(strlen(cert_pem) * 2 + 1);
-    char *key_esc = malloc(strlen(key_pem) * 2 + 1);
-    if (!ca_esc || !cert_esc || !key_esc) {
-        free(ca_pem); free(cert_pem); free(key_pem);
-        free(ca_esc); free(cert_esc); free(key_esc);
-        return 1;
-    }
-    json_escape(ca_pem, ca_esc, strlen(ca_pem) * 2 + 1);
-    json_escape(cert_pem, cert_esc, strlen(cert_pem) * 2 + 1);
-    json_escape(key_pem, key_esc, strlen(key_pem) * 2 + 1);
-
-    char *body = NULL;
-    if (asprintf(&body,
-        "{\"ca_cert\":\"%s\",\"server_cert\":\"%s\",\"server_key\":\"%s\"}",
-        ca_esc, cert_esc, key_esc) < 0) {
-        free(ca_pem); free(cert_pem); free(key_pem);
-        free(ca_esc); free(cert_esc); free(key_esc);
-        return 1;
-    }
-    free(ca_pem); free(cert_pem); free(key_pem);
-    free(ca_esc); free(cert_esc); free(key_esc);
-
-    char url[1024];
-    snprintf(url, sizeof(url), "%s/v1/admin/setup", g_server);
-    int rc = do_post(url, body);
-    free(body);
-    return rc;
-}
-
 static int cmd_join(int argc, char *argv[]) {
     char *role = NULL, *node = NULL, *cert_file = NULL;
 
@@ -296,7 +236,6 @@ static void usage(const char *prog) {
         "Usage: %s <command> [options]\n"
         "\n"
         "Commands:\n"
-        "  setup        Initial server setup (CA + server certs)\n"
         "  join         Register a master or client node\n"
         "  list-nodes   List registered nodes\n"
         "  remove-node  Remove a node\n"
@@ -307,11 +246,6 @@ static void usage(const char *prog) {
         "  --key, -k FILE     Admin client key (PEM)\n"
         "  --ca, -C FILE      CA certificate (PEM)\n"
         "  --verbose, -v      Verbose output\n"
-        "\n"
-        "Setup options:\n"
-        "  --ca FILE           CA certificate to upload\n"
-        "  --cert FILE         Server certificate to upload\n"
-        "  --key FILE          Server key to upload\n"
         "\n"
         "Join options:\n"
         "  --role master|client  Node role\n"
@@ -365,8 +299,7 @@ int main(int argc, char *argv[]) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
     int rc = 1;
-    if (strcmp(cmd, "setup") == 0)       rc = cmd_setup(sub_argc, sub_argv);
-    else if (strcmp(cmd, "join") == 0)   rc = cmd_join(sub_argc, sub_argv);
+    if (strcmp(cmd, "join") == 0)   rc = cmd_join(sub_argc, sub_argv);
     else if (strcmp(cmd, "list-nodes") == 0) rc = cmd_list_nodes(sub_argc, sub_argv);
     else if (strcmp(cmd, "remove-node") == 0) rc = cmd_remove_node(sub_argc, sub_argv);
     else { fprintf(stderr, "Unknown command: %s\n", cmd); usage(argv2[0]); }

@@ -29,6 +29,7 @@ static char g_cert_path[ZEP_MAX_PATH] = "";
 static char g_key_path[ZEP_MAX_PATH] = "";
 static char g_ca_path[ZEP_MAX_PATH] = "";
 static int  g_verbose = 0;
+static int  g_setup_mode = 0;
 static struct MHD_Daemon *g_daemon = NULL;
 static sqlite3 *g_db = NULL;
 
@@ -321,27 +322,6 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
     /* ── admin routes ── */
     if (strncmp(ctx->target_url, "/v1/admin", 9) == 0) {
         if (strcmp(ctx->method, "POST") == 0) {
-            if (strcmp(ctx->target_url, "/v1/admin/setup") == 0) {
-                cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
-                if (!json) return send_error(conn, 400, "Invalid JSON");
-
-                cJSON *ca = cJSON_GetObjectItem(json, "ca_cert");
-                cJSON *sc = cJSON_GetObjectItem(json, "server_cert");
-                cJSON *sk = cJSON_GetObjectItem(json, "server_key");
-                int ok = 0;
-                if (ca && cJSON_IsString(ca) && sc && cJSON_IsString(sc) && sk && cJSON_IsString(sk)) {
-                    FILE *f = fopen(g_ca_path[0] ? g_ca_path : "/var/lib/zep-air/pki/ca.crt", "w");
-                    if (f) { fputs(ca->valuestring, f); fclose(f); ok++; }
-                    f = fopen(g_cert_path[0] ? g_cert_path : "/var/lib/zep-air/pki/server.crt", "w");
-                    if (f) { fputs(sc->valuestring, f); fclose(f); ok++; }
-                    f = fopen(g_key_path[0] ? g_key_path : "/var/lib/zep-air/pki/server.key", "w");
-                    if (f) { fputs(sk->valuestring, f); fclose(f); ok++; }
-                }
-                cJSON_Delete(json);
-                return ok == 3 ? send_json(conn, 200, "{\"ok\":true}")
-                               : send_error(conn, 500, "Failed to store certs");
-            }
-
             if (strcmp(ctx->target_url, "/v1/admin/nodes") == 0) {
                 cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
                 if (!json) return send_error(conn, 400, "Invalid JSON");
@@ -532,6 +512,7 @@ static void usage_serve(const char *prog) {
     fprintf(stderr, "  -k, --key FILE        TLS server private key (PEM)\n");
     fprintf(stderr, "  -a, --ca FILE         CA certificate for client auth (optional)\n");
     fprintf(stderr, "  -D, --db FILE         SQLite database path (default: /var/lib/zep-air/zep-air.db)\n");
+    fprintf(stderr, "  -S, --setup           Run setup mode: store CA + server certs in DB, then exit\n");
     fprintf(stderr, "  -v, --verbose         Verbose output\n");
     fprintf(stderr, "  -h, --help            This help\n");
 }
@@ -544,13 +525,14 @@ int serve_main(int argc, char *argv[]) {
         {"key",     required_argument, 0, 'k'},
         {"ca",      required_argument, 0, 'a'},
         {"db",      required_argument, 0, 'D'},
+        {"setup",   no_argument,       0, 'S'},
         {"verbose", no_argument,       0, 'v'},
         {"help",    no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:D:vh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:D:Svh", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'p': g_port = atoi(optarg); break;
             case 's': snprintf(g_storage_root, sizeof(g_storage_root), "%s", optarg); break;
@@ -558,10 +540,64 @@ int serve_main(int argc, char *argv[]) {
             case 'k': snprintf(g_key_path, sizeof(g_key_path), "%s", optarg); break;
             case 'a': snprintf(g_ca_path, sizeof(g_ca_path), "%s", optarg); break;
             case 'D': snprintf(g_db_path, sizeof(g_db_path), "%s", optarg); break;
+            case 'S': g_setup_mode = 1; break;
             case 'v': g_verbose = 1; break;
             case 'h': usage_serve(argv[0]); return 0;
             default:  usage_serve(argv[0]); return 1;
         }
+    }
+
+    char *cert_pem = NULL, *key_pem = NULL, *ca_pem = NULL;
+
+    if (g_setup_mode) {
+        if (!g_cert_path[0] || !g_ca_path[0]) {
+            fprintf(stderr, "error: --setup requires --cert, --key, and --ca\n");
+            return 1;
+        }
+        if (load_pem(g_cert_path, &cert_pem) != 0) return 1;
+        if (load_pem(g_key_path, &key_pem) != 0) { free(cert_pem); return 1; }
+        if (load_pem(g_ca_path, &ca_pem) != 0) { free(cert_pem); free(key_pem); return 1; }
+
+        if (db_open(g_db_path, &g_db) != ZEP_ERR_OK) {
+            free(cert_pem); free(key_pem); free(ca_pem);
+            return 1;
+        }
+        db_init_tables(g_db);
+
+        X509 *cert = NULL;
+        FILE *cf = fopen(g_cert_path, "r");
+        if (cf) { cert = PEM_read_X509(cf, NULL, NULL, NULL); fclose(cf); }
+
+        X509 *ca = NULL;
+        FILE *caf = fopen(g_ca_path, "r");
+        if (caf) { ca = PEM_read_X509(caf, NULL, NULL, NULL); fclose(caf); }
+
+        if (ca) {
+            char *fp = auth_cert_fingerprint(ca);
+            if (fp) {
+                char *cn = auth_extract_cn(ca);
+                db_cert_store(g_db, cn ? cn : "Zep-Air testing", fp, ca_pem, "server");
+                printf("Setup: stored CA  CN=%s  fingerprint=%s\n", cn ? cn : "?", fp);
+                free(cn); free(fp);
+            }
+            X509_free(ca);
+        }
+
+        if (cert) {
+            char *fp = auth_cert_fingerprint(cert);
+            if (fp) {
+                char *cn = auth_extract_cn(cert);
+                db_cert_store(g_db, cn ? cn : "server", fp, cert_pem, "server");
+                printf("Setup: stored server cert  CN=%s  fingerprint=%s\n", cn ? cn : "?", fp);
+                free(cn); free(fp);
+            }
+            X509_free(cert);
+        }
+
+        printf("Setup complete.\n");
+        db_close(g_db);
+        free(cert_pem); free(key_pem); free(ca_pem);
+        return 0;
     }
 
     if (!g_cert_path[0] || !g_key_path[0]) {
@@ -569,7 +605,6 @@ int serve_main(int argc, char *argv[]) {
         return 1;
     }
 
-    char *cert_pem = NULL, *key_pem = NULL, *ca_pem = NULL;
     if (load_pem(g_cert_path, &cert_pem) != 0) return 1;
     if (load_pem(g_key_path, &key_pem) != 0) { free(cert_pem); return 1; }
     if (g_ca_path[0] && load_pem(g_ca_path, &ca_pem) != 0) {
