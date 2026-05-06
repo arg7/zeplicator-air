@@ -22,5 +22,6 @@ err_t http_get_blob(const http_config_t *cfg, const char *node,
                     void **data, size_t *len);
 err_t http_list_snapshots(const http_config_t *cfg, const char *node,
                           int limit, char ***prefixes, int *count);
+char *http_get_json(const http_config_t *cfg, const char *path);
 
 #endif

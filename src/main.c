@@ -4,10 +4,12 @@
 #include "pipeline.h"
 #include "storage.h"
 #include "http.h"
+#include <cjson/cJSON.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
+#include <unistd.h>
 
 static char g_db_path[ZEP_MAX_PATH] = "zep-air.db";
 
@@ -19,6 +21,7 @@ static void usage(const char *prog) {
         "\n"
         "Commands:\n"
         "  snap    Create local snapshots (no push)\n"
+        "  cron    Query server for due tasks, execute push/pull\n"
         "  push    Push a snapshot to the storage intermediary\n"
         "  pull    Pull snapshots from the storage intermediary\n"
         "  config  Manage configuration\n"
@@ -324,6 +327,101 @@ static int cmd_snap(int argc, char *argv[]) {
     return created > 0 ? 0 : 1;
 }
 
+static int cmd_cron(int argc, char *argv[]) {
+    int daemon_mode = 0;
+    int interval = 60;
+
+    static struct option opts[] = {
+        {"daemon",  no_argument,       0, 'd'},
+        {"interval", required_argument, 0, 'i'},
+        {"db",       required_argument, 0, 'D'},
+        {"help",     no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
+    int opt;
+    while ((opt = getopt_long(argc, argv, "di:D:h", opts, NULL)) != -1) {
+        switch (opt) {
+            case 'd': daemon_mode = 1; break;
+            case 'i': interval = atoi(optarg); if (interval < 10) interval = 10; break;
+            case 'D': snprintf(g_db_path, sizeof(g_db_path), "%s", optarg); break;
+            case 'h': usage(argv[0]); return 0;
+            default:  return 1;
+        }
+    }
+
+    sqlite3 *db = NULL;
+    if (db_open(g_db_path, &db) != ZEP_ERR_OK) return 1;
+    db_init_tables(db);
+    zep_config_t cfg;
+    db_config_load(db, &cfg);
+
+    http_config_t http_cfg;
+    memset(&http_cfg, 0, sizeof(http_cfg));
+    snprintf(http_cfg.server_url, sizeof(http_cfg.server_url), "%s", cfg.server_url);
+    snprintf(http_cfg.cert_path, sizeof(http_cfg.cert_path), "%s", cfg.cert_path);
+    snprintf(http_cfg.key_path, sizeof(http_cfg.key_path), "%s", cfg.key_path);
+    snprintf(http_cfg.ca_path, sizeof(http_cfg.ca_path), "%s", cfg.ca_path);
+    db_close(db);
+
+    do {
+        char *json = http_get_json(&http_cfg, "/v1/cron/sync");
+        if (!json) {
+            if (daemon_mode) { sleep((unsigned int)interval); continue; }
+            return 1;
+        }
+
+        cJSON *tasks = cJSON_Parse(json);
+        free(json);
+        if (!tasks || !cJSON_IsArray(tasks)) {
+            if (tasks) cJSON_Delete(tasks);
+            if (daemon_mode) { sleep((unsigned int)interval); continue; }
+            return 1;
+        }
+
+        cJSON *task;
+        cJSON_ArrayForEach(task, tasks) {
+            cJSON *action = cJSON_GetObjectItem(task, "action");
+            cJSON *cfs = cJSON_GetObjectItem(task, "cluster_fs");
+            cJSON *label = cJSON_GetObjectItem(task, "label");
+            cJSON *guid = cJSON_GetObjectItem(task, "guid");
+
+            if (!action || !cJSON_IsString(action)) continue;
+
+            if (strcmp(action->valuestring, "push") == 0 &&
+                cfs && cJSON_IsString(cfs) &&
+                label && cJSON_IsString(label)) {
+                char local_fs[ZEP_MAX_SNAPSHOT_NAME];
+                if (db_open(g_db_path, &db) == ZEP_ERR_OK) {
+                    db_init_tables(db);
+                    zep_config_t cfg2;
+                    db_config_load(db, &cfg2);
+                    if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
+                                            local_fs, sizeof(local_fs)) == ZEP_ERR_OK)
+                        pipeline_push(db, &cfg2, &http_cfg, local_fs, label->valuestring);
+                    db_close(db);
+                }
+            } else if (strcmp(action->valuestring, "pull") == 0 &&
+                       cfs && cJSON_IsString(cfs) && guid && cJSON_IsString(guid)) {
+                char local_fs[ZEP_MAX_SNAPSHOT_NAME];
+                if (db_open(g_db_path, &db) == ZEP_ERR_OK) {
+                    db_init_tables(db);
+                    zep_config_t cfg2;
+                    db_config_load(db, &cfg2);
+                    if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
+                                            local_fs, sizeof(local_fs)) == ZEP_ERR_OK)
+                        pipeline_pull(db, &cfg2, &http_cfg, local_fs, cfg2.node_name);
+                    db_close(db);
+                }
+            }
+        }
+        cJSON_Delete(tasks);
+
+        if (daemon_mode) sleep((unsigned int)interval);
+    } while (daemon_mode);
+
+    return 0;
+}
+
 static int cmd_config(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: zep-air config <set|get|list> [args]\n");
@@ -468,6 +566,7 @@ int main(int argc, char *argv[]) {
     int sub_argc = argc2 - 1;
 
     if (strcmp(cmd, "snap") == 0)   return cmd_snap(sub_argc, sub_argv);
+    if (strcmp(cmd, "cron") == 0)   return cmd_cron(sub_argc, sub_argv);
     if (strcmp(cmd, "push") == 0)   return cmd_push(sub_argc, sub_argv);
     if (strcmp(cmd, "pull") == 0)   return cmd_pull(sub_argc, sub_argv);
     if (strcmp(cmd, "config") == 0) return cmd_config(sub_argc, sub_argv);

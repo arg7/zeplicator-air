@@ -256,6 +256,26 @@ static void verify_snapshot(const char *cluster_key, const char *prefix) {
     const char *pusher = meta.host[0] ? meta.host : cluster_key;
     db_chain_insert(db, cluster_key, toguid, fromguid, meta.snapshot, pusher);
 
+    if (meta.label[0]) {
+        const char *at = strchr(meta.snapshot, '@');
+        if (at) {
+            size_t fs_len = (size_t)(at - meta.snapshot);
+            char fs_buf[256];
+            if (fs_len >= sizeof(fs_buf)) fs_len = sizeof(fs_buf) - 1;
+            memcpy(fs_buf, meta.snapshot, fs_len);
+            fs_buf[fs_len] = '\0';
+            char cron_key[1024];
+            snprintf(cron_key, sizeof(cron_key),
+                     "cron_last_%s_%s_%s", cluster_key, fs_buf, meta.label);
+            char now_str[32];
+            time_t tnow = time(NULL);
+            struct tm tm;
+            gmtime_r(&tnow, &tm);
+            strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
+            db_config_set(db, cron_key, now_str);
+        }
+    }
+
     if (g_verbose) {
         printf("verify: cluster=%s toguid=%s fromguid=%s snap=%s\n",
                cluster_key, toguid, fromguid, meta.snapshot);
@@ -513,6 +533,112 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         }
 
         return send_error(conn, 404, "Admin endpoint not found");
+    }
+
+    /* ── cron sync endpoint ── */
+    if (strcmp(ctx->method, "GET") == 0 &&
+        strcmp(ctx->target_url, "/v1/cron/sync") == 0) {
+        char role[16] = {0}, cluster_name[64] = {0};
+        if (ctx->node[0]) {
+            db_cert_lookup(g_db, ctx->node,
+                           (char[96]){0}, 96);
+            sqlite3_stmt *st = NULL;
+            sqlite3_prepare_v2(g_db,
+                "SELECT role, cluster FROM auth WHERE cn = ?",
+                -1, &st, NULL);
+            if (st) {
+                sqlite3_bind_text(st, 1, ctx->node, -1, SQLITE_STATIC);
+                if (sqlite3_step(st) == SQLITE_ROW) {
+                    const char *r = (const char *)sqlite3_column_text(st, 0);
+                    const char *c = (const char *)sqlite3_column_text(st, 1);
+                    snprintf(role, sizeof(role), "%s", r ? r : "");
+                    snprintf(cluster_name, sizeof(cluster_name), "%s", c ? c : "");
+                }
+                sqlite3_finalize(st);
+            }
+        }
+
+        cJSON *tasks = cJSON_CreateArray();
+        time_t now = time(NULL);
+
+        if (strcmp(role, "master") == 0 && cluster_name[0]) {
+            char cfg_key[128], cluster_json[65536] = {0};
+            snprintf(cfg_key, sizeof(cfg_key), "cluster_%s", cluster_name);
+            if (db_config_get(g_db, cfg_key, cluster_json,
+                              sizeof(cluster_json)) == ZEP_ERR_OK) {
+                cJSON *cj = cJSON_Parse(cluster_json);
+                if (cj) {
+                    cJSON *pools = cJSON_GetObjectItem(cj, "pools");
+                    if (pools) {
+                        cJSON *pool;
+                        cJSON_ArrayForEach(pool, pools) {
+                            cJSON *fs;
+                            cJSON_ArrayForEach(fs, pool) {
+                                char cluster_fs[512];
+                                snprintf(cluster_fs, sizeof(cluster_fs),
+                                         "%s/%s", pool->string, fs->string);
+                                cJSON *labels = cJSON_GetObjectItem(fs, "labels");
+                                if (labels) {
+                                    cJSON *lbl;
+                                    cJSON_ArrayForEach(lbl, labels) {
+                                        int interval_min = lbl->valueint;
+                                        char cron_key[1024];
+                                        snprintf(cron_key, sizeof(cron_key),
+                                            "cron_last_%s_%s_%s",
+                                            cluster_name, cluster_fs, lbl->string);
+                                        char last_str[32] = {0};
+                                        db_config_get(g_db, cron_key, last_str,
+                                                      sizeof(last_str));
+                                        time_t last = 0;
+                                        if (last_str[0]) {
+                                            struct tm tm = {0};
+                                            if (strptime(last_str, "%Y-%m-%dT%H:%M:%SZ", &tm))
+                                                last = timegm(&tm);
+                                        }
+                                        if (last == 0 || (now - last) >= interval_min * 60) {
+                                            cJSON *t = cJSON_CreateObject();
+                                            cJSON_AddStringToObject(t, "action", "push");
+                                            cJSON_AddStringToObject(t, "cluster_fs", cluster_fs);
+                                            cJSON_AddStringToObject(t, "label", lbl->string);
+                                            cJSON_AddItemToArray(tasks, t);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    cJSON_Delete(cj);
+                }
+            }
+        } else if (strcmp(role, "client") == 0 && cluster_name[0]) {
+            sqlite3_stmt *st = NULL;
+            sqlite3_prepare_v2(g_db,
+                "SELECT toguid, snapshot FROM cluster_chain "
+                "WHERE cluster_key = ?1 AND toguid NOT IN "
+                "(SELECT toguid FROM cluster_chain WHERE cluster_key = ?1 "
+                " INTERSECT SELECT guid FROM pulled WHERE 1=0) "
+                "ORDER BY rowid ASC LIMIT 20",
+                -1, &st, NULL);
+            if (st) {
+                sqlite3_bind_text(st, 1, cluster_name, -1, SQLITE_STATIC);
+                while (sqlite3_step(st) == SQLITE_ROW) {
+                    cJSON *t = cJSON_CreateObject();
+                    cJSON_AddStringToObject(t, "action", "pull");
+                    cJSON_AddStringToObject(t, "guid",
+                        (const char *)sqlite3_column_text(st, 0));
+                    cJSON_AddStringToObject(t, "snapshot",
+                        (const char *)sqlite3_column_text(st, 1));
+                    cJSON_AddItemToArray(tasks, t);
+                }
+                sqlite3_finalize(st);
+            }
+        }
+
+        char *js = cJSON_PrintUnformatted(tasks);
+        cJSON_Delete(tasks);
+        enum MHD_Result ret = send_json(conn, 200, js);
+        free(js);
+        return ret;
     }
 
     if (strcmp(ctx->method, "PUT") == 0) {

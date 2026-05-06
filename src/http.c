@@ -272,3 +272,21 @@ err_t http_list_snapshots(const http_config_t *cfg, const char *node,
     *count = cnt;
     return ZEP_ERR_OK;
 }
+
+char *http_get_json(const http_config_t *cfg, const char *path) {
+    char *url = NULL;
+    if (asprintf(&url, "%s%s", cfg->server_url, path) < 0)
+        return NULL;
+
+    struct resp_buf rb = {0};
+    CURL *curl = http_init(cfg, url, &rb);
+    free(url);
+    if (!curl) return NULL;
+
+    int rc = http_do(curl);
+    if (rc != ZEP_ERR_OK || !rb.data) {
+        free(rb.data);
+        return NULL;
+    }
+    return rb.data;
+}
