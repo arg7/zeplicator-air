@@ -44,6 +44,8 @@ static CURL *http_init(const http_config_t *cfg, const char *url,
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+    if (cfg->key_password[0])
+        curl_easy_setopt(curl, CURLOPT_KEYPASSWD, cfg->key_password);
     return curl;
 }
 

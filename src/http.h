@@ -8,6 +8,7 @@ typedef struct {
     char cert_path[ZEP_MAX_PATH];
     char key_path[ZEP_MAX_PATH];
     char ca_path[ZEP_MAX_PATH];
+    char key_password[128];
 } http_config_t;
 
 err_t http_put_blob(const http_config_t *cfg, const char *node,

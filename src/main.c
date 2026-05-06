@@ -59,6 +59,7 @@ static void usage(const char *prog) {
         "  cert_path        Path to TLS client certificate\n"
         "  key_path         Path to TLS client key\n"
         "  ca_path          Path to CA certificate\n"
+        "  key_password     Password for encrypted key\n"
         "  chunk_size       Max blob size in bytes (default: %d)\n",
         ZEP_VERSION, prog, g_db_path, g_db_path, g_db_path, g_db_path, ZEP_DEFAULT_CHUNK_SZ);
 }
@@ -104,6 +105,7 @@ static int cmd_push(int argc, char *argv[]) {
     snprintf(http_cfg.cert_path, sizeof(http_cfg.cert_path), "%s", cfg.cert_path);
     snprintf(http_cfg.key_path, sizeof(http_cfg.key_path), "%s", cfg.key_path);
     snprintf(http_cfg.ca_path, sizeof(http_cfg.ca_path), "%s", cfg.ca_path);
+    snprintf(http_cfg.key_password, sizeof(http_cfg.key_password), "%s", cfg.key_password);
 
     int pushed = 0;
 
@@ -196,6 +198,7 @@ static int cmd_pull(int argc, char *argv[]) {
     snprintf(http_cfg.cert_path, sizeof(http_cfg.cert_path), "%s", cfg.cert_path);
     snprintf(http_cfg.key_path, sizeof(http_cfg.key_path), "%s", cfg.key_path);
     snprintf(http_cfg.ca_path, sizeof(http_cfg.ca_path), "%s", cfg.ca_path);
+    snprintf(http_cfg.key_password, sizeof(http_cfg.key_password), "%s", cfg.key_password);
 
     int pulled = 0;
 
@@ -359,6 +362,7 @@ static int cmd_rotate(int argc, char *argv[]) {
     snprintf(http_cfg.cert_path, sizeof(http_cfg.cert_path), "%s", cfg.cert_path);
     snprintf(http_cfg.key_path, sizeof(http_cfg.key_path), "%s", cfg.key_path);
     snprintf(http_cfg.ca_path, sizeof(http_cfg.ca_path), "%s", cfg.ca_path);
+    snprintf(http_cfg.key_password, sizeof(http_cfg.key_password), "%s", cfg.key_password);
 
     /* get protected guids from server */
     char *pjson = http_get_json(&http_cfg,
@@ -536,6 +540,7 @@ static int cmd_cron(int argc, char *argv[]) {
     snprintf(http_cfg.cert_path, sizeof(http_cfg.cert_path), "%s", cfg.cert_path);
     snprintf(http_cfg.key_path, sizeof(http_cfg.key_path), "%s", cfg.key_path);
     snprintf(http_cfg.ca_path, sizeof(http_cfg.ca_path), "%s", cfg.ca_path);
+    snprintf(http_cfg.key_password, sizeof(http_cfg.key_password), "%s", cfg.key_password);
     db_close(db);
 
     do {

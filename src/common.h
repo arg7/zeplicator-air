@@ -56,6 +56,7 @@ typedef struct {
     char cert_path[ZEP_MAX_PATH];
     char key_path[ZEP_MAX_PATH];
     char ca_path[ZEP_MAX_PATH];
+    char key_password[128];
     size_t chunk_size;
 } zep_config_t;
 

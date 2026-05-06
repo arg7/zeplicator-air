@@ -9,6 +9,7 @@ static char g_server[512] = "https://master.zep.lan:8443";
 static char g_cert_path[ZEP_MAX_PATH];
 static char g_key_path[ZEP_MAX_PATH];
 static char g_ca_path[ZEP_MAX_PATH];
+static char g_key_password[128];
 static int  g_verbose = 0;
 
 struct curl_buf {
@@ -40,6 +41,8 @@ static CURL *curl_init(struct curl_buf *resp) {
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    if (g_key_password[0])
+        curl_easy_setopt(curl, CURLOPT_KEYPASSWD, g_key_password);
     if (g_verbose) curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
     return curl;
 }
@@ -322,6 +325,7 @@ static void usage(const char *prog) {
         "  --cert, -c FILE    Admin client certificate (PEM)\n"
         "  --key, -k FILE     Admin client key (PEM)\n"
         "  --ca, -C FILE      CA certificate (PEM)\n"
+        "  --password, -P PASS  Password for encrypted key\n"
         "  --verbose, -v      Verbose output\n"
         "\n"
         "Join options:\n"
@@ -361,6 +365,10 @@ int main(int argc, char *argv[]) {
             snprintf(g_ca_path, sizeof(g_ca_path), "%s", argv[++i]);
         } else if (strcmp(argv[i], "-C") == 0 && i + 1 < argc) {
             snprintf(g_ca_path, sizeof(g_ca_path), "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--password") == 0 && i + 1 < argc) {
+            snprintf(g_key_password, sizeof(g_key_password), "%s", argv[++i]);
+        } else if (strcmp(argv[i], "-P") == 0 && i + 1 < argc) {
+            snprintf(g_key_password, sizeof(g_key_password), "%s", argv[++i]);
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             g_verbose = 1;
         } else {

@@ -118,6 +118,7 @@ err_t db_config_load(sqlite3 *db, zep_config_t *cfg) {
     db_config_get(db, "cert_path",   cfg->cert_path,   sizeof(cfg->cert_path));
     db_config_get(db, "key_path",    cfg->key_path,    sizeof(cfg->key_path));
     db_config_get(db, "ca_path",     cfg->ca_path,     sizeof(cfg->ca_path));
+    db_config_get(db, "key_password", cfg->key_password, sizeof(cfg->key_password));
 
     char buf[32];
     if (db_config_get(db, "chunk_size", buf, sizeof(buf)) == ZEP_ERR_OK) {

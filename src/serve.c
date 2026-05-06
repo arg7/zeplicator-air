@@ -27,6 +27,7 @@ static char g_cert_path[ZEP_MAX_PATH] = "";
 static char g_key_path[ZEP_MAX_PATH] = "";
 static char g_ca_path[ZEP_MAX_PATH] = "";
 static char g_admin_cert_path[ZEP_MAX_PATH] = "";
+static char g_key_password[128] = "";
 static int  g_verbose = 0;
 static int  g_setup_mode = 0;
 static struct MHD_Daemon *g_daemon = NULL;
@@ -838,6 +839,33 @@ static int load_pem(const char *path, char **data) {
     size_t r = fread(*data, 1, (size_t)sz, f);
     fclose(f);
     (*data)[r] = '\0';
+
+    if (g_key_password[0] && strstr(*data, "ENCRYPTED")) {
+        char tmp_in[256], tmp_out[256], cmd[2048];
+        snprintf(tmp_in, sizeof(tmp_in), "/tmp/zep-key-in-%d", getpid());
+        snprintf(tmp_out, sizeof(tmp_out), "/tmp/zep-key-out-%d", getpid());
+        FILE *tf = fopen(tmp_in, "w");
+        if (tf) { fwrite(*data, 1, r, tf); fclose(tf); }
+        snprintf(cmd, sizeof(cmd),
+            "openssl rsa -in '%s' -passin pass:'%s' -out '%s' 2>/dev/null",
+            tmp_in, g_key_password, tmp_out);
+        if (system(cmd) == 0) {
+            FILE *of = fopen(tmp_out, "r");
+            if (of) {
+                fseek(of, 0, SEEK_END);
+                long osz = ftell(of);
+                fseek(of, 0, SEEK_SET);
+                free(*data);
+                *data = malloc((size_t)osz + 1);
+                if (*data) {
+                    size_t or_ = fread(*data, 1, (size_t)osz, of);
+                    (*data)[or_] = '\0';
+                }
+                fclose(of);
+            }
+        }
+        unlink(tmp_in); unlink(tmp_out);
+    }
     return 0;
 }
 
@@ -851,6 +879,7 @@ static void usage_serve(const char *prog) {
     fprintf(stderr, "  -D, --db FILE         SQLite database path (default: /var/lib/zep-air/zep-air.db)\n");
     fprintf(stderr, "  -S, --setup           Run setup mode: store CA + server + admin certs in DB, then exit\n");
     fprintf(stderr, "  -A, --admin-cert      Admin client certificate for setup mode (PEM)\n");
+    fprintf(stderr, "  -P, --password PASS   Password for encrypted private keys\n");
     fprintf(stderr, "  -v, --verbose         Verbose output\n");
     fprintf(stderr, "  -h, --help            This help\n");
 }
@@ -864,6 +893,7 @@ int serve_main(int argc, char *argv[]) {
         {"ca",      required_argument, 0, 'a'},
         {"db",         required_argument, 0, 'D'},
         {"admin-cert", required_argument, 0, 'A'},
+        {"password",  required_argument, 0, 'P'},
         {"setup",      no_argument,       0, 'S'},
         {"verbose", no_argument,       0, 'v'},
         {"help",    no_argument,       0, 'h'},
@@ -871,7 +901,7 @@ int serve_main(int argc, char *argv[]) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:A:D:Svh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:A:D:P:Svh", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'p': g_port = atoi(optarg); break;
             case 's': snprintf(g_storage_root, sizeof(g_storage_root), "%s", optarg); break;
@@ -880,6 +910,7 @@ int serve_main(int argc, char *argv[]) {
             case 'a': snprintf(g_ca_path, sizeof(g_ca_path), "%s", optarg); break;
             case 'D': snprintf(g_db_path, sizeof(g_db_path), "%s", optarg); break;
             case 'A': snprintf(g_admin_cert_path, sizeof(g_admin_cert_path), "%s", optarg); break;
+            case 'P': snprintf(g_key_password, sizeof(g_key_password), "%s", optarg); break;
             case 'S': g_setup_mode = 1; break;
             case 'v': g_verbose = 1; break;
             case 'h': usage_serve(argv[0]); return 0;
