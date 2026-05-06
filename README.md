@@ -241,6 +241,13 @@ zep-air config list
 | `cluster` | Cluster name to operate on |
 | `mapping` | Pool/fs translation: `cluster_fs:local_fs(label:ret,...),...` |
 | `chunk_size` | Max blob size in bytes (default 10 MB) |
+| `send_options` | Extra `zfs send` flags (`-w`, `-p`, `-R`) |
+| `recv_options` | Extra `zfs recv` flags |
+| `send_all_snap` | `1` = use `-I` (all snapshots), `0` = `-i` (single incremental) |
+| `pipe_zip_cmd` | Compression command (default: `zstd -c`, set `""` to disable) |
+| `pipe_unzip_cmd` | Decompression command (default: `zstd -d`) |
+| `pipe_send_buf_cmd` | Buffer command before compression (e.g. `mbuffer -q -m 512M`) |
+| `pipe_recv_buf_cmd` | Buffer command after decompression |
 
 ### `zep-air-serve`
 
@@ -280,6 +287,16 @@ Commands:
         [--cluster NAME] [--map MAPPINGS]
   list-nodes                List registered nodes
   remove-node <CN>          Remove a node
+  config list               List server config
+  config get KEY            Get server config value
+  config set KEY VALUE      Set server config value
+  config rm KEY             Remove server config key
+  suspend [--master|--clients|--node CN]  Pause replication
+  resume  [--master|--clients|--node CN]  Resume replication
+  promote --node CN         Promote client to master
+  rollback --snap NAME      Cluster-wide rollback to snapshot
+  snap create --name NAME   Manual snapshot (no rotation)
+  snap destroy --name NAME  Remove manual snapshot
 ```
 
 ## REST API
@@ -297,13 +314,23 @@ GET  /v1/nodes/<node>/snapshots/<prefix>/blobs/<N>
 ### Admin routes (admin cert required)
 
 ```
-POST   /v1/admin/clusters           Create cluster definition
-GET    /v1/admin/clusters           List clusters
-GET    /v1/admin/clusters/<name>    Get cluster
-DELETE /v1/admin/clusters/<name>    Remove cluster
-POST   /v1/admin/nodes              Register master/client
-GET    /v1/admin/nodes              List nodes
-DELETE /v1/admin/nodes/<cn>         Remove node
+POST   /v1/admin/clusters              Create cluster definition
+GET    /v1/admin/clusters              List clusters
+GET    /v1/admin/clusters/<name>       Get cluster
+DELETE /v1/admin/clusters/<name>       Remove cluster
+POST   /v1/admin/nodes                 Register master/client
+GET    /v1/admin/nodes                 List nodes
+DELETE /v1/admin/nodes/<cn>            Remove node
+GET    /v1/admin/config                List server config
+GET    /v1/admin/config/<key>          Get config value
+POST   /v1/admin/config/<key>          Set config value
+DELETE /v1/admin/config/<key>          Remove config key
+POST   /v1/admin/suspend[/master|clients|<cn>]  Pause replication
+POST   /v1/admin/resume[/master|clients|<cn>]   Resume replication
+POST   /v1/admin/promote/<cn>          Promote client to master
+POST   /v1/admin/rollback/<snap>       Cluster rollback target
+POST   /v1/admin/snap/<name>           Manual snapshot (no rotation)
+POST   /v1/admin/unsnap/<name>         Remove manual snapshot
 ```
 
 ### Cron routes
@@ -318,6 +345,40 @@ GET  /v1/cron/protected?<cluster>   GUIDs unsafe to delete
 
 ```
 GET  /health                        Always 200 (no auth)
+```
+
+## Advanced Pipeline
+
+The ZFS send/recv pipe is fully configurable. Defaults use `zstd` compression with `-i` for single incremental sends.
+
+**Pipe structure:**
+```
+Send: zfs send [opts] [buf_cmd |] [zip_cmd]       → chunk → blob
+Recv: blob → chunk → [unzip_cmd |] [buf_cmd |] zfs recv [opts]
+```
+
+**Common configurations:**
+
+```sh
+# Raw encrypted send with no local compression (fast LAN)
+zep-air config set send_options "-w"
+zep-air config set pipe_zip_cmd ""
+
+# All properties, all intermediate snapshots
+zep-air config set send_options "-p"
+zep-air config set send_all_snap 1
+
+# mbuffer for rate-limited WAN links
+zep-air config set pipe_send_buf_cmd "mbuffer -q -s 128k -m 512M"
+zep-air config set pipe_recv_buf_cmd "mbuffer -q -s 128k -m 512M"
+
+# lz4 instead of zstd
+zep-air config set pipe_zip_cmd "lz4 -c"
+zep-air config set pipe_unzip_cmd "lz4 -d"
+
+# No compression (raw stream, fast CPU)
+zep-air config set pipe_zip_cmd ""
+zep-air config set pipe_unzip_cmd ""
 ```
 
 ## Architecture
