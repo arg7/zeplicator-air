@@ -28,6 +28,7 @@ static int  g_port = 8443;
 static char g_cert_path[ZEP_MAX_PATH] = "";
 static char g_key_path[ZEP_MAX_PATH] = "";
 static char g_ca_path[ZEP_MAX_PATH] = "";
+static char g_admin_cert_path[ZEP_MAX_PATH] = "";
 static int  g_verbose = 0;
 static int  g_setup_mode = 0;
 static struct MHD_Daemon *g_daemon = NULL;
@@ -512,7 +513,8 @@ static void usage_serve(const char *prog) {
     fprintf(stderr, "  -k, --key FILE        TLS server private key (PEM)\n");
     fprintf(stderr, "  -a, --ca FILE         CA certificate for client auth (optional)\n");
     fprintf(stderr, "  -D, --db FILE         SQLite database path (default: /var/lib/zep-air/zep-air.db)\n");
-    fprintf(stderr, "  -S, --setup           Run setup mode: store CA + server certs in DB, then exit\n");
+    fprintf(stderr, "  -S, --setup           Run setup mode: store CA + server + admin certs in DB, then exit\n");
+    fprintf(stderr, "  -A, --admin-cert      Admin client certificate for setup mode (PEM)\n");
     fprintf(stderr, "  -v, --verbose         Verbose output\n");
     fprintf(stderr, "  -h, --help            This help\n");
 }
@@ -524,15 +526,16 @@ int serve_main(int argc, char *argv[]) {
         {"cert",    required_argument, 0, 'c'},
         {"key",     required_argument, 0, 'k'},
         {"ca",      required_argument, 0, 'a'},
-        {"db",      required_argument, 0, 'D'},
-        {"setup",   no_argument,       0, 'S'},
+        {"db",         required_argument, 0, 'D'},
+        {"admin-cert", required_argument, 0, 'A'},
+        {"setup",      no_argument,       0, 'S'},
         {"verbose", no_argument,       0, 'v'},
         {"help",    no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:D:Svh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:A:D:Svh", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'p': g_port = atoi(optarg); break;
             case 's': snprintf(g_storage_root, sizeof(g_storage_root), "%s", optarg); break;
@@ -540,6 +543,7 @@ int serve_main(int argc, char *argv[]) {
             case 'k': snprintf(g_key_path, sizeof(g_key_path), "%s", optarg); break;
             case 'a': snprintf(g_ca_path, sizeof(g_ca_path), "%s", optarg); break;
             case 'D': snprintf(g_db_path, sizeof(g_db_path), "%s", optarg); break;
+            case 'A': snprintf(g_admin_cert_path, sizeof(g_admin_cert_path), "%s", optarg); break;
             case 'S': g_setup_mode = 1; break;
             case 'v': g_verbose = 1; break;
             case 'h': usage_serve(argv[0]); return 0;
@@ -550,8 +554,8 @@ int serve_main(int argc, char *argv[]) {
     char *cert_pem = NULL, *key_pem = NULL, *ca_pem = NULL;
 
     if (g_setup_mode) {
-        if (!g_cert_path[0] || !g_ca_path[0]) {
-            fprintf(stderr, "error: --setup requires --cert, --key, and --ca\n");
+        if (!g_cert_path[0] || !g_ca_path[0] || !g_admin_cert_path[0]) {
+            fprintf(stderr, "error: --setup requires --cert, --key, --ca, and --admin-cert\n");
             return 1;
         }
         if (load_pem(g_cert_path, &cert_pem) != 0) return 1;
@@ -593,6 +597,26 @@ int serve_main(int argc, char *argv[]) {
             }
             X509_free(cert);
         }
+
+        X509 *admin = NULL;
+        FILE *af = fopen(g_admin_cert_path, "r");
+        if (af) { admin = PEM_read_X509(af, NULL, NULL, NULL); fclose(af); }
+        if (!admin) {
+            fprintf(stderr, "error: failed to load admin cert from %s\n", g_admin_cert_path);
+            db_close(g_db);
+            free(cert_pem); free(key_pem); free(ca_pem);
+            return 1;
+        }
+        char *admin_fp = auth_cert_fingerprint(admin);
+        if (admin_fp) {
+            char *admin_cn = auth_extract_cn(admin);
+            db_cert_store(g_db, admin_cn ? admin_cn : "admin", admin_fp,
+                          NULL, "admin");
+            printf("Setup: stored admin cert  CN=%s  fingerprint=%s\n",
+                   admin_cn ? admin_cn : "?", admin_fp);
+            free(admin_cn); free(admin_fp);
+        }
+        X509_free(admin);
 
         printf("Setup complete.\n");
         db_close(g_db);
