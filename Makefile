@@ -20,4 +20,7 @@ zep-air-admin: src/admin.c
 clean:
 	rm -f zep-air zep-air-serve zep-air-admin
 
-.PHONY: all clean
+install: all
+	cp zep-air zep-air-serve zep-air-admin /usr/local/bin/
+
+.PHONY: all clean install
