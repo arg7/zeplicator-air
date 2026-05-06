@@ -293,6 +293,80 @@ static int cmd_cluster(int argc, char *argv[]) {
     return 1;
 }
 
+static int cmd_suspend(int argc, char *argv[]) {
+    const char *target = "";
+    int has_opt = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--master") == 0)  { target = "master"; has_opt = 1; }
+        else if (strcmp(argv[i], "--clients") == 0) { target = "clients"; has_opt = 1; }
+        else if (strcmp(argv[i], "--node") == 0 && i + 1 < argc) {
+            target = argv[++i]; has_opt = 1;
+        }
+    }
+    char path[512];
+    if (has_opt) snprintf(path, sizeof(path), "/v1/admin/suspend/%s", target);
+    else snprintf(path, sizeof(path), "/v1/admin/suspend");
+    return do_get(path);
+}
+
+static int cmd_resume(int argc, char *argv[]) {
+    const char *target = "";
+    int has_opt = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--master") == 0)  { target = "master"; has_opt = 1; }
+        else if (strcmp(argv[i], "--clients") == 0) { target = "clients"; has_opt = 1; }
+        else if (strcmp(argv[i], "--node") == 0 && i + 1 < argc) {
+            target = argv[++i]; has_opt = 1;
+        }
+    }
+    char path[512];
+    if (has_opt) snprintf(path, sizeof(path), "/v1/admin/resume/%s", target);
+    else snprintf(path, sizeof(path), "/v1/admin/resume");
+    return do_get(path);
+}
+
+static int cmd_promote(int argc, char *argv[]) {
+    const char *node = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--node") == 0 && i + 1 < argc) node = argv[++i];
+    }
+    if (!node) { fprintf(stderr, "Usage: zep-air-admin promote --node <CN>\n"); return 1; }
+    char path[512];
+    snprintf(path, sizeof(path), "/v1/admin/promote/%s", node);
+    return do_get(path);
+}
+
+static int cmd_rollback(int argc, char *argv[]) {
+    const char *snap = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--snap") == 0 && i + 1 < argc) snap = argv[++i];
+    }
+    if (!snap) { fprintf(stderr, "Usage: zep-air-admin rollback --snap <name>\n"); return 1; }
+    char path[512];
+    snprintf(path, sizeof(path), "/v1/admin/rollback/%s", snap);
+    return do_get(path);
+}
+
+static int cmd_admin_snap(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: zep-air-admin snap <create|destroy> --name <name>\n");
+        return 1;
+    }
+    const char *sub = argv[1];
+    const char *name = NULL;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) name = argv[++i];
+    }
+    if (!name) { fprintf(stderr, "Missing --name\n"); return 1; }
+    char path[512];
+    if (strcmp(sub, "create") == 0)
+        snprintf(path, sizeof(path), "/v1/admin/snap/%s", name);
+    else if (strcmp(sub, "destroy") == 0)
+        snprintf(path, sizeof(path), "/v1/admin/unsnap/%s", name);
+    else { fprintf(stderr, "Unknown: %s\n", sub); return 1; }
+    return do_get(path);
+}
+
 static int cmd_list_nodes(int argc, char *argv[]) {
     (void)argc; (void)argv;
     return do_get("/v1/admin/nodes");
@@ -319,6 +393,11 @@ static void usage(const char *prog) {
         "  join         Register a master or client node\n"
         "  list-nodes   List registered nodes\n"
         "  remove-node  Remove a node\n"
+        "  suspend      Pause replication (--master, --clients, --node)\n"
+        "  resume       Resume replication\n"
+        "  promote      Promote client to master (--node CN)\n"
+        "  rollback     Cluster rollback to snapshot (--snap NAME)\n"
+        "  snap         Manual snapshot create/destroy (--name NAME)\n"
         "\n"
         "Global options:\n"
         "  --server, -s URL   Server URL (default: https://master.zep.lan:8443)\n"
@@ -343,7 +422,12 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "join") == 0 ||
             strcmp(argv[i], "list-nodes") == 0 ||
             strcmp(argv[i], "remove-node") == 0 ||
-            strcmp(argv[i], "cluster") == 0) {
+            strcmp(argv[i], "cluster") == 0 ||
+            strcmp(argv[i], "suspend") == 0 ||
+            strcmp(argv[i], "resume") == 0 ||
+            strcmp(argv[i], "promote") == 0 ||
+            strcmp(argv[i], "rollback") == 0 ||
+            strcmp(argv[i], "snap") == 0) {
             argv2[argc2++] = argv[i];
             for (int j = i + 1; j < argc && argc2 < 63; j++)
                 argv2[argc2++] = argv[j];
@@ -399,7 +483,12 @@ int main(int argc, char *argv[]) {
 
     int rc = 1;
     if (strcmp(cmd, "join") == 0)   rc = cmd_join(sub_argc, sub_argv);
-    else if (strcmp(cmd, "cluster") == 0) rc = cmd_cluster(sub_argc, sub_argv);
+    else     if (strcmp(cmd, "suspend") == 0)  rc = cmd_suspend(sub_argc, sub_argv);
+    else if (strcmp(cmd, "resume") == 0)   rc = cmd_resume(sub_argc, sub_argv);
+    else if (strcmp(cmd, "promote") == 0)  rc = cmd_promote(sub_argc, sub_argv);
+    else if (strcmp(cmd, "rollback") == 0) rc = cmd_rollback(sub_argc, sub_argv);
+    else if (strcmp(cmd, "snap") == 0)     rc = cmd_admin_snap(sub_argc, sub_argv);
+    else if (strcmp(cmd, "cluster") == 0)  rc = cmd_cluster(sub_argc, sub_argv);
     else if (strcmp(cmd, "list-nodes") == 0) rc = cmd_list_nodes(sub_argc, sub_argv);
     else if (strcmp(cmd, "remove-node") == 0) rc = cmd_remove_node(sub_argc, sub_argv);
     else { fprintf(stderr, "Unknown command: %s\n", cmd); usage(argv2[0]); }

@@ -536,22 +536,124 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         return send_error(conn, 404, "Admin endpoint not found");
     }
 
+    /* ── suspend / resume ── */
+    if ((strcmp(ctx->method, "POST") == 0 || strcmp(ctx->method, "PUT") == 0) &&
+        strncmp(ctx->target_url, "/v1/admin/", 10) == 0) {
+        const char *rest = ctx->target_url + 10;
+
+        if (strncmp(rest, "suspend", 7) == 0) {
+            const char *arg = rest + 7;
+            sqlite3_stmt *st = NULL;
+            if (*arg == '/') arg++;
+            if (strcmp(arg, "master") == 0 || strcmp(arg, "clients") == 0 || arg[0]) {
+                if (strcmp(arg, "master") == 0) {
+                    sqlite3_prepare_v2(g_db,
+                        "UPDATE auth SET suspended = 0 WHERE role = 'master'", -1, &st, NULL);
+                } else if (strcmp(arg, "clients") == 0) {
+                    sqlite3_prepare_v2(g_db,
+                        "UPDATE auth SET suspended = 0 WHERE role = 'client'", -1, &st, NULL);
+                } else {
+                    db_set_suspended(g_db, arg, 0);
+                }
+                if (st) { sqlite3_step(st); sqlite3_finalize(st); }
+                return send_json(conn, 200, "{\"ok\":true}");
+            }
+            sqlite3_prepare_v2(g_db,
+                "UPDATE auth SET suspended = 0", -1, &st, NULL);
+            if (st) { sqlite3_step(st); sqlite3_finalize(st); }
+            return send_json(conn, 200, "{\"ok\":true}");
+        }
+
+        /* ── promote ── */
+        if (strncmp(rest, "promote/", 8) == 0) {
+            const char *new_master = rest + 8;
+            if (!new_master[0]) return send_error(conn, 400, "Missing node");
+            /* find current master for this cluster */
+            char cluster[64] = {0}, old_master_cn[64] = {0};
+            sqlite3_stmt *st = NULL;
+            sqlite3_prepare_v2(g_db,
+                "SELECT cluster FROM auth WHERE cn = ?", -1, &st, NULL);
+            if (st) {
+                sqlite3_bind_text(st, 1, new_master, -1, SQLITE_STATIC);
+                if (sqlite3_step(st) == SQLITE_ROW)
+                    snprintf(cluster, sizeof(cluster), "%s",
+                             (const char *)sqlite3_column_text(st, 0));
+                sqlite3_finalize(st);
+            }
+            if (!cluster[0]) return send_error(conn, 400, "Node not in any cluster");
+            sqlite3_prepare_v2(g_db,
+                "SELECT cn FROM auth WHERE cluster = ? AND role = 'master'",
+                -1, &st, NULL);
+            if (st) {
+                sqlite3_bind_text(st, 1, cluster, -1, SQLITE_STATIC);
+                if (sqlite3_step(st) == SQLITE_ROW)
+                    snprintf(old_master_cn, sizeof(old_master_cn), "%s",
+                             (const char *)sqlite3_column_text(st, 0));
+                sqlite3_finalize(st);
+            }
+            if (old_master_cn[0]) {
+                db_set_suspended(g_db, old_master_cn, 1);
+                db_update_role(g_db, old_master_cn, "client");
+            }
+            db_update_role(g_db, new_master, "master");
+            db_set_suspended(g_db, new_master, 0);
+            return send_json(conn, 200, "{\"ok\":true}");
+        }
+
+        /* ── rollback ── */
+        if (strncmp(rest, "rollback/", 9) == 0) {
+            const char *snap = rest + 9;
+            if (!snap[0]) return send_error(conn, 400, "Missing snapshot name");
+            /* suspend all nodes in cluster(s), mark snapshot for rollback */
+            /* For now: just mark the config — actual rollback is on the master */
+            char key[256];
+            snprintf(key, sizeof(key), "rollback_target");
+            db_config_set(g_db, key, snap);
+            sqlite3_stmt *st = NULL;
+            sqlite3_prepare_v2(g_db,
+                "UPDATE auth SET suspended = 1", -1, &st, NULL);
+            if (st) { sqlite3_step(st); sqlite3_finalize(st); }
+            return send_json(conn, 200, "{\"ok\":true}");
+        }
+
+        /* ── manual snap create ── */
+        if (strncmp(rest, "snap/", 5) == 0) {
+            const char *snap_name = rest + 5;
+            if (!snap_name[0]) return send_error(conn, 400, "Missing snapshot name");
+            char key[256];
+            snprintf(key, sizeof(key), "manual_snap_%s", snap_name);
+            db_config_set(g_db, key, "pending");
+            return send_json(conn, 200, "{\"ok\":true}");
+        }
+
+        if (strncmp(rest, "unsnap/", 7) == 0) {
+            const char *snap_name = rest + 7;
+            if (!snap_name[0]) return send_error(conn, 400, "Missing snapshot name");
+            char key[256];
+            snprintf(key, sizeof(key), "manual_snap_%s", snap_name);
+            db_config_set(g_db, key, "");
+            return send_json(conn, 200, "{\"ok\":true}");
+        }
+
+        return send_error(conn, 404, "Admin action not found");
+    }
+
     /* ── cron sync endpoint ── */
     if (strcmp(ctx->method, "GET") == 0 &&
         strcmp(ctx->target_url, "/v1/cron/sync") == 0) {
         char role[16] = {0}, cluster_name[64] = {0};
+        int suspended = 0;
         if (ctx->node[0]) {
-            db_cert_lookup(g_db, ctx->node,
-                           (char[96]){0}, 96);
             sqlite3_stmt *st = NULL;
             sqlite3_prepare_v2(g_db,
-                "SELECT role, cluster FROM auth WHERE cn = ?",
+                "SELECT role, cluster, suspended FROM auth WHERE cn = ?",
                 -1, &st, NULL);
             if (st) {
                 sqlite3_bind_text(st, 1, ctx->node, -1, SQLITE_STATIC);
                 if (sqlite3_step(st) == SQLITE_ROW) {
                     const char *r = (const char *)sqlite3_column_text(st, 0);
                     const char *c = (const char *)sqlite3_column_text(st, 1);
+                    suspended = sqlite3_column_int(st, 2);
                     snprintf(role, sizeof(role), "%s", r ? r : "");
                     snprintf(cluster_name, sizeof(cluster_name), "%s", c ? c : "");
                 }
@@ -562,7 +664,10 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         cJSON *tasks = cJSON_CreateArray();
         time_t now = time(NULL);
 
-        if (strcmp(role, "master") == 0 && cluster_name[0]) {
+        if (suspended) {
+            cJSON_AddItemToArray(tasks, cJSON_CreateObject());
+            /* empty task list — no work for suspended nodes */
+        } else if (strcmp(role, "master") == 0 && cluster_name[0]) {
             char cfg_key[128], cluster_json[65536] = {0};
             snprintf(cfg_key, sizeof(cfg_key), "cluster_%s", cluster_name);
             if (db_config_get(g_db, cfg_key, cluster_json,

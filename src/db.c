@@ -67,7 +67,8 @@ err_t db_init_tables(sqlite3 *db) {
         "  mapping     TEXT NOT NULL DEFAULT '',"
         "  last_ack_guid TEXT DEFAULT '',"
         "  last_ack_at   TEXT DEFAULT '',"
-        "  created_at  TEXT NOT NULL DEFAULT (datetime('now'))"
+        "  suspended     INTEGER NOT NULL DEFAULT 0,"
+        "  created_at    TEXT NOT NULL DEFAULT (datetime('now'))"
         ");";
     char *err = NULL;
     int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
@@ -400,6 +401,30 @@ err_t db_ack_guid(sqlite3 *db, const char *cn, const char *guid) {
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;
     sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, cn, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
+}
+
+err_t db_set_suspended(sqlite3 *db, const char *cn, int val) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE auth SET suspended = ? WHERE cn = ?", -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_int(stmt, 1, val);
+    sqlite3_bind_text(stmt, 2, cn, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
+}
+
+err_t db_update_role(sqlite3 *db, const char *cn, const char *new_role) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE auth SET role = ? WHERE cn = ?", -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, new_role, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, cn, -1, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
