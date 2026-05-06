@@ -1,3 +1,5 @@
+/* MIT License — Copyright (c) 2026 CompEd Software Design srl — see LICENSE */
+
 #include "pipeline.h"
 #include "storage.h"
 #include "zfs.h"

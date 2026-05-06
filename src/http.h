@@ -1,3 +1,5 @@
+/* MIT License — Copyright (c) 2026 CompEd Software Design srl — see LICENSE */
+
 #ifndef ZEP_AIR_HTTP_H
 #define ZEP_AIR_HTTP_H
 

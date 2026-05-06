@@ -1,3 +1,5 @@
+/* MIT License — Copyright (c) 2026 CompEd Software Design srl — see LICENSE */
+
 #include "storage.h"
 #include "common.h"
 #include <stdio.h>

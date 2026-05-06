@@ -1,3 +1,5 @@
+/* MIT License — Copyright (c) 2026 CompEd Software Design srl — see LICENSE */
+
 #include "common.h"
 #include "db.h"
 #include "zfs.h"
