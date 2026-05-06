@@ -110,14 +110,14 @@ static int cmd_push(int argc, char *argv[]) {
     int pushed = 0;
 
     if (filesystem[0]) {
-        err_t ret = pipeline_push(db, &cfg, &http_cfg, filesystem, label);
+        err_t ret = pipeline_push(&cfg, &http_cfg, filesystem, label);
         if (ret == ZEP_ERR_OK) pushed++;
     } else if (optind < argc) {
         for (int i = optind; i < argc; i++) {
             char local_fs[ZEP_MAX_SNAPSHOT_NAME];
             if (pipeline_resolve_fs(argv[i], cfg.mapping,
                                     local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
-                err_t ret = pipeline_push(db, &cfg, &http_cfg, local_fs, label);
+                err_t ret = pipeline_push(&cfg, &http_cfg, local_fs, label);
                 if (ret == ZEP_ERR_OK) pushed++;
             } else {
                 fprintf(stderr, "push: no mapping for '%s'\n", argv[i]);
@@ -137,7 +137,7 @@ static int cmd_push(int argc, char *argv[]) {
             if (n >= sizeof(local_fs)) n = sizeof(local_fs) - 1;
             memcpy(local_fs, start, n);
             local_fs[n] = '\0';
-            err_t ret = pipeline_push(db, &cfg, &http_cfg, local_fs, label);
+            err_t ret = pipeline_push(&cfg, &http_cfg, local_fs, label);
             if (ret == ZEP_ERR_OK) pushed++;
             const char *comma = strchr(colon, ',');
             p = comma ? comma + 1 : colon + strlen(colon);
@@ -203,14 +203,14 @@ static int cmd_pull(int argc, char *argv[]) {
     int pulled = 0;
 
     if (filesystem[0]) {
-        err_t ret = pipeline_pull(db, &cfg, &http_cfg, filesystem, donor);
+        err_t ret = pipeline_pull(&cfg, &http_cfg, filesystem, donor);
         if (ret == ZEP_ERR_OK) pulled++;
     } else if (optind < argc) {
         for (int i = optind; i < argc; i++) {
             char local_fs[ZEP_MAX_SNAPSHOT_NAME];
             if (pipeline_resolve_fs(argv[i], cfg.mapping,
                                     local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
-                err_t ret = pipeline_pull(db, &cfg, &http_cfg, local_fs, donor);
+                err_t ret = pipeline_pull(&cfg, &http_cfg, local_fs, donor);
                 if (ret == ZEP_ERR_OK) pulled++;
             } else {
                 fprintf(stderr, "pull: no mapping for '%s'\n", argv[i]);
@@ -230,7 +230,7 @@ static int cmd_pull(int argc, char *argv[]) {
             if (n >= sizeof(local_fs)) n = sizeof(local_fs) - 1;
             memcpy(local_fs, start, n);
             local_fs[n] = '\0';
-            err_t ret = pipeline_pull(db, &cfg, &http_cfg, local_fs, donor);
+            err_t ret = pipeline_pull(&cfg, &http_cfg, local_fs, donor);
             if (ret == ZEP_ERR_OK) pulled++;
             const char *comma = strchr(colon, ',');
             p = comma ? comma + 1 : colon + strlen(colon);
@@ -578,7 +578,7 @@ static int cmd_cron(int argc, char *argv[]) {
                     db_config_load(db, &cfg2);
                     if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
                                             local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
-                        pipeline_push(db, &cfg2, &http_cfg, local_fs, label->valuestring);
+                        pipeline_push(&cfg2, &http_cfg, local_fs, label->valuestring);
                         tasks_done++;
                     }
                     db_close(db);
@@ -593,7 +593,7 @@ static int cmd_cron(int argc, char *argv[]) {
                     db_config_load(db, &cfg2);
                     if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
                                             local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
-                        pipeline_pull(db, &cfg2, &http_cfg, local_fs,
+                        pipeline_pull(&cfg2, &http_cfg, local_fs,
                                       (donor && cJSON_IsString(donor)) ? donor->valuestring : "");
                         tasks_done++;
 
@@ -682,7 +682,6 @@ static int cmd_status(int argc, char *argv[]) {
         {"help", no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
-
     int opt;
     while ((opt = getopt_long(argc, argv, "D:h", opts, NULL)) != -1) {
         switch (opt) {
@@ -695,40 +694,18 @@ static int cmd_status(int argc, char *argv[]) {
     sqlite3 *db = NULL;
     if (db_open(g_db_path, &db) != ZEP_ERR_OK) return 1;
     db_init_tables(db);
-
     zep_config_t cfg;
     db_config_load(db, &cfg);
+    db_close(db);
 
     printf("=== Zeplicator Air Status ===\n");
-    printf("Node: %s\n\n", cfg.node_name[0] ? cfg.node_name : "(not configured)");
-
-    printf("Pushed snapshots:\n");
-    char **pushed = NULL;
-    int pushed_cnt = 0;
-    db_list_pushed(db, &pushed, &pushed_cnt);
-    if (pushed_cnt == 0) {
-        printf("  (none)\n");
-    } else {
-        for (int i = 0; i < pushed_cnt; i++) {
-            printf("  %s\n", pushed[i]);
-        }
-    }
-
-    printf("\nPulled snapshots:\n");
-    char **pulled = NULL;
-    int pulled_cnt = 0;
-    db_list_pulled(db, &pulled, &pulled_cnt);
-    if (pulled_cnt == 0) {
-        printf("  (none)\n");
-    } else {
-        for (int i = 0; i < pulled_cnt; i++) {
-            printf("  %s\n", pulled[i]);
-        }
-    }
-
-    storage_free_list(pushed, pushed_cnt);
-    storage_free_list(pulled, pulled_cnt);
-    db_close(db);
+    printf("Node:       %s\n", cfg.node_name[0] ? cfg.node_name : "(not set)");
+    printf("Cluster:    %s\n", cfg.cluster[0] ? cfg.cluster : "(not set)");
+    printf("Server:     %s\n", cfg.server_url[0] ? cfg.server_url : "(not set)");
+    printf("Cert:       %s\n", cfg.cert_path[0] ? cfg.cert_path : "(not set)");
+    printf("Mapping:    %s\n", cfg.mapping[0] ? cfg.mapping : "(not set)");
+    printf("Chunk size: %zu\n", cfg.chunk_size);
+    printf("\nPush/pull history is tracked on the server — no local snapshot DB.\n");
     return 0;
 }
 

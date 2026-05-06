@@ -1,7 +1,6 @@
 #include "pipeline.h"
 #include "storage.h"
 #include "zfs.h"
-#include "db.h"
 #include "http.h"
 #include "common.h"
 #include <stdio.h>
@@ -122,7 +121,7 @@ static err_t find_base_snapshot(const char *fs, const char *base_guid, char *sna
     return ZEP_ERR_NOT_FOUND;
 }
 
-err_t pipeline_push(sqlite3 *db, const zep_config_t *cfg,
+err_t pipeline_push(const zep_config_t *cfg,
                     const http_config_t *http_cfg,
                     const char *fs, const char *label) {
     char base_guid[ZEP_MAX_GUID_LEN] = {0};
@@ -259,11 +258,6 @@ err_t pipeline_push(sqlite3 *db, const zep_config_t *cfg,
         return ret;
     }
 
-    ret = db_push_record(db, &meta);
-    if (ret != ZEP_ERR_OK) {
-        fprintf(stderr, "push: failed to record in database\n");
-    }
-
     printf("Push complete: %s  guid=%s  blobs=%d  size=%lu  prefix=%s\n",
            snap_name, guid, blob_count, (unsigned long)stream_size, prefix);
 
@@ -271,10 +265,9 @@ err_t pipeline_push(sqlite3 *db, const zep_config_t *cfg,
     return ZEP_ERR_OK;
 }
 
-err_t pipeline_pull(sqlite3 *db, const zep_config_t *cfg,
+err_t pipeline_pull(const zep_config_t *cfg,
                     const http_config_t *http_cfg,
                     const char *fs, const char *donor_node) {
-    (void)db;
     if (!http_cfg->server_url[0]) {
         fprintf(stderr, "error: server_url not configured\n");
         return ZEP_ERR_DB;
@@ -285,10 +278,6 @@ err_t pipeline_pull(sqlite3 *db, const zep_config_t *cfg,
     char local_guid[ZEP_MAX_GUID_LEN] = {0};
     zfs_get_latest_guid(fs, local_guid, sizeof(local_guid));
 
-    char **pulled_guids = NULL;
-    int pulled_count = 0;
-    db_list_pulled(db, &pulled_guids, &pulled_count);
-
     char **prefixes = NULL;
     int prefix_count = 0;
     err_t ret = http_list_snapshots(http_cfg, node, 20, &prefixes, &prefix_count);
@@ -297,7 +286,6 @@ err_t pipeline_pull(sqlite3 *db, const zep_config_t *cfg,
     if (prefix_count == 0) {
         printf("No snapshots available from node '%s'\n", node);
         storage_free_list(prefixes, prefix_count);
-        storage_free_list(pulled_guids, pulled_count);
         return ZEP_ERR_OK;
     }
 
@@ -311,13 +299,7 @@ err_t pipeline_pull(sqlite3 *db, const zep_config_t *cfg,
             continue;
         }
 
-        if (db_was_pulled(db, meta.guid)) {
-            storage_meta_free(&meta);
-            continue;
-        }
-
         if (strcmp(meta.guid, local_guid) == 0) {
-            db_pull_record(db, &meta, node);
             storage_meta_free(&meta);
             continue;
         }
@@ -381,7 +363,6 @@ err_t pipeline_pull(sqlite3 *db, const zep_config_t *cfg,
         zfs_recv_close(recv_fp);
 
         if (ok) {
-            db_pull_record(db, &meta, node);
             zfs_get_latest_guid(fs, local_guid, sizeof(local_guid));
             printf("Pull complete: %s\n", meta.snapshot);
         }
@@ -389,6 +370,5 @@ err_t pipeline_pull(sqlite3 *db, const zep_config_t *cfg,
     }
 
     storage_free_list(prefixes, prefix_count);
-    storage_free_list(pulled_guids, pulled_count);
     return ZEP_ERR_OK;
 }
