@@ -383,7 +383,6 @@ static int cmd_cron(int argc, char *argv[]) {
             cJSON *action = cJSON_GetObjectItem(task, "action");
             cJSON *cfs = cJSON_GetObjectItem(task, "cluster_fs");
             cJSON *label = cJSON_GetObjectItem(task, "label");
-            cJSON *guid = cJSON_GetObjectItem(task, "guid");
 
             if (!action || !cJSON_IsString(action)) continue;
 
@@ -400,8 +399,9 @@ static int cmd_cron(int argc, char *argv[]) {
                         pipeline_push(db, &cfg2, &http_cfg, local_fs, label->valuestring);
                     db_close(db);
                 }
-            } else if (strcmp(action->valuestring, "pull") == 0 &&
-                       cfs && cJSON_IsString(cfs) && guid && cJSON_IsString(guid)) {
+            } else if (strcmp(action->valuestring, "sync") == 0 &&
+                       cfs && cJSON_IsString(cfs)) {
+                cJSON *donor = cJSON_GetObjectItem(task, "donor");
                 char local_fs[ZEP_MAX_SNAPSHOT_NAME];
                 if (db_open(g_db_path, &db) == ZEP_ERR_OK) {
                     db_init_tables(db);
@@ -409,7 +409,8 @@ static int cmd_cron(int argc, char *argv[]) {
                     db_config_load(db, &cfg2);
                     if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
                                             local_fs, sizeof(local_fs)) == ZEP_ERR_OK)
-                        pipeline_pull(db, &cfg2, &http_cfg, local_fs, cfg2.node_name);
+                        pipeline_pull(db, &cfg2, &http_cfg, local_fs,
+                                      (donor && cJSON_IsString(donor)) ? donor->valuestring : "");
                     db_close(db);
                 }
             }

@@ -611,26 +611,46 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 }
             }
         } else if (strcmp(role, "client") == 0 && cluster_name[0]) {
-            sqlite3_stmt *st = NULL;
-            sqlite3_prepare_v2(g_db,
-                "SELECT toguid, snapshot FROM cluster_chain "
-                "WHERE cluster_key = ?1 AND toguid NOT IN "
-                "(SELECT toguid FROM cluster_chain WHERE cluster_key = ?1 "
-                " INTERSECT SELECT guid FROM pulled WHERE 1=0) "
-                "ORDER BY rowid ASC LIMIT 20",
-                -1, &st, NULL);
-            if (st) {
-                sqlite3_bind_text(st, 1, cluster_name, -1, SQLITE_STATIC);
-                while (sqlite3_step(st) == SQLITE_ROW) {
-                    cJSON *t = cJSON_CreateObject();
-                    cJSON_AddStringToObject(t, "action", "pull");
-                    cJSON_AddStringToObject(t, "guid",
-                        (const char *)sqlite3_column_text(st, 0));
-                    cJSON_AddStringToObject(t, "snapshot",
-                        (const char *)sqlite3_column_text(st, 1));
-                    cJSON_AddItemToArray(tasks, t);
+            char cfg_key[128], cluster_json[65536] = {0};
+            snprintf(cfg_key, sizeof(cfg_key), "cluster_%s", cluster_name);
+            if (db_config_get(g_db, cfg_key, cluster_json,
+                              sizeof(cluster_json)) == ZEP_ERR_OK) {
+                cJSON *cj = cJSON_Parse(cluster_json);
+                if (cj) {
+                    cJSON *pools = cJSON_GetObjectItem(cj, "pools");
+                    if (pools) {
+                        cJSON *pool;
+                        cJSON_ArrayForEach(pool, pools) {
+                            cJSON *fs;
+                            cJSON_ArrayForEach(fs, pool) {
+                                char cluster_fs[512];
+                                snprintf(cluster_fs, sizeof(cluster_fs),
+                                         "%s/%s", pool->string, fs->string);
+                                sqlite3_stmt *st2 = NULL;
+                                sqlite3_prepare_v2(g_db,
+                                    "SELECT cn FROM auth WHERE cluster = ?1 AND role = 'master' LIMIT 1",
+                                    -1, &st2, NULL);
+                                const char *donor = NULL;
+                                char donor_buf[64] = {0};
+                                if (st2) {
+                                    sqlite3_bind_text(st2, 1, cluster_name, -1, SQLITE_STATIC);
+                                    if (sqlite3_step(st2) == SQLITE_ROW) {
+                                        snprintf(donor_buf, sizeof(donor_buf), "%s",
+                                                 (const char *)sqlite3_column_text(st2, 0));
+                                        donor = donor_buf;
+                                    }
+                                    sqlite3_finalize(st2);
+                                }
+                                cJSON *t = cJSON_CreateObject();
+                                cJSON_AddStringToObject(t, "action", "sync");
+                                cJSON_AddStringToObject(t, "cluster_fs", cluster_fs);
+                                if (donor) cJSON_AddStringToObject(t, "donor", donor);
+                                cJSON_AddItemToArray(tasks, t);
+                            }
+                        }
+                    }
+                    cJSON_Delete(cj);
                 }
-                sqlite3_finalize(st);
             }
         }
 
