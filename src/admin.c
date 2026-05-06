@@ -170,23 +170,28 @@ static int json_escape(const char *src, char *dst, size_t dst_len) {
 
 static int cmd_join(int argc, char *argv[]) {
     char *role = NULL, *node = NULL, *cert_file = NULL;
+    char *cluster = NULL, *map = NULL;
 
     static struct option opts[] = {
-        {"role", required_argument, 0, 'r'},
-        {"node", required_argument, 0, 'n'},
-        {"cert", required_argument, 0, 'c'},
+        {"role",    required_argument, 0, 'r'},
+        {"node",    required_argument, 0, 'n'},
+        {"cert",    required_argument, 0, 'c'},
+        {"cluster", required_argument, 0, 'l'},
+        {"map",     required_argument, 0, 'm'},
         {0, 0, 0, 0}
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "+r:n:c:", opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+r:n:c:l:m:", opts, NULL)) != -1) {
         switch (opt) {
             case 'r': role = optarg; break;
             case 'n': node = optarg; break;
             case 'c': cert_file = optarg; break;
+            case 'l': cluster = optarg; break;
+            case 'm': map = optarg; break;
         }
     }
     if (!role || !node || !cert_file) {
-        fprintf(stderr, "Usage: zep-air-admin join --role master|client --node <name> --cert <cert.crt>\n");
+        fprintf(stderr, "Usage: zep-air-admin join --role master|client --node <name> --cert <cert.crt> [--cluster <name>] [--map <mappings>]\n");
         return 1;
     }
     if (strcmp(role, "master") != 0 && strcmp(role, "client") != 0) {
@@ -200,18 +205,89 @@ static int cmd_join(int argc, char *argv[]) {
     char *esc = malloc(strlen(pem) * 2 + 1);
     if (!esc) { free(pem); return 1; }
     json_escape(pem, esc, strlen(pem) * 2 + 1);
+
+    char *map_esc = NULL;
+    if (map) {
+        map_esc = malloc(strlen(map) * 2 + 1);
+        if (map_esc) json_escape(map, map_esc, strlen(map) * 2 + 1);
+    }
+
     char *body = NULL;
     if (asprintf(&body,
-        "{\"cn\":\"%s\",\"role\":\"%s\",\"pem\":\"%s\"}", node, role, esc) < 0) {
-        free(pem); free(esc); return 1;
+        "{\"cn\":\"%s\",\"role\":\"%s\",\"pem\":\"%s\",\"cluster\":\"%s\",\"mapping\":\"%s\"}",
+        node, role, esc,
+        cluster ? cluster : "",
+        map_esc ? map_esc : "") < 0) {
+        free(pem); free(esc); free(map_esc); return 1;
     }
-    free(pem); free(esc);
+    free(pem); free(esc); free(map_esc);
 
     char url[1024];
     snprintf(url, sizeof(url), "%s/v1/admin/nodes", g_server);
     int rc = do_post(url, body);
     free(body);
     return rc;
+}
+
+static int cmd_cluster(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: zep-air-admin cluster <set|get|delete> [args]\n");
+        return 1;
+    }
+    const char *sub = argv[1];
+
+    if (strcmp(sub, "set") == 0) {
+        char *file = NULL;
+        static struct option opts[] = {
+            {"file", required_argument, 0, 'f'},
+            {0, 0, 0, 0}
+        };
+        int opt;
+        while ((opt = getopt_long(argc, argv, "f:", opts, NULL)) != -1) {
+            if (opt == 'f') file = optarg;
+        }
+        if (!file) {
+            fprintf(stderr, "Usage: zep-air-admin cluster set --file <cluster.json>\n");
+            return 1;
+        }
+        char *json = read_file_str(file);
+        if (!json) return 1;
+        char *esc = malloc(strlen(json) * 2 + 1);
+        if (!esc) { free(json); return 1; }
+        json_escape(json, esc, strlen(json) * 2 + 1);
+        char *body = NULL;
+        if (asprintf(&body, "%s", json) < 0) { free(json); free(esc); return 1; }
+        free(json); free(esc);
+        char *url = NULL;
+        if (asprintf(&url, "%s/v1/admin/clusters", g_server) < 0) { free(body); return 1; }
+        int rc = do_post(url, body);
+        free(body); free(url);
+        return rc;
+    }
+
+    if (strcmp(sub, "get") == 0) {
+        char *name = NULL;
+        for (int i = 2; i < argc; i++) {
+            if (argv[i][0] != '-') { name = argv[i]; break; }
+        }
+        char path[512];
+        if (name) snprintf(path, sizeof(path), "/v1/admin/clusters/%s", name);
+        else snprintf(path, sizeof(path), "/v1/admin/clusters");
+        return do_get(path);
+    }
+
+    if (strcmp(sub, "delete") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: zep-air-admin cluster delete <name>\n");
+            return 1;
+        }
+        char path[512];
+        snprintf(path, sizeof(path), "/v1/admin/clusters/%s", argv[2]);
+        return do_delete(path);
+    }
+
+    fprintf(stderr, "Unknown cluster subcommand: %s\n", sub);
+    return 1;
 }
 
 static int cmd_list_nodes(int argc, char *argv[]) {
@@ -236,6 +312,7 @@ static void usage(const char *prog) {
         "Usage: %s <command> [options]\n"
         "\n"
         "Commands:\n"
+        "  cluster      Manage cluster definitions\n"
         "  join         Register a master or client node\n"
         "  list-nodes   List registered nodes\n"
         "  remove-node  Remove a node\n"
@@ -261,7 +338,8 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < argc && argc2 < 63; i++) {
         if (strcmp(argv[i], "join") == 0 ||
             strcmp(argv[i], "list-nodes") == 0 ||
-            strcmp(argv[i], "remove-node") == 0) {
+            strcmp(argv[i], "remove-node") == 0 ||
+            strcmp(argv[i], "cluster") == 0) {
             argv2[argc2++] = argv[i];
             for (int j = i + 1; j < argc && argc2 < 63; j++)
                 argv2[argc2++] = argv[j];
@@ -309,6 +387,7 @@ int main(int argc, char *argv[]) {
 
     int rc = 1;
     if (strcmp(cmd, "join") == 0)   rc = cmd_join(sub_argc, sub_argv);
+    else if (strcmp(cmd, "cluster") == 0) rc = cmd_cluster(sub_argc, sub_argv);
     else if (strcmp(cmd, "list-nodes") == 0) rc = cmd_list_nodes(sub_argc, sub_argv);
     else if (strcmp(cmd, "remove-node") == 0) rc = cmd_remove_node(sub_argc, sub_argv);
     else { fprintf(stderr, "Unknown command: %s\n", cmd); usage(argv2[0]); }

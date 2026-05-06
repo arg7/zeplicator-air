@@ -370,6 +370,76 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
     /* ── admin routes ── */
     if (strncmp(ctx->target_url, "/v1/admin", 9) == 0) {
+
+        /* cluster routes */
+        if (strncmp(ctx->target_url, "/v1/admin/clusters", 18) == 0) {
+            if (strcmp(ctx->method, "POST") == 0 &&
+                strcmp(ctx->target_url, "/v1/admin/clusters") == 0) {
+                cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
+                if (!json) return send_error(conn, 400, "Invalid JSON");
+                cJSON *name = cJSON_GetObjectItem(json, "name");
+                if (!name || !cJSON_IsString(name) || !name->valuestring[0]) {
+                    cJSON_Delete(json);
+                    return send_error(conn, 400, "Missing cluster name");
+                }
+                char cfg_key[128];
+                snprintf(cfg_key, sizeof(cfg_key), "cluster_%s", name->valuestring);
+                char *js = cJSON_PrintUnformatted(json);
+                cJSON_Delete(json);
+                db_config_set(g_db, cfg_key, js);
+                if (g_verbose) fprintf(stderr, "cluster set: key=%s len=%zu\n", cfg_key, strlen(js));
+                free(js);
+                return send_json(conn, 200, "{\"ok\":true}");
+            }
+
+            if (strcmp(ctx->method, "GET") == 0) {
+                if (strncmp(ctx->target_url, "/v1/admin/clusters/", 19) == 0) {
+                    const char *cn = ctx->target_url + 19;
+                    if (cn[0]) {
+                        char cfg_key[128], val[65536] = {0};
+                        snprintf(cfg_key, sizeof(cfg_key), "cluster_%s", cn);
+                        if (db_config_get(g_db, cfg_key, val, sizeof(val)) == ZEP_ERR_OK)
+                            return send_json(conn, 200, val);
+                    }
+                    return send_error(conn, 404, "Not found");
+                }
+                /* list clusters: return names */
+                cJSON *arr = cJSON_CreateArray();
+                char key_buf[256], val_buf[16];
+                sqlite3_stmt *st = NULL;
+                sqlite3_prepare_v2(g_db,
+                    "SELECT key FROM config WHERE key LIKE 'cluster_%'", -1, &st, NULL);
+                if (st) {
+                    while (sqlite3_step(st) == SQLITE_ROW) {
+                        const char *k = (const char *)sqlite3_column_text(st, 0);
+                        if (k && strlen(k) > 8)
+                            cJSON_AddItemToArray(arr, cJSON_CreateString(k + 8));
+                    }
+                    sqlite3_finalize(st);
+                }
+                (void)key_buf; (void)val_buf;
+                char *js = cJSON_PrintUnformatted(arr);
+                cJSON_Delete(arr);
+                enum MHD_Result ret = send_json(conn, 200, js);
+                free(js);
+                return ret;
+            }
+
+            if (strcmp(ctx->method, "DELETE") == 0 &&
+                strncmp(ctx->target_url, "/v1/admin/clusters/", 19) == 0) {
+                const char *cn = ctx->target_url + 19;
+                if (cn[0]) {
+                    char cfg_key[128];
+                    snprintf(cfg_key, sizeof(cfg_key), "cluster_%s", cn);
+                    db_config_set(g_db, cfg_key, "");
+                    return send_json(conn, 200, "{\"ok\":true}");
+                }
+                return send_error(conn, 400, "Missing cluster name");
+            }
+
+            return send_error(conn, 404, "Cluster endpoint not found");
+        }
+
         if (strcmp(ctx->method, "POST") == 0) {
             if (strcmp(ctx->target_url, "/v1/admin/nodes") == 0) {
                 cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
@@ -377,9 +447,25 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 cJSON *cn = cJSON_GetObjectItem(json, "cn");
                 cJSON *role = cJSON_GetObjectItem(json, "role");
                 cJSON *pem = cJSON_GetObjectItem(json, "pem");
+                cJSON *cl = cJSON_GetObjectItem(json, "cluster");
+                cJSON *mp = cJSON_GetObjectItem(json, "mapping");
                 int ok = 0;
                 if (cn && cJSON_IsString(cn) && role && cJSON_IsString(role) &&
                     pem && cJSON_IsString(pem)) {
+                    const char *cluster_name = (cl && cJSON_IsString(cl)) ? cl->valuestring : "";
+                    const char *mapping = (mp && cJSON_IsString(mp)) ? mp->valuestring : "";
+
+                    if (cluster_name[0]) {
+                        char cluster_json[65536] = {0};
+                        char cfg_key[128];
+                        snprintf(cfg_key, sizeof(cfg_key), "cluster_%s", cluster_name);
+                        if (db_config_get(g_db, cfg_key, cluster_json,
+                                          sizeof(cluster_json)) != ZEP_ERR_OK) {
+                            cJSON_Delete(json);
+                            return send_error(conn, 400, "Cluster not found");
+                        }
+                    }
+
                     BIO *bio = BIO_new_mem_buf(pem->valuestring, -1);
                     if (bio) {
                         X509 *cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
@@ -388,7 +474,9 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                             char *fp = auth_cert_fingerprint(cert);
                             X509_free(cert);
                             if (fp) {
-                                db_cert_store(g_db, cn->valuestring, fp, pem->valuestring, role->valuestring);
+                                db_cert_store(g_db, cn->valuestring, fp,
+                                              pem->valuestring, role->valuestring,
+                                              cluster_name, mapping);
                                 free(fp);
                                 ok = 1;
                             }
@@ -628,7 +716,7 @@ int serve_main(int argc, char *argv[]) {
             char *fp = auth_cert_fingerprint(ca);
             if (fp) {
                 char *cn = auth_extract_cn(ca);
-                db_cert_store(g_db, cn ? cn : "Zep-Air testing", fp, ca_pem, "server");
+                db_cert_store(g_db, cn ? cn : "Zep-Air testing", fp, ca_pem, "server", "", "");
                 printf("Setup: stored CA  CN=%s  fingerprint=%s\n", cn ? cn : "?", fp);
                 free(cn); free(fp);
             }
@@ -639,7 +727,7 @@ int serve_main(int argc, char *argv[]) {
             char *fp = auth_cert_fingerprint(cert);
             if (fp) {
                 char *cn = auth_extract_cn(cert);
-                db_cert_store(g_db, cn ? cn : "server", fp, cert_pem, "server");
+                db_cert_store(g_db, cn ? cn : "server", fp, cert_pem, "server", "", "");
                 printf("Setup: stored server cert  CN=%s  fingerprint=%s\n", cn ? cn : "?", fp);
                 free(cn); free(fp);
             }
@@ -674,8 +762,8 @@ int serve_main(int argc, char *argv[]) {
         char *admin_fp = auth_cert_fingerprint(admin);
         if (admin_fp) {
             char *admin_cn = auth_extract_cn(admin);
-            db_cert_store(g_db, admin_cn ? admin_cn : "admin", admin_fp,
-                          admin_pem ? admin_pem : "none", "admin");
+                db_cert_store(g_db, admin_cn ? admin_cn : "admin", admin_fp,
+                              admin_pem ? admin_pem : "none", "admin", "", "");
             printf("Setup: stored admin cert  CN=%s  fingerprint=%s\n",
                    admin_cn ? admin_cn : "?", admin_fp);
             free(admin_cn); free(admin_fp);
@@ -722,7 +810,7 @@ int serve_main(int argc, char *argv[]) {
                     ca_fp = auth_cert_fingerprint(ca);
                     X509_free(ca);
                     if (ca_fp) {
-                        db_cert_store(g_db, "Zep-Air testing", ca_fp, "CA", "server");
+                        db_cert_store(g_db, "Zep-Air testing", ca_fp, "CA", "server", "", "");
                         free(ca_fp);
                     }
                 }

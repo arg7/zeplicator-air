@@ -63,6 +63,8 @@ err_t db_init_tables(sqlite3 *db) {
         "  fingerprint TEXT NOT NULL UNIQUE,"
         "  pem         TEXT NOT NULL,"
         "  role        TEXT NOT NULL DEFAULT 'client' CHECK(role IN ('server','admin','master','client')),"
+        "  cluster     TEXT NOT NULL DEFAULT '',"
+        "  mapping     TEXT NOT NULL DEFAULT '',"
         "  created_at  TEXT NOT NULL DEFAULT (datetime('now'))"
         ");";
     char *err = NULL;
@@ -292,9 +294,11 @@ err_t db_chain_common(sqlite3 *db, const char *cluster_key,
 
 err_t db_cert_store(sqlite3 *db, const char *cn,
                     const char *fingerprint, const char *pem_data,
-                    const char *role) {
+                    const char *role, const char *cluster,
+                    const char *mapping) {
     const char *sql =
-        "INSERT OR IGNORE INTO auth (cn, fingerprint, pem, role) VALUES (?, ?, ?, ?)";
+        "INSERT OR IGNORE INTO auth (cn, fingerprint, pem, role, cluster, mapping) "
+        "VALUES (?, ?, ?, ?, ?, ?)";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;
@@ -302,6 +306,8 @@ err_t db_cert_store(sqlite3 *db, const char *cn,
     sqlite3_bind_text(stmt, 2, fingerprint, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 3, pem_data, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 4, role, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 5, cluster, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 6, mapping, -1, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;

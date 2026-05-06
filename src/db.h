@@ -30,7 +30,8 @@ err_t db_chain_common(sqlite3 *db, const char *cluster_key,
 
 err_t db_cert_store(sqlite3 *db, const char *cn,
                     const char *fingerprint, const char *pem_data,
-                    const char *role);
+                    const char *role, const char *cluster,
+                    const char *mapping);
 err_t db_cert_lookup(sqlite3 *db, const char *cn,
                      char *fingerprint, size_t flen);
 err_t db_ca_fingerprint(sqlite3 *db, char *fp, size_t len);
