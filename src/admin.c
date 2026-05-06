@@ -5,7 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
+#include <unistd.h>
 #include <curl/curl.h>
+#include <cjson/cJSON.h>
 
 static char g_server[512] = "https://master.zep.lan:8443";
 static char g_cert_path[ZEP_MAX_PATH];
@@ -413,6 +415,182 @@ static int cmd_admin_snap(int argc, char *argv[]) {
     return do_get(path);
 }
 
+static int cmd_pipe(int argc, char *argv[]) {
+    const char *snap_start = NULL, *snap_stop = NULL;
+    const char *node = NULL;
+    const char *pool_fs = NULL;
+    const char *flags = "full";
+    const char *resume_token = NULL;
+    int progress = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-i") == 0 && i + 2 < argc) {
+            flags = "incremental";
+            snap_start = argv[++i];
+            snap_stop = argv[++i];
+        } else if (strcmp(argv[i], "-I") == 0 && i + 2 < argc) {
+            flags = "all";
+            snap_start = argv[++i];
+            snap_stop = argv[++i];
+        } else if (strcmp(argv[i], "--node") == 0 && i + 1 < argc) {
+            node = argv[++i];
+        } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+            resume_token = argv[++i];
+        } else if (strcmp(argv[i], "--progress") == 0) {
+            progress = 1;
+        } else if (argv[i][0] != '-') {
+            pool_fs = argv[i];
+        }
+    }
+
+    if (!pool_fs) {
+        fprintf(stderr, "Usage: zep-air-admin pipe [--progress] [-t resume_token] [-i snapA snapB] [-I snapA snapB] [--node CN] <pool/fs>\n"
+                        "  No -i/-I: full send (snapshot autodetected from server)\n");
+        return 1;
+    }
+
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "pool_fs", pool_fs);
+    cJSON_AddStringToObject(json, "flags", flags);
+    if (snap_start)    cJSON_AddStringToObject(json, "snap_start", snap_start);
+    if (snap_stop)     cJSON_AddStringToObject(json, "snap_stop", snap_stop);
+    if (node)           cJSON_AddStringToObject(json, "node", node);
+    if (resume_token)   cJSON_AddStringToObject(json, "resume_token", resume_token);
+    char *body = cJSON_PrintUnformatted(json);
+    cJSON_Delete(json);
+
+    char url[1024];
+    snprintf(url, sizeof(url), "%s/v1/admin/pipe", g_server);
+
+    struct curl_buf resp = {0};
+    CURL *curl = curl_easy_init();
+    if (!curl) { free(body); return 1; }
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(curl, CURLOPT_SSLCERT, g_cert_path);
+    curl_easy_setopt(curl, CURLOPT_SSLKEY, g_key_path);
+    curl_easy_setopt(curl, CURLOPT_CAINFO, g_ca_path);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    if (g_key_password[0])
+        curl_easy_setopt(curl, CURLOPT_KEYPASSWD, g_key_password);
+
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    CURLcode rc = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    free(body);
+
+    if (rc != CURLE_OK) {
+        fprintf(stderr, "pipe: curl error: %s\n", curl_easy_strerror(rc));
+        free(resp.data);
+        return 1;
+    }
+    if (http_code != 200) {
+        fprintf(stderr, "pipe: HTTP %ld — %s\n", http_code, resp.data ? resp.data : "");
+        free(resp.data);
+        return 1;
+    }
+
+    cJSON *init_resp = cJSON_Parse(resp.data);
+    free(resp.data);
+    if (!init_resp) { fprintf(stderr, "pipe: invalid init response\n"); return 1; }
+    cJSON *sess_j = cJSON_GetObjectItem(init_resp, "session");
+    if (!sess_j || !cJSON_IsString(sess_j)) {
+        cJSON_Delete(init_resp);
+        fprintf(stderr, "pipe: no session in response\n");
+        return 1;
+    }
+    char session[64];
+    snprintf(session, sizeof(session), "%s", sess_j->valuestring);
+    cJSON_Delete(init_resp);
+
+    uint64_t total_size = 0, received = 0;
+    char poll_url[1024];
+    snprintf(poll_url, sizeof(poll_url), "%s/v1/admin/pipe/%s", g_server, session);
+
+    if (g_verbose || progress)
+        fprintf(stderr, "pipe: session %s, waiting for chunks...\n", session);
+
+    for (;;) {
+        struct curl_buf pr = {0};
+        CURL *pc = curl_easy_init();
+        if (!pc) { fprintf(stderr, "pipe: curl init failed\n"); return 1; }
+        curl_easy_setopt(pc, CURLOPT_URL, poll_url);
+        curl_easy_setopt(pc, CURLOPT_WRITEFUNCTION, curl_write_cb);
+        curl_easy_setopt(pc, CURLOPT_WRITEDATA, &pr);
+        curl_easy_setopt(pc, CURLOPT_SSLCERT, g_cert_path);
+        curl_easy_setopt(pc, CURLOPT_SSLKEY, g_key_path);
+        curl_easy_setopt(pc, CURLOPT_CAINFO, g_ca_path);
+        curl_easy_setopt(pc, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(pc, CURLOPT_SSL_VERIFYHOST, 2L);
+        curl_easy_setopt(pc, CURLOPT_TIMEOUT, 30L);
+        curl_easy_setopt(pc, CURLOPT_CONNECTTIMEOUT, 10L);
+        if (g_key_password[0])
+            curl_easy_setopt(pc, CURLOPT_KEYPASSWD, g_key_password);
+
+        rc = curl_easy_perform(pc);
+        curl_easy_getinfo(pc, CURLINFO_RESPONSE_CODE, &http_code);
+
+        curl_off_t cl = 0;
+        curl_easy_getinfo(pc, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
+
+        curl_easy_cleanup(pc);
+
+        if (rc != CURLE_OK) {
+            fprintf(stderr, "pipe: curl error: %s\n", curl_easy_strerror(rc));
+            free(pr.data);
+            return 1;
+        }
+
+        if (http_code == 204) {
+            free(pr.data);
+            sleep(1);
+            continue;
+        }
+
+        if (http_code != 200) {
+            fprintf(stderr, "pipe: HTTP %ld — aborting\n", http_code);
+            free(pr.data);
+            return 1;
+        }
+
+        int is_done = (cl == 0);
+
+        if (!is_done && pr.data && pr.len > 0) {
+            fwrite(pr.data, 1, pr.len, stdout);
+            fflush(stdout);
+            received += pr.len;
+            if (total_size == 0) total_size = 1;
+        }
+        free(pr.data);
+
+        if (is_done) {
+            if (progress)
+                fprintf(stderr, "\npipe: complete — %llu bytes\n",
+                        (unsigned long long)received);
+            break;
+        }
+
+        if (progress && total_size > 0) {
+            fprintf(stderr, "\rpipe: %llu bytes received", (unsigned long long)received);
+            fflush(stderr);
+        }
+    }
+    return 0;
+}
+
 static int cmd_list_nodes(int argc, char *argv[]) {
     (void)argc; (void)argv;
     return do_get("/v1/admin/nodes");
@@ -443,6 +621,7 @@ static void usage(const char *prog) {
         "  resume       Resume replication\n"
         "  promote      Promote client to master (--node CN)\n"
         "  rollback     Cluster rollback to snapshot (--snap NAME)\n"
+        "  pipe         Replicate ZFS stream from a node through the server\n"
         "  snap         Manual snapshot create/destroy (--name NAME)\n"
         "  config       Server config get/set/list/rm\n"
         "\n"
@@ -475,6 +654,7 @@ int main(int argc, char *argv[]) {
             strcmp(argv[i], "promote") == 0 ||
             strcmp(argv[i], "rollback") == 0 ||
             strcmp(argv[i], "snap") == 0 ||
+            strcmp(argv[i], "pipe") == 0 ||
             strcmp(argv[i], "config") == 0) {
             argv2[argc2++] = argv[i];
             for (int j = i + 1; j < argc && argc2 < 63; j++)
@@ -535,6 +715,7 @@ int main(int argc, char *argv[]) {
     else if (strcmp(cmd, "resume") == 0)   rc = cmd_resume(sub_argc, sub_argv);
     else if (strcmp(cmd, "promote") == 0)  rc = cmd_promote(sub_argc, sub_argv);
     else if (strcmp(cmd, "rollback") == 0) rc = cmd_rollback(sub_argc, sub_argv);
+    else if (strcmp(cmd, "pipe") == 0)     rc = cmd_pipe(sub_argc, sub_argv);
     else if (strcmp(cmd, "snap") == 0)     rc = cmd_admin_snap(sub_argc, sub_argv);
     else if (strcmp(cmd, "config") == 0)   rc = cmd_admin_config(sub_argc, sub_argv);
     else if (strcmp(cmd, "cluster") == 0)  rc = cmd_cluster(sub_argc, sub_argv);

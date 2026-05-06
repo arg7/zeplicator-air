@@ -599,7 +599,6 @@ static int cmd_cron(int argc, char *argv[]) {
                                       (donor && cJSON_IsString(donor)) ? donor->valuestring : "");
                         tasks_done++;
 
-                        /* ack latest local guid */
                         char latest[ZEP_MAX_GUID_LEN] = {0};
                         zfs_get_latest_guid(local_fs, latest, sizeof(latest));
                         if (latest[0]) {
@@ -610,6 +609,122 @@ static int cmd_cron(int argc, char *argv[]) {
                     }
                     db_close(db);
                 }
+            } else if (strcmp(action->valuestring, "pipe") == 0 &&
+                       cfs && cJSON_IsString(cfs)) {
+                cJSON *session_j = cJSON_GetObjectItem(task, "session");
+                cJSON *flags_j    = cJSON_GetObjectItem(task, "flags");
+                cJSON *snap_s     = cJSON_GetObjectItem(task, "snap_start");
+                cJSON *snap_t     = cJSON_GetObjectItem(task, "snap_stop");
+                if (!session_j || !cJSON_IsString(session_j)) continue;
+
+                char local_fs[ZEP_MAX_SNAPSHOT_NAME];
+                if (db_open(g_db_path, &db) != ZEP_ERR_OK) continue;
+                db_init_tables(db);
+                zep_config_t cfg2;
+                db_config_load(db, &cfg2);
+
+                if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
+                                        local_fs, sizeof(local_fs)) != ZEP_ERR_OK) {
+                    fprintf(stderr, "pipe: no mapping for '%s'\n", cfs->valuestring);
+                    db_close(db);
+                    continue;
+                }
+
+                const char *fl = (flags_j && cJSON_IsString(flags_j)) ?
+                                  flags_j->valuestring : "full";
+                int send_all = (strcmp(fl, "all") == 0);
+                int incremental = (strcmp(fl, "incremental") == 0 || send_all);
+
+                const char *from_snap = NULL;
+                const char *to_snap = NULL;
+
+                if (incremental) {
+                    if (snap_s && cJSON_IsString(snap_s))
+                        from_snap = snap_s->valuestring;
+                    if (snap_t && cJSON_IsString(snap_t))
+                        to_snap = snap_t->valuestring;
+                } else {
+                    if (snap_s && cJSON_IsString(snap_s) && snap_s->valuestring[0])
+                        to_snap = snap_s->valuestring;
+                    else if (snap_t && cJSON_IsString(snap_t) && snap_t->valuestring[0])
+                        to_snap = snap_t->valuestring;
+                }
+
+                if (!to_snap) {
+                    fprintf(stderr, "pipe: no snapshot specified\n");
+                    db_close(db);
+                    continue;
+                }
+
+                const char *session = session_j->valuestring;
+
+                char send_opts[512] = {0};
+                if (cfg2.send_options[0])
+                    snprintf(send_opts, sizeof(send_opts), "%s", cfg2.send_options);
+                cJSON *resume_tok = cJSON_GetObjectItem(task, "resume_token");
+                if (resume_tok && cJSON_IsString(resume_tok) && resume_tok->valuestring[0]) {
+                    size_t off = strlen(send_opts);
+                    snprintf(send_opts + off, sizeof(send_opts) - off,
+                             "%s-t %s", off > 0 ? " " : "", resume_tok->valuestring);
+                }
+
+                uint64_t est = zfs_send_estimate(local_fs, from_snap, to_snap,
+                                                  send_all, send_opts[0] ? send_opts : NULL);
+                if (est > 0)
+                    http_put_pipe_meta(&http_cfg, session, est);
+
+                if (cfg2.pipe_zip_cmd[0])
+                    fprintf(stderr, "pipe: using compression '%s' "
+                            "(set pipe_zip_cmd to \"\" to disable)\n",
+                            cfg2.pipe_zip_cmd);
+
+                FILE *send_fp = NULL;
+                err_t sret = zfs_send_open(local_fs, from_snap, to_snap,
+                                           send_all,
+                                           send_opts[0] ? send_opts : NULL,
+                                           cfg2.pipe_zip_cmd, cfg2.pipe_send_buf_cmd,
+                                           &send_fp);
+                if (sret != ZEP_ERR_OK) {
+                    fprintf(stderr, "pipe: zfs send failed\n");
+                    db_close(db);
+                    continue;
+                }
+
+                size_t chunk_size = cfg2.chunk_size;
+                unsigned char *buf = malloc(chunk_size);
+                if (!buf) {
+                    zfs_send_close(send_fp);
+                    db_close(db);
+                    continue;
+                }
+
+                int part = 0;
+                while (1) {
+                    size_t nread = fread(buf, 1, chunk_size, send_fp);
+                    if (nread == 0) break;
+                    err_t put_ret = http_put_pipe_chunk(&http_cfg, session, part, buf, nread);
+                    if (put_ret != ZEP_ERR_OK) {
+                        fprintf(stderr, "pipe: chunk %d upload failed\n", part);
+                        free(buf);
+                        zfs_send_close(send_fp);
+                        db_close(db);
+                        goto pipe_cleanup;
+                    }
+                    tasks_done++;
+                    part++;
+                }
+                free(buf);
+                zfs_send_close(send_fp);
+
+                if (http_post_pipe_done(&http_cfg, session) == ZEP_ERR_OK)
+                    fprintf(stderr, "pipe: send complete (%d chunks)\n", part);
+                else
+                    fprintf(stderr, "pipe: done signal failed\n");
+                db_close(db);
+                continue;
+
+            pipe_cleanup:
+                continue;
             }
         }
         cJSON_Delete(tasks);

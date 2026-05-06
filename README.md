@@ -297,6 +297,75 @@ Commands:
   rollback --snap NAME      Cluster-wide rollback to snapshot
   snap create --name NAME   Manual snapshot (no rotation)
   snap destroy --name NAME  Remove manual snapshot
+  pipe [options] <pool/fs>  Stream ZFS send from source node through server to stdout
+```
+
+### `pipe` — Live ZFS stream relay
+
+Streams a live `zfs send` from a source node through the server to stdout. Prefers clients over master for source selection to avoid burdening production hosts. Data flows in real-time via a 2-chunk FIFO on the server — no disk storage.
+
+```
+zep-air-admin pipe [--progress] [-t resume_token] [-i snapA snapB] [-I snapA snapB] [--node CN] <pool/fs>
+```
+
+| Option | Description |
+|--------|-------------|
+| `--progress` | Print bytes received to stderr |
+| `-t TOKEN` | ZFS resume token for interrupted sends (`zfs send -t`) |
+| `-i SNAP SNAP` | Incremental send between two snapshots |
+| `-I SNAP SNAP` | Send all intermediate snapshots between two |
+| `--node CN` | Source node (default: any non-suspended client, fallback to master) |
+| `<pool/fs>` | Cluster filesystem definition from cluster JSON (e.g. `tank-prod/data`) |
+
+**Examples:**
+
+```sh
+# Full send
+zep-air-admin pipe tank-prod/data > /tmp/full.zfs
+
+# Incremental with progress
+zep-air-admin pipe --progress -i "rpool/data@prod-min-20260506153045" \
+                                   "rpool/data@prod-min-20260506160000" tank-prod/data
+
+# Resume interrupted send
+zep-air-admin pipe -t '1-c22a4b65-...' tank-prod/data
+
+# Pipe directly into zfs recv on a new node
+zep-air-admin pipe tank-prod/data | zfs recv -F -u vault/data
+```
+
+**Flow:**
+
+```
+admin ──POST /v1/admin/pipe──▶ server (suspends source node, stores pipe task)
+node ◀── cron poll ───────────▶ server (returns pipe task, even if suspended)
+node ── zfs send | zstd | chunk ──▶ PUT /v1/pipe/<s>/chunk/N (queued, max 2)
+admin ── poll GET /v1/admin/pipe/<s> ──▶ 200+chunk or 204(wait) or 200+0(done)
+node ── POST /v1/pipe/<s>/done ──▶ server resumes node
+```
+
+The server FIFO holds at most 2 chunks, providing backpressure. Sessions expire after 5 minutes of inactivity. On success the source node is auto-resumed; on failure or abort the node stays suspended for manual retry.
+
+### REST API — Pipe routes
+
+```
+POST /v1/admin/pipe               Initiate pipe session (admin cert required)
+     Body: {"pool_fs":"...","flags":"full|incremental|all","snap_start":"...","snap_stop":"...","node":"...","resume_token":"..."}
+     → {"session":"abc123"}
+
+GET  /v1/admin/pipe/<session>     Poll for next chunk (admin cert required)
+     → 200 + binary chunk         (X-Pipe-Done:0)
+     → 204                        (no chunks yet, retry)
+     → 200 + empty body           (pipe complete)
+
+PUT  /v1/pipe/<session>/meta      Node sends estimated size (mTLS)
+     Body: {"size":1932735283}
+
+PUT  /v1/pipe/<session>/chunk/<N>  Node uploads a chunk (mTLS)
+     → 200 ok / 503 queue full, retry
+
+POST /v1/pipe/<session>/done      Node signals completion (mTLS)
+     → resumes source node
 ```
 
 ## REST API
@@ -331,6 +400,16 @@ POST   /v1/admin/promote/<cn>          Promote client to master
 POST   /v1/admin/rollback/<snap>       Cluster rollback target
 POST   /v1/admin/snap/<name>           Manual snapshot (no rotation)
 POST   /v1/admin/unsnap/<name>         Remove manual snapshot
+POST   /v1/admin/pipe                  Initiate pipe session (admin)
+GET    /v1/admin/pipe/<session>        Poll for pipe chunk (admin)
+```
+
+### Pipe routes (mTLS, node scope)
+
+```
+PUT    /v1/pipe/<session>/meta         Send estimated stream size
+PUT    /v1/pipe/<session>/chunk/<N>    Upload a chunk (max 2 queued)
+POST   /v1/pipe/<session>/done         Signal completion, resumes source node
 ```
 
 ### Cron routes

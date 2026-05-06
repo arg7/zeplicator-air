@@ -312,3 +312,66 @@ err_t http_post_json(const http_config_t *cfg, const char *path, const char *bod
     free(rb.data);
     return rc;
 }
+
+err_t http_put_pipe_chunk(const http_config_t *cfg, const char *session,
+                          int part, const void *data, size_t len) {
+    char *url = NULL;
+    if (asprintf(&url, "%s/v1/pipe/%s/chunk/%04d",
+                 cfg->server_url, session, part) < 0)
+        return ZEP_ERR_SYS;
+
+    struct resp_buf rb = {0};
+    CURL *curl = http_init(cfg, url, &rb);
+    free(url);
+    if (!curl) return ZEP_ERR_NETWORK;
+
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)len);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+
+    int rc = http_do(curl);
+    free(rb.data);
+    return rc;
+}
+
+err_t http_put_pipe_meta(const http_config_t *cfg, const char *session,
+                         uint64_t size) {
+    char *url = NULL;
+    if (asprintf(&url, "%s/v1/pipe/%s/meta", cfg->server_url, session) < 0)
+        return ZEP_ERR_SYS;
+
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddNumberToObject(json, "size", (double)size);
+    char *body = cJSON_PrintUnformatted(json);
+    cJSON_Delete(json);
+
+    struct resp_buf rb = {0};
+    CURL *curl = http_init(cfg, url, &rb);
+    free(url);
+    if (!curl) { free(body); return ZEP_ERR_NETWORK; }
+
+    size_t jlen = strlen(body);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)jlen);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+
+    int rc = http_do(curl);
+    free(body);
+    free(rb.data);
+    return rc;
+}
+
+err_t http_post_pipe_done(const http_config_t *cfg, const char *session) {
+    char *url = NULL;
+    if (asprintf(&url, "%s/v1/pipe/%s/done", cfg->server_url, session) < 0)
+        return ZEP_ERR_SYS;
+
+    struct resp_buf rb = {0};
+    CURL *curl = http_init(cfg, url, &rb);
+    free(url);
+    if (!curl) return ZEP_ERR_NETWORK;
+
+    int rc = http_do(curl);
+    free(rb.data);
+    return rc;
+}

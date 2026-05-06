@@ -13,6 +13,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/time.h>
+#include <sys/time.h>
 #include <microhttpd.h>
 #include <openssl/x509.h>
 #include <openssl/ssl.h>
@@ -34,6 +36,29 @@ static int  g_verbose = 0;
 static int  g_setup_mode = 0;
 static struct MHD_Daemon *g_daemon = NULL;
 static sqlite3 *g_db = NULL;
+
+struct pipe_chunk {
+    struct pipe_chunk *next;
+    unsigned char *data;
+    size_t len;
+    int part;
+};
+
+struct pipe_session {
+    struct pipe_session *next;
+    char token[33];
+    char src_node[64];
+    struct pipe_chunk *chunks_head;
+    struct pipe_chunk *chunks_tail;
+    int chunk_count;
+    int done;
+    uint64_t estimated_size;
+    time_t created;
+    time_t last_activity;
+};
+
+#define ZEP_PIPE_MAX_CHUNKS 2
+static struct pipe_session *g_pipe_sessions = NULL;
 
 struct conn_ctx {
     char method[8];
@@ -286,6 +311,97 @@ static void verify_snapshot(const char *cluster_key, const char *prefix) {
 
     db_close(db);
     storage_meta_free(&meta);
+}
+
+static void pipe_generate_token(char token[33]) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    srand((unsigned int)(tv.tv_sec ^ tv.tv_usec ^ getpid()));
+    for (int i = 0; i < 32; i++)
+        token[i] = (char)("0123456789abcdef"[rand() % 16]);
+    token[32] = '\0';
+}
+
+static struct pipe_session *pipe_session_find(const char *token) {
+    for (struct pipe_session *ps = g_pipe_sessions; ps; ps = ps->next)
+        if (strcmp(ps->token, token) == 0) return ps;
+    return NULL;
+}
+
+static struct pipe_session *pipe_session_create(const char *src_node) {
+    struct pipe_session *ps = calloc(1, sizeof(*ps));
+    if (!ps) return NULL;
+    pipe_generate_token(ps->token);
+    snprintf(ps->src_node, sizeof(ps->src_node), "%s", src_node);
+    ps->created = time(NULL);
+    ps->last_activity = ps->created;
+    ps->next = g_pipe_sessions;
+    g_pipe_sessions = ps;
+    return ps;
+}
+
+static int pipe_session_add_chunk(struct pipe_session *ps, int part,
+                                   const void *data, size_t len) {
+    if (ps->chunk_count >= ZEP_PIPE_MAX_CHUNKS) return -1;
+    struct pipe_chunk *pc = calloc(1, sizeof(*pc));
+    if (!pc) return -1;
+    pc->data = malloc(len);
+    if (!pc->data) { free(pc); return -1; }
+    memcpy(pc->data, data, len);
+    pc->len = len;
+    pc->part = part;
+    if (ps->chunks_tail) {
+        ps->chunks_tail->next = pc;
+        ps->chunks_tail = pc;
+    } else {
+        ps->chunks_head = ps->chunks_tail = pc;
+    }
+    ps->chunk_count++;
+    ps->last_activity = time(NULL);
+    return 0;
+}
+
+static struct pipe_chunk *pipe_session_pop_chunk(struct pipe_session *ps) {
+    if (!ps->chunks_head) return NULL;
+    struct pipe_chunk *pc = ps->chunks_head;
+    ps->chunks_head = pc->next;
+    if (!ps->chunks_head) ps->chunks_tail = NULL;
+    ps->chunk_count--;
+    ps->last_activity = time(NULL);
+    return pc;
+}
+
+static void pipe_session_destroy(struct pipe_session *ps) {
+    if (!ps) return;
+    struct pipe_chunk *pc = ps->chunks_head;
+    while (pc) {
+        struct pipe_chunk *next = pc->next;
+        free(pc->data);
+        free(pc);
+        pc = next;
+    }
+    free(ps);
+}
+
+static void pipe_sessions_cleanup(void) {
+    time_t now = time(NULL);
+    struct pipe_session *prev = NULL, *ps = g_pipe_sessions;
+    while (ps) {
+        struct pipe_session *next = ps->next;
+        if ((now - ps->last_activity) > 300) {
+            if (!ps->done && ps->src_node[0])
+                db_set_suspended(g_db, ps->src_node, 0);
+            char pipe_key[128];
+            snprintf(pipe_key, sizeof(pipe_key), "pipe_task_%s", ps->src_node);
+            db_config_set(g_db, pipe_key, "");
+            if (prev) prev->next = next;
+            else g_pipe_sessions = next;
+            pipe_session_destroy(ps);
+        } else {
+            prev = ps;
+        }
+        ps = next;
+    }
 }
 
 static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
@@ -574,7 +690,174 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             return send_error(conn, 400, "Missing key");
         }
 
+        /* ── pipe: admin initiates pipe session ── */
+        if (strcmp(ctx->method, "POST") == 0 &&
+            strcmp(ctx->target_url, "/v1/admin/pipe") == 0) {
+            cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
+            if (!json) return send_error(conn, 400, "Invalid JSON");
+
+            cJSON *pool_fs_j = cJSON_GetObjectItem(json, "pool_fs");
+            cJSON *flags_j   = cJSON_GetObjectItem(json, "flags");
+            cJSON *snap_s    = cJSON_GetObjectItem(json, "snap_start");
+            cJSON *snap_t    = cJSON_GetObjectItem(json, "snap_stop");
+            cJSON *node_j    = cJSON_GetObjectItem(json, "node");
+            cJSON *resume_j  = cJSON_GetObjectItem(json, "resume_token");
+
+            if (!pool_fs_j || !cJSON_IsString(pool_fs_j) || !pool_fs_j->valuestring[0] ||
+                !flags_j  || !cJSON_IsString(flags_j)) {
+                cJSON_Delete(json);
+                return send_error(conn, 400, "Missing pool_fs or flags");
+            }
+            const char *pool_fs = pool_fs_j->valuestring;
+            const char *flags  = flags_j->valuestring;
+
+            if (strcmp(flags, "full") != 0 && strcmp(flags, "incremental") != 0 &&
+                strcmp(flags, "all") != 0) {
+                cJSON_Delete(json);
+                return send_error(conn, 400, "Invalid flags (full|incremental|all)");
+            }
+
+            char src_node[64] = {0};
+            if (node_j && cJSON_IsString(node_j) && node_j->valuestring[0]) {
+                snprintf(src_node, sizeof(src_node), "%s", node_j->valuestring);
+            } else {
+                sqlite3_stmt *st = NULL;
+                sqlite3_prepare_v2(g_db,
+                    "SELECT cn FROM auth WHERE role = 'client' AND suspended = 0 "
+                    "LIMIT 1", -1, &st, NULL);
+                if (st) {
+                    if (sqlite3_step(st) == SQLITE_ROW)
+                        snprintf(src_node, sizeof(src_node), "%s",
+                                 (const char *)sqlite3_column_text(st, 0));
+                    sqlite3_finalize(st);
+                }
+                if (!src_node[0]) {
+                    sqlite3_prepare_v2(g_db,
+                        "SELECT cn FROM auth WHERE role = 'master' AND suspended = 0 "
+                        "LIMIT 1", -1, &st, NULL);
+                    if (st) {
+                        if (sqlite3_step(st) == SQLITE_ROW)
+                            snprintf(src_node, sizeof(src_node), "%s",
+                                     (const char *)sqlite3_column_text(st, 0));
+                        sqlite3_finalize(st);
+                    }
+                }
+            }
+
+            if (!src_node[0]) {
+                cJSON_Delete(json);
+                return send_error(conn, 500, "No available source node");
+            }
+
+            int suspended_now = 0;
+            {
+                sqlite3_stmt *st = NULL;
+                sqlite3_prepare_v2(g_db,
+                    "SELECT suspended FROM auth WHERE cn = ?", -1, &st, NULL);
+                if (st) {
+                    sqlite3_bind_text(st, 1, src_node, -1, SQLITE_STATIC);
+                    if (sqlite3_step(st) == SQLITE_ROW)
+                        suspended_now = sqlite3_column_int(st, 0);
+                    sqlite3_finalize(st);
+                }
+            }
+            if (suspended_now) {
+                cJSON_Delete(json);
+                return send_error(conn, 409, "Source node already suspended");
+            }
+
+            db_set_suspended(g_db, src_node, 1);
+            if (g_verbose)
+                fprintf(stderr, "pipe: suspended node %s\n", src_node);
+
+            struct pipe_session *ps = pipe_session_create(src_node);
+            if (!ps) {
+                db_set_suspended(g_db, src_node, 0);
+                cJSON_Delete(json);
+                return send_error(conn, 500, "Failed to create session");
+            }
+
+            const char *snap_start = (snap_s && cJSON_IsString(snap_s)) ? snap_s->valuestring : NULL;
+            const char *snap_stop  = (snap_t && cJSON_IsString(snap_t)) ? snap_t->valuestring : NULL;
+
+            cJSON *task_j = cJSON_CreateObject();
+            cJSON_AddStringToObject(task_j, "action", "pipe");
+            cJSON_AddStringToObject(task_j, "session", ps->token);
+            cJSON_AddStringToObject(task_j, "flags", flags);
+            cJSON_AddStringToObject(task_j, "cluster_fs", pool_fs);
+            if (snap_start) cJSON_AddStringToObject(task_j, "snap_start", snap_start);
+            if (snap_stop)  cJSON_AddStringToObject(task_j, "snap_stop", snap_stop);
+            if (resume_j && cJSON_IsString(resume_j) && resume_j->valuestring[0])
+                cJSON_AddStringToObject(task_j, "resume_token", resume_j->valuestring);
+            char *task_str = cJSON_PrintUnformatted(task_j);
+            cJSON_Delete(task_j);
+            cJSON_Delete(json);
+
+            char pipe_key[128];
+            snprintf(pipe_key, sizeof(pipe_key), "pipe_task_%s", src_node);
+            db_config_set(g_db, pipe_key, task_str);
+            free(task_str);
+
+            char *resp = NULL;
+            if (asprintf(&resp, "{\"session\":\"%s\"}", ps->token) < 0)
+                return send_error(conn, 500, "OOM");
+            enum MHD_Result ret = send_json(conn, 200, resp);
+            free(resp);
+            return ret;
+        }
+
         return send_error(conn, 404, "Admin endpoint not found");
+    }
+
+    /* ── pipe node endpoints (mTLS authenticated, not admin) ── */
+    if (strncmp(ctx->target_url, "/v1/pipe/", 9) == 0) {
+        const char *rest = ctx->target_url + 9;
+        char token[64] = {0};
+        const char *slash = strchr(rest, '/');
+        if (slash) {
+            size_t tok_len = (size_t)(slash - rest);
+            if (tok_len >= sizeof(token)) tok_len = sizeof(token) - 1;
+            memcpy(token, rest, tok_len);
+        } else {
+            snprintf(token, sizeof(token), "%s", rest);
+        }
+
+        struct pipe_session *ps = pipe_session_find(token);
+        if (!ps) return send_error(conn, 404, "Session not found");
+
+        if (strcmp(ctx->method, "PUT") == 0 && slash) {
+            const char *sub = slash + 1;
+            if (strncmp(sub, "meta", 4) == 0) {
+                cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
+                if (json) {
+                    cJSON *sz = cJSON_GetObjectItem(json, "size");
+                    if (sz && cJSON_IsNumber(sz))
+                        ps->estimated_size = (uint64_t)sz->valuedouble;
+                    cJSON_Delete(json);
+                }
+                return send_json(conn, 200, "{\"ok\":true}");
+            }
+            if (strncmp(sub, "chunk/", 6) == 0) {
+                int part = atoi(sub + 6);
+                if (pipe_session_add_chunk(ps, part, ctx->body, ctx->body_len) != 0)
+                    return send_error(conn, 503, "Pipe queue full, retry");
+                return send_json(conn, 200, "{\"ok\":true}");
+            }
+        }
+
+        if (strcmp(ctx->method, "POST") == 0 && slash &&
+            strncmp(slash + 1, "done", 4) == 0) {
+            ps->done = 1;
+            db_set_suspended(g_db, ps->src_node, 0);
+            char pipe_key[128];
+            snprintf(pipe_key, sizeof(pipe_key), "pipe_task_%s", ps->src_node);
+            db_config_set(g_db, pipe_key, "");
+            if (g_verbose)
+                fprintf(stderr, "pipe: session %s done, resumed %s\n", token, ps->src_node);
+            return send_json(conn, 200, "{\"ok\":true}");
+        }
+
+        return send_error(conn, 404, "Pipe endpoint not found");
     }
 
     /* ── suspend / resume ── */
@@ -692,9 +975,68 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         return send_error(conn, 404, "Admin action not found");
     }
 
+    /* ── admin pipe poll ── */
+    if (strcmp(ctx->method, "GET") == 0 &&
+        strncmp(ctx->target_url, "/v1/admin/pipe/", 15) == 0) {
+        const char *token = ctx->target_url + 15;
+        if (!token[0]) return send_error(conn, 400, "Missing session token");
+
+        pipe_sessions_cleanup();
+        struct pipe_session *ps = pipe_session_find(token);
+        if (!ps) return send_error(conn, 404, "Session not found or expired");
+
+        struct pipe_chunk *pc = pipe_session_pop_chunk(ps);
+        if (!pc) {
+            if (ps->done) {
+                struct MHD_Response *resp = MHD_create_response_from_buffer(
+                    0, "", MHD_RESPMEM_PERSISTENT);
+                MHD_add_response_header(resp, "X-Pipe-Done", "1");
+                MHD_add_response_header(resp, "Content-Type", "application/octet-stream");
+                enum MHD_Result ret = MHD_queue_response(conn, 200, resp);
+                MHD_destroy_response(resp);
+                return ret;
+            }
+            return send_error(conn, 204, "No chunks yet");
+        }
+
+        char size_buf[32];
+        snprintf(size_buf, sizeof(size_buf), "%llu", (unsigned long long)ps->estimated_size);
+        struct MHD_Response *resp = MHD_create_response_from_buffer(
+            pc->len, pc->data, MHD_RESPMEM_MUST_FREE);
+        free(pc);
+        MHD_add_response_header(resp, "Content-Type", "application/octet-stream");
+        MHD_add_response_header(resp, "X-Pipe-Chunk", "1");
+        if (ps->estimated_size > 0)
+            MHD_add_response_header(resp, "X-Pipe-Size", size_buf);
+        enum MHD_Result ret = MHD_queue_response(conn, 200, resp);
+        MHD_destroy_response(resp);
+        return ret;
+    }
+
     /* ── cron sync endpoint ── */
     if (strcmp(ctx->method, "GET") == 0 &&
         strcmp(ctx->target_url, "/v1/cron/sync") == 0) {
+        cJSON *tasks = cJSON_CreateArray();
+
+        if (ctx->node[0]) {
+            char pipe_key[128];
+            snprintf(pipe_key, sizeof(pipe_key), "pipe_task_%s", ctx->node);
+            char pipe_task_json[4096] = {0};
+            if (db_config_get(g_db, pipe_key, pipe_task_json,
+                              sizeof(pipe_task_json)) == ZEP_ERR_OK &&
+                pipe_task_json[0]) {
+                cJSON *pt = cJSON_Parse(pipe_task_json);
+                if (pt) {
+                    cJSON_AddItemToArray(tasks, pt);
+                    char *js = cJSON_PrintUnformatted(tasks);
+                    cJSON_Delete(tasks);
+                    enum MHD_Result ret = send_json(conn, 200, js);
+                    free(js);
+                    return ret;
+                }
+            }
+        }
+
         char role[16] = {0}, cluster_name[64] = {0};
         int suspended = 0;
         if (ctx->node[0]) {
@@ -715,7 +1057,6 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             }
         }
 
-        cJSON *tasks = cJSON_CreateArray();
         time_t now = time(NULL);
 
         if (suspended) {
