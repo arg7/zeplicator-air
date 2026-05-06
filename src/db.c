@@ -365,3 +365,19 @@ err_t db_auth_remove(sqlite3 *db, const char *cn) {
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
 }
+
+err_t db_auth_get_role_by_fp(sqlite3 *db, const char *fingerprint,
+                              char *role, size_t len) {
+    const char *sql = "SELECT role FROM auth WHERE fingerprint = ?";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, fingerprint, -1, SQLITE_STATIC);
+    err_t ret = ZEP_ERR_NOT_FOUND;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        snprintf(role, len, "%s", sqlite3_column_text(stmt, 0));
+        ret = ZEP_ERR_OK;
+    }
+    sqlite3_finalize(stmt);
+    return ret;
+}

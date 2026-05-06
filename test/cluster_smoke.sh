@@ -168,6 +168,18 @@ sudo -u za-client-1 "$ZEP" --db /tmp/zep-air/za-client-1.db pull -f za-client-1-
 after=$(sudo zfs list -r -t snapshot za-client-1-pool/slave 2>/dev/null | grep -c '@' | tr -d '[:space:]' || echo 0)
 [[ $before -eq $after ]] && ok "idempotent ($before snaps)" || bad "duplicates: $before -> $after"
 
+# ---- test 8: admin API rejects non-admin cert ----
+echo -e "${CYAN}Test 8: admin API rejects non-admin cert${NC}"
+out=$("$ADMIN" --server https://master.zep.lan:18443 \
+    --cert "$PKI/za-master.crt" --key "$PKI/za-master.key" --ca "$PKI/ca.crt" \
+    join --role client --node evil --cert "$PKI/za-master.crt" 2>&1)
+echo "$out" | grep -qE '403|Admin' && ok "admin API rejects non-admin cert" || bad "admin API accepted non-admin cert"
+
+# ---- test 9: push works with node cert (not admin) ----
+echo -e "${CYAN}Test 9: push works with node cert${NC}"
+out=$(sudo -u za-master "$ZEP" --db /tmp/zep-air/za-master.db push -f za-master-pool/master -l daily 2>&1)
+echo "$out" | grep -q "Push complete" && ok "push with node cert succeeded" || bad "push with node cert failed"
+
 # ---- stop server ----
 kill $SERV_PID 2>/dev/null; wait $SERV_PID 2>/dev/null
 

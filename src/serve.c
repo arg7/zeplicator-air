@@ -17,6 +17,8 @@
 #include <openssl/pem.h>
 #include <openssl/bio.h>
 #include <cjson/cJSON.h>
+#include <gnutls/gnutls.h>
+#include <gnutls/x509.h>
 
 static char g_storage_root[ZEP_MAX_PATH] = "/var/lib/zep-air";
 static char g_db_path[ZEP_MAX_PATH]       = "/var/lib/zep-air/zep-air.db";
@@ -277,13 +279,71 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         snprintf(ctx->method, sizeof(ctx->method), "%s", method);
         snprintf(ctx->target_url, sizeof(ctx->target_url), "%s", url);
 
+        const union MHD_ConnectionInfo *info = MHD_get_connection_info(
+            conn, MHD_CONNECTION_INFO_GNUTLS_CLIENT_CERT);
+        gnutls_x509_crt_t client_cert =
+            info ? (gnutls_x509_crt_t)info->client_cert : NULL;
+
+        if (!client_cert) {
+            const union MHD_ConnectionInfo *sinfo = MHD_get_connection_info(
+                conn, MHD_CONNECTION_INFO_GNUTLS_SESSION);
+            if (sinfo && sinfo->tls_session) {
+                unsigned int cert_count = 0;
+                const gnutls_datum_t *certs = gnutls_certificate_get_peers(
+                    (gnutls_session_t)sinfo->tls_session, &cert_count);
+                if (certs && cert_count > 0) {
+                    gnutls_x509_crt_t crt;
+                    if (gnutls_x509_crt_init(&crt) >= 0) {
+                        if (gnutls_x509_crt_import(crt, &certs[0],
+                                GNUTLS_X509_FMT_DER) >= 0)
+                            client_cert = crt;
+                        else
+                            gnutls_x509_crt_deinit(crt);
+                    }
+                }
+            }
+        }
+
         if (strcmp(url, "/health") == 0) {
             return send_response(conn, 200, "text/plain", "ok", 2);
         }
 
-        ctx->authed = 1;
-        snprintf(ctx->node, sizeof(ctx->node), "cert-authenticated");
+        if (client_cert) {
+            unsigned char fp_buf[32];
+            size_t fp_size = sizeof(fp_buf);
+            if (gnutls_x509_crt_get_fingerprint(client_cert,
+                    GNUTLS_DIG_SHA256, fp_buf, &fp_size) == 0) {
+                char fp_hex[65];
+                for (size_t j = 0; j < fp_size; j++)
+                    sprintf(fp_hex + j * 2, "%02X", fp_buf[j]);
+                fp_hex[fp_size * 2] = '\0';
 
+                char role[16] = {0};
+                db_auth_get_role_by_fp(g_db, fp_hex, role, sizeof(role));
+
+                if (g_verbose)
+                    fprintf(stderr, "auth: fp=%s role=%s url=%s\n", fp_hex, role, url);
+
+                size_t cn_size = 0;
+                if (gnutls_x509_crt_get_dn_by_oid(client_cert,
+                        GNUTLS_OID_X520_COMMON_NAME, 0, 0, NULL, &cn_size) >= 0) {
+                    char *cn = malloc(cn_size);
+                    if (cn) {
+                        gnutls_x509_crt_get_dn_by_oid(client_cert,
+                            GNUTLS_OID_X520_COMMON_NAME, 0, 0, cn, &cn_size);
+                        snprintf(ctx->node, sizeof(ctx->node), "%s", cn);
+                        free(cn);
+                    }
+                }
+
+                if (strncmp(ctx->target_url, "/v1/admin", 9) == 0 &&
+                    strcmp(role, "admin") != 0) {
+                    return send_error(conn, 403, "Admin access required");
+                }
+            }
+        }
+
+        ctx->authed = 1;
         parse_url(url, ctx);
         return MHD_YES;
     }
@@ -588,7 +648,23 @@ int serve_main(int argc, char *argv[]) {
 
         X509 *admin = NULL;
         FILE *af = fopen(g_admin_cert_path, "r");
-        if (af) { admin = PEM_read_X509(af, NULL, NULL, NULL); fclose(af); }
+        char *admin_pem = NULL;
+        if (af) {
+            admin = PEM_read_X509(af, NULL, NULL, NULL);
+            fclose(af);
+            af = fopen(g_admin_cert_path, "r");
+            if (af) {
+                fseek(af, 0, SEEK_END);
+                long sz = ftell(af);
+                fseek(af, 0, SEEK_SET);
+                admin_pem = malloc((size_t)sz + 1);
+                if (admin_pem) {
+                    size_t r = fread(admin_pem, 1, (size_t)sz, af);
+                    admin_pem[r] = '\0';
+                }
+                fclose(af);
+            }
+        }
         if (!admin) {
             fprintf(stderr, "error: failed to load admin cert from %s\n", g_admin_cert_path);
             db_close(g_db);
@@ -599,11 +675,12 @@ int serve_main(int argc, char *argv[]) {
         if (admin_fp) {
             char *admin_cn = auth_extract_cn(admin);
             db_cert_store(g_db, admin_cn ? admin_cn : "admin", admin_fp,
-                          NULL, "admin");
+                          admin_pem ? admin_pem : "none", "admin");
             printf("Setup: stored admin cert  CN=%s  fingerprint=%s\n",
                    admin_cn ? admin_cn : "?", admin_fp);
             free(admin_cn); free(admin_fp);
         }
+        free(admin_pem);
         X509_free(admin);
 
         printf("Setup complete.\n");
