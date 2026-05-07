@@ -372,7 +372,8 @@ static int cmd_rotate(int argc, char *argv[]) {
         cfg.cluster[0] ? "" : NULL);
     char *protected_url = NULL;
     if (cfg.cluster[0])
-        asprintf(&protected_url, "/v1/cron/protected?%s", cfg.cluster);
+        if (asprintf(&protected_url, "/v1/cron/protected?%s", cfg.cluster) < 0)
+            return ZEP_ERR_SYS;
 
     char **protected_guids = NULL;
     int pcount = 0;
@@ -490,7 +491,7 @@ static int cmd_rotate(int argc, char *argv[]) {
             FILE *dp = popen(dcmd, "r");
             if (dp) {
                 char ebuf[256] = {0};
-                fread(ebuf, 1, sizeof(ebuf)-1, dp);
+                if (fread(ebuf, 1, sizeof(ebuf)-1, dp) == 0 && ferror(dp)) {}
                 int rc = pclose(dp);
                 if (rc == 0) {
                     printf("purged: %s (label=%s, count=%d)\n", snaps[i].name, snaps[i].label, count);

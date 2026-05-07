@@ -320,7 +320,7 @@ err_t pipeline_pull(const zep_config_t *cfg,
         if (!meta.base_guid[0]) {
             char cmd[ZEP_MAX_PATH];
             snprintf(cmd, sizeof(cmd), "zfs set mountpoint=none '%s' 2>/dev/null", fs);
-            system(cmd);
+            if (system(cmd) == -1) {}
         }
 
         printf("Pulling %s  guid=%s  blobs=%d  size=%lu\n",

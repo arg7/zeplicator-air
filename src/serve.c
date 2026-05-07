@@ -258,7 +258,7 @@ static void verify_snapshot(const char *cluster_key, const char *prefix) {
     fseek(dfp, 0, SEEK_SET);
     unsigned char *decomp = malloc((size_t)dlen);
     if (!decomp) { fclose(dfp); unlink(dec_path); free(dec_path); storage_meta_free(&meta); return; }
-    fread(decomp, 1, (size_t)dlen, dfp);
+    if (fread(decomp, 1, (size_t)dlen, dfp) != (size_t)dlen) { fclose(dfp); unlink(dec_path); free(dec_path); free(decomp); storage_meta_free(&meta); return; }
     fclose(dfp);
     unlink(dec_path);
     free(dec_path);
