@@ -204,20 +204,24 @@ for user in za-master za-client-1 za-client-2; do
     sudo -u "$user" "$ZEP" --db "/tmp/zep-air/${user}.db" cron --daemon --interval 2 &
     CRON_PIDS+=($!)
 done
-sleep 2
+sleep 3
 "$ADMIN" $BASE config set pipe_restrict zfs >/dev/null 2>&1
+
+PIPE_ADM="--server https://master.zep.lan:18443 --cert $PKI/admin.crt --key $PKI/admin.key --ca $PKI/ca.crt"
 
 # ---- test 10: pipe zfs list ----
 echo -e "${CYAN}Test 10: pipe zfs list -t snapshot${NC}"
-out=$("$ADMIN" $BASE pipe zfs list -t snapshot 2>/dev/null)
+out=$(timeout 12s "$ADMIN" $PIPE_ADM pipe zfs list -t snapshot 2>/dev/null)
 echo "$out" | grep -q '@' && ok "pipe zfs list returned snapshots" || bad "pipe zfs list failed"
 
 # ---- test 11: pipe zfs send | zstream dump ----
 echo -e "${CYAN}Test 11: pipe zfs send | zstream dump -v${NC}"
 last_snap=$(sudo zfs list -t snapshot -o name -s creation za-master-pool/master 2>/dev/null | tail -1 | tr -d '[:space:]')
 if [ -n "$last_snap" ]; then
-    "$ADMIN" $BASE pipe --node za-master zfs send "$last_snap" 2>/dev/null | zstream dump -v >/dev/null 2>&1
-    [ $? -eq 0 ] && ok "pipe zfs send + zstream dump OK for $last_snap" || bad "pipe zfs send + zstream dump failed"
+    timeout 12s "$ADMIN" $PIPE_ADM pipe --node za-master zfs send "$last_snap" 2>/dev/null \
+        | zstream dump -v >/dev/null 2>&1
+    [ $? -eq 0 ] && ok "pipe zfs send valid stream ($last_snap)" \
+                  || bad "pipe zfs send stream invalid"
 else
     bad "no snapshot found for pipe zfs send"
 fi
