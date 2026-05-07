@@ -43,6 +43,7 @@ err_t db_auth_get_role_by_fp(sqlite3 *db, const char *fingerprint,
                               char *role, size_t len);
 err_t db_ack_guid(sqlite3 *db, const char *cn, const char *guid);
 err_t db_set_suspended(sqlite3 *db, const char *cn, int val);
+err_t db_set_pipe_active(sqlite3 *db, const char *cn, int val);
 err_t db_update_role(sqlite3 *db, const char *cn, const char *new_role);
 
 #endif

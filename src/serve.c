@@ -394,7 +394,7 @@ static void pipe_sessions_cleanup(void) {
         struct pipe_session *next = ps->next;
         if ((now - ps->last_activity) > 300) {
             if (!ps->done && ps->src_node[0])
-                db_set_suspended(g_db, ps->src_node, 0);
+                db_set_pipe_active(g_db, ps->src_node, 0);
             char pipe_key[128];
             snprintf(pipe_key, sizeof(pipe_key), "pipe_task_%s", ps->src_node);
             db_config_set(g_db, pipe_key, "");
@@ -779,7 +779,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             } else {
                 sqlite3_stmt *st = NULL;
                 sqlite3_prepare_v2(g_db,
-                    "SELECT cn FROM auth WHERE role = 'client' AND suspended = 0 "
+                    "SELECT cn FROM auth WHERE role = 'client' AND pipe_active = 0 "
                     "LIMIT 1", -1, &st, NULL);
                 if (st) {
                     if (sqlite3_step(st) == SQLITE_ROW)
@@ -789,7 +789,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 }
                 if (!src_node[0]) {
                     sqlite3_prepare_v2(g_db,
-                        "SELECT cn FROM auth WHERE role = 'master' AND suspended = 0 "
+                        "SELECT cn FROM auth WHERE role = 'master' AND pipe_active = 0 "
                         "LIMIT 1", -1, &st, NULL);
                     if (st) {
                         if (sqlite3_step(st) == SQLITE_ROW)
@@ -805,31 +805,31 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 return send_error(conn, 500, "No available node");
             }
 
-            int suspended_now = 0;
+            int active_now = 0;
             {
                 sqlite3_stmt *st = NULL;
                 sqlite3_prepare_v2(g_db,
-                    "SELECT suspended FROM auth WHERE cn = ?", -1, &st, NULL);
+                    "SELECT pipe_active FROM auth WHERE cn = ?", -1, &st, NULL);
                 if (st) {
                     sqlite3_bind_text(st, 1, src_node, -1, SQLITE_STATIC);
                     if (sqlite3_step(st) == SQLITE_ROW)
-                        suspended_now = sqlite3_column_int(st, 0);
+                        active_now = sqlite3_column_int(st, 0);
                     sqlite3_finalize(st);
                 }
             }
-            if (suspended_now) {
+            if (active_now) {
                 cJSON_Delete(json);
-                return send_error(conn, 409, "Target node already suspended");
+                return send_error(conn, 409, "Node already has active pipe");
             }
 
-            db_set_suspended(g_db, src_node, 1);
+            db_set_pipe_active(g_db, src_node, 1);
             if (g_verbose)
-                fprintf(stderr, "pipe: suspended node %s (dir=%s, cmd=%s)\n",
+                fprintf(stderr, "pipe: reserved node %s (dir=%s, cmd=%s)\n",
                         src_node, direction ? "recv" : "send", command);
 
             struct pipe_session *ps = pipe_session_create(src_node, direction);
             if (!ps) {
-                db_set_suspended(g_db, src_node, 0);
+                db_set_pipe_active(g_db, src_node, 0);
                 cJSON_Delete(json);
                 return send_error(conn, 500, "Failed to create session");
             }
@@ -1091,12 +1091,12 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         if (strcmp(ctx->method, "POST") == 0 && slash &&
             strncmp(slash + 1, "done", 4) == 0) {
             ps->done = 1;
-            db_set_suspended(g_db, ps->src_node, 0);
+            db_set_pipe_active(g_db, ps->src_node, 0);
             char pipe_key[128];
             snprintf(pipe_key, sizeof(pipe_key), "pipe_task_%s", ps->src_node);
             db_config_set(g_db, pipe_key, "");
             if (g_verbose)
-                fprintf(stderr, "pipe: session %s done, resumed %s\n", token, ps->src_node);
+                fprintf(stderr, "pipe: session %s done, released %s\n", token, ps->src_node);
             return send_json(conn, 200, "{\"ok\":true}");
         }
 
@@ -1128,11 +1128,11 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         }
 
         char role[16] = {0}, cluster_name[64] = {0};
-        int suspended = 0;
+        int suspended = 0, pipe_active = 0;
         if (ctx->node[0]) {
             sqlite3_stmt *st = NULL;
             sqlite3_prepare_v2(g_db,
-                "SELECT role, cluster, suspended FROM auth WHERE cn = ?",
+                "SELECT role, cluster, suspended, pipe_active FROM auth WHERE cn = ?",
                 -1, &st, NULL);
             if (st) {
                 sqlite3_bind_text(st, 1, ctx->node, -1, SQLITE_STATIC);
@@ -1140,6 +1140,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     const char *r = (const char *)sqlite3_column_text(st, 0);
                     const char *c = (const char *)sqlite3_column_text(st, 1);
                     suspended = sqlite3_column_int(st, 2);
+                    pipe_active = sqlite3_column_int(st, 3);
                     snprintf(role, sizeof(role), "%s", r ? r : "");
                     snprintf(cluster_name, sizeof(cluster_name), "%s", c ? c : "");
                 }
@@ -1149,9 +1150,9 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
         time_t now = time(NULL);
 
-        if (suspended) {
+        if (suspended || pipe_active) {
             cJSON_AddItemToArray(tasks, cJSON_CreateObject());
-            /* empty task list — no work for suspended nodes */
+            /* empty task list — no work for suspended or pipe-active nodes */
         } else if (strcmp(role, "master") == 0 && cluster_name[0]) {
             char cfg_key[128], cluster_json[65536] = {0};
             snprintf(cfg_key, sizeof(cfg_key), "cluster_%s", cluster_name);

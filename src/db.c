@@ -70,6 +70,7 @@ err_t db_init_tables(sqlite3 *db) {
         "  last_ack_guid TEXT DEFAULT '',"
         "  last_ack_at   TEXT DEFAULT '',"
         "  suspended     INTEGER NOT NULL DEFAULT 0,"
+        "  pipe_active   INTEGER NOT NULL DEFAULT 0,"
         "  created_at    TEXT NOT NULL DEFAULT (datetime('now'))"
         ");";
     char *err = NULL;
@@ -79,6 +80,8 @@ err_t db_init_tables(sqlite3 *db) {
         sqlite3_free(err);
         return ZEP_ERR_DB;
     }
+    sqlite3_exec(db, "ALTER TABLE auth ADD COLUMN pipe_active INTEGER NOT NULL DEFAULT 0",
+                 NULL, NULL, NULL);
     return ZEP_ERR_OK;
 }
 
@@ -430,6 +433,18 @@ err_t db_set_suspended(sqlite3 *db, const char *cn, int val) {
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db,
             "UPDATE auth SET suspended = ? WHERE cn = ?", -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_int(stmt, 1, val);
+    sqlite3_bind_text(stmt, 2, cn, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
+}
+
+err_t db_set_pipe_active(sqlite3 *db, const char *cn, int val) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE auth SET pipe_active = ? WHERE cn = ?", -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;
     sqlite3_bind_int(stmt, 1, val);
     sqlite3_bind_text(stmt, 2, cn, -1, SQLITE_STATIC);

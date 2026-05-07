@@ -4,6 +4,7 @@ set -u
 
 RED='\033[31m'; GREEN='\033[32m'; CYAN='\033[36m'; NC='\033[0m'
 pass=0; fail=0
+CRON_PIDS=()
 ZEP="/usr/local/bin/zep-air"
 SERV="/usr/local/bin/zep-air-serve"
 ADMIN="/usr/local/bin/zep-air-admin"
@@ -197,6 +198,33 @@ echo "$out" | grep -qE '403|Admin' && ok "admin API rejects non-admin cert" || b
 echo -e "${CYAN}Test 9: push works with node cert${NC}"
 out=$(sudo -u za-master "$ZEP" --db /tmp/zep-air/za-master.db push -f za-master-pool/master -l daily 2>&1)
 echo "$out" | grep -q "Push complete" && ok "push with node cert succeeded" || bad "push with node cert failed"
+
+# ---- pipe tests: need cron daemons ----
+for user in za-master za-client-1 za-client-2; do
+    sudo -u "$user" "$ZEP" --db "/tmp/zep-air/${user}.db" cron --daemon --interval 2 &
+    CRON_PIDS+=($!)
+done
+sleep 2
+"$ADMIN" $BASE config set pipe_restrict zfs >/dev/null 2>&1
+
+# ---- test 10: pipe zfs list ----
+echo -e "${CYAN}Test 10: pipe zfs list -t snapshot${NC}"
+out=$("$ADMIN" $BASE pipe zfs list -t snapshot 2>/dev/null)
+echo "$out" | grep -q '@' && ok "pipe zfs list returned snapshots" || bad "pipe zfs list failed"
+
+# ---- test 11: pipe zfs send | zstream dump ----
+echo -e "${CYAN}Test 11: pipe zfs send | zstream dump -v${NC}"
+last_snap=$(sudo zfs list -t snapshot -o name -s creation za-master-pool/master 2>/dev/null | tail -1 | tr -d '[:space:]')
+if [ -n "$last_snap" ]; then
+    "$ADMIN" $BASE pipe --node za-master zfs send "$last_snap" 2>/dev/null | zstream dump -v >/dev/null 2>&1
+    [ $? -eq 0 ] && ok "pipe zfs send + zstream dump OK for $last_snap" || bad "pipe zfs send + zstream dump failed"
+else
+    bad "no snapshot found for pipe zfs send"
+fi
+
+# stop cron daemons
+for pid in "${CRON_PIDS[@]}"; do kill "$pid" 2>/dev/null; done
+wait 2>/dev/null
 
 # ---- stop server ----
 kill $SERV_PID 2>/dev/null; wait $SERV_PID 2>/dev/null
