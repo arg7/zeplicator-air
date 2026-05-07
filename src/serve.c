@@ -480,9 +480,11 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                 const char *end = strchr(cn_start, ',');
                                 size_t n = end ? (size_t)(end - cn_start)
                                                : strlen(cn_start);
-                                if (n >= sizeof(ctx->node)) n = sizeof(ctx->node) - 1;
-                                memcpy(ctx->node, cn_start, n);
-                                ctx->node[n] = '\0';
+                                if (!ctx->node[0]) {
+                                    if (n >= sizeof(ctx->node)) n = sizeof(ctx->node) - 1;
+                                    memcpy(ctx->node, cn_start, n);
+                                    ctx->node[n] = '\0';
+                                }
                             }
                         }
                         free(dn);

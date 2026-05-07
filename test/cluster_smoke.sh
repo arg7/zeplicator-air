@@ -93,6 +93,7 @@ sudo "$SERV" --setup \
 
 "$SERV" --port 18443 --cert "$PKI/server.crt" --key "$PKI/server.key" \
     --ca "$PKI/ca.crt" --db "$SDB" --storage /tmp/zep-air/store &
+
 SERV_PID=$!
 sleep 2
 
