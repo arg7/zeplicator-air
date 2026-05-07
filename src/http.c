@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <curl/curl.h>
 #include <cjson/cJSON.h>
 
@@ -320,18 +321,40 @@ err_t http_put_pipe_chunk(const http_config_t *cfg, const char *session,
                  cfg->server_url, session, part) < 0)
         return ZEP_ERR_SYS;
 
-    struct resp_buf rb = {0};
-    CURL *curl = http_init(cfg, url, &rb);
+    for (int retry = 0; retry < 120; retry++) {
+        struct resp_buf rb = {0};
+        CURL *curl = http_init(cfg, url, &rb);
+        if (!curl) { free(url); return ZEP_ERR_NETWORK; }
+
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)len);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+
+        CURLcode crc = curl_easy_perform(curl);
+        long http_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        curl_easy_cleanup(curl);
+        free(rb.data);
+
+        if (crc != CURLE_OK) {
+            fprintf(stderr, "http_put_chunk: %s\n", curl_easy_strerror(crc));
+            free(url);
+            return ZEP_ERR_NETWORK;
+        }
+        if (http_code == 503) {
+            sleep(1);
+            continue;
+        }
+        free(url);
+        if (http_code >= 400) {
+            fprintf(stderr, "http_put_chunk: HTTP %ld\n", http_code);
+            return ZEP_ERR_NETWORK;
+        }
+        return ZEP_ERR_OK;
+    }
     free(url);
-    if (!curl) return ZEP_ERR_NETWORK;
-
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)len);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
-    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
-
-    int rc = http_do(curl);
-    free(rb.data);
-    return rc;
+    fprintf(stderr, "http_put_chunk: too many retries\n");
+    return ZEP_ERR_NETWORK;
 }
 
 err_t http_put_pipe_meta(const http_config_t *cfg, const char *session,
@@ -374,4 +397,51 @@ err_t http_post_pipe_done(const http_config_t *cfg, const char *session) {
     int rc = http_do(curl);
     free(rb.data);
     return rc;
+}
+
+err_t http_get_pipe_chunk(const http_config_t *cfg, const char *session,
+                          void **data, size_t *len, int *is_done) {
+    char *url = NULL;
+    if (asprintf(&url, "%s/v1/pipe/%s", cfg->server_url, session) < 0)
+        return ZEP_ERR_SYS;
+
+    *data = NULL;
+    *len = 0;
+    *is_done = 0;
+
+    struct resp_buf rb = {0};
+    CURL *curl = http_init(cfg, url, &rb);
+    free(url);
+    if (!curl) return ZEP_ERR_NETWORK;
+
+    CURLcode crc = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_cleanup(curl);
+
+    if (crc != CURLE_OK) {
+        fprintf(stderr, "http_get_pipe_chunk: %s\n", curl_easy_strerror(crc));
+        free(rb.data);
+        return ZEP_ERR_NETWORK;
+    }
+
+    if (http_code == 204) {
+        free(rb.data);
+        return ZEP_ERR_NOT_FOUND;
+    }
+
+    if (http_code == 200) {
+        if (rb.data && rb.len > 0) {
+            *data = rb.data;
+            *len = rb.len;
+            return ZEP_ERR_OK;
+        }
+        *is_done = 1;
+        free(rb.data);
+        return ZEP_ERR_OK;
+    }
+
+    fprintf(stderr, "http_get_pipe_chunk: HTTP %ld\n", http_code);
+    free(rb.data);
+    return ZEP_ERR_NETWORK;
 }

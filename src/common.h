@@ -65,6 +65,7 @@ typedef struct {
     char pipe_unzip_cmd[128];
     char pipe_send_buf_cmd[128];
     char pipe_recv_buf_cmd[128];
+    char pipe_restrict[256];
     int  send_all_snap;
     size_t chunk_size;
 } zep_config_t;

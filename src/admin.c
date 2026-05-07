@@ -51,11 +51,13 @@ static CURL *curl_init(struct curl_buf *resp) {
     return curl;
 }
 
-static int do_post(const char *url, const char *json_body) {
+static int do_post(const char *path, const char *json_body) {
     struct curl_buf resp = {0};
     CURL *curl = curl_init(&resp);
     if (!curl) return 1;
 
+    char *url = NULL;
+    if (asprintf(&url, "%s%s", g_server, path) < 0) { curl_easy_cleanup(curl); return 1; }
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
     struct curl_slist *headers = NULL;
@@ -67,6 +69,7 @@ static int do_post(const char *url, const char *json_body) {
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
+    free(url);
 
     if (rc != CURLE_OK) {
         fprintf(stderr, "curl error: %s\n", curl_easy_strerror(rc));
@@ -229,9 +232,7 @@ static int cmd_join(int argc, char *argv[]) {
     }
     free(pem); free(esc); free(map_esc);
 
-    char url[1024];
-    snprintf(url, sizeof(url), "%s/v1/admin/nodes", g_server);
-    int rc = do_post(url, body);
+    int rc = do_post("/v1/admin/nodes", body);
     free(body);
     return rc;
 }
@@ -265,10 +266,8 @@ static int cmd_cluster(int argc, char *argv[]) {
         char *body = NULL;
         if (asprintf(&body, "%s", json) < 0) { free(json); free(esc); return 1; }
         free(json); free(esc);
-        char *url = NULL;
-        if (asprintf(&url, "%s/v1/admin/clusters", g_server) < 0) { free(body); return 1; }
-        int rc = do_post(url, body);
-        free(body); free(url);
+        int rc = do_post("/v1/admin/clusters", body);
+        free(body);
         return rc;
     }
 
@@ -415,47 +414,62 @@ static int cmd_admin_snap(int argc, char *argv[]) {
     return do_get(path);
 }
 
+#define ZEP_ADMIN_PIPE_CHUNK (1024 * 1024)
+
 static int cmd_pipe(int argc, char *argv[]) {
-    const char *snap_start = NULL, *snap_stop = NULL;
     const char *node = NULL;
-    const char *pool_fs = NULL;
-    const char *flags = "full";
-    const char *resume_token = NULL;
     int progress = 0;
+    int recv_mode = 0;
+    int compress = 0;
+    int buffer = 0;
+    int cmd_start = -1;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-i") == 0 && i + 2 < argc) {
-            flags = "incremental";
-            snap_start = argv[++i];
-            snap_stop = argv[++i];
-        } else if (strcmp(argv[i], "-I") == 0 && i + 2 < argc) {
-            flags = "all";
-            snap_start = argv[++i];
-            snap_stop = argv[++i];
-        } else if (strcmp(argv[i], "--node") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--recv") == 0)
+            recv_mode = 1;
+        else if (strcmp(argv[i], "--compress") == 0)
+            compress = 1;
+        else if (strcmp(argv[i], "--buffer") == 0)
+            buffer = 1;
+        else if (strcmp(argv[i], "--node") == 0 && i + 1 < argc)
             node = argv[++i];
-        } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
-            resume_token = argv[++i];
-        } else if (strcmp(argv[i], "--progress") == 0) {
+        else if (strcmp(argv[i], "--progress") == 0)
             progress = 1;
+        else if (strcmp(argv[i], "--") == 0) {
+            cmd_start = i + 1;
+            break;
         } else if (argv[i][0] != '-') {
-            pool_fs = argv[i];
+            cmd_start = i;
+            break;
         }
     }
 
-    if (!pool_fs) {
-        fprintf(stderr, "Usage: zep-air-admin pipe [--progress] [-t resume_token] [-i snapA snapB] [-I snapA snapB] [--node CN] <pool/fs>\n"
-                        "  No -i/-I: full send (snapshot autodetected from server)\n");
+    if (cmd_start < 0 || cmd_start >= argc) {
+        fprintf(stderr, "Usage: zep-air-admin pipe [--recv] [--compress] [--buffer] [--node CN] [--progress] <command...>\n"
+                        "  --recv      Admin→node direction (zfs recv on remote node)\n"
+                        "  --compress  Apply pipe_zip_cmd / pipe_unzip_cmd compression\n"
+                        "  --buffer    Apply pipe_send_buf_cmd / pipe_recv_buf_cmd buffering\n"
+                        "  --node CN   Target node (default: auto-select)\n"
+                        "  --progress  Print transfer progress to stderr\n"
+                        "\nExamples:\n"
+                        "  zep-air-admin pipe zfs send -R tank-prod/data\n"
+                        "  zep-air-admin pipe --recv --compress dd if=/dev/urandom bs=1M count=10\n"
+                        "  zep-air-admin pipe --compress --buffer --recv zfs recv -F -u tank-prod/data\n");
         return 1;
     }
 
+    char cmd_buf[4096] = {0};
+    for (int i = cmd_start; i < argc; i++) {
+        if (i > cmd_start) strncat(cmd_buf, " ", sizeof(cmd_buf) - strlen(cmd_buf) - 1);
+        strncat(cmd_buf, argv[i], sizeof(cmd_buf) - strlen(cmd_buf) - 1);
+    }
+
     cJSON *json = cJSON_CreateObject();
-    cJSON_AddStringToObject(json, "pool_fs", pool_fs);
-    cJSON_AddStringToObject(json, "flags", flags);
-    if (snap_start)    cJSON_AddStringToObject(json, "snap_start", snap_start);
-    if (snap_stop)     cJSON_AddStringToObject(json, "snap_stop", snap_stop);
-    if (node)           cJSON_AddStringToObject(json, "node", node);
-    if (resume_token)   cJSON_AddStringToObject(json, "resume_token", resume_token);
+    cJSON_AddStringToObject(json, "command", cmd_buf);
+    if (recv_mode)       cJSON_AddStringToObject(json, "direction", "recv");
+    if (compress)        cJSON_AddBoolToObject(json, "compress", 1);
+    if (buffer)          cJSON_AddBoolToObject(json, "buffer", 1);
+    if (node)            cJSON_AddStringToObject(json, "node", node);
     char *body = cJSON_PrintUnformatted(json);
     cJSON_Delete(json);
 
@@ -516,6 +530,112 @@ static int cmd_pipe(int argc, char *argv[]) {
     snprintf(session, sizeof(session), "%s", sess_j->valuestring);
     cJSON_Delete(init_resp);
 
+    if (recv_mode) {
+        unsigned char *buf = malloc(ZEP_ADMIN_PIPE_CHUNK + 4);
+        if (!buf) { fprintf(stderr, "pipe: OOM\n"); return 1; }
+        int part = 0;
+        uint64_t sent = 0;
+
+        if (g_verbose || progress)
+            fprintf(stderr, "pipe: recv session %s, reading stdin...\n", session);
+
+        for (;;) {
+            size_t nread = fread(buf + 4, 1, ZEP_ADMIN_PIPE_CHUNK, stdin);
+            if (nread == 0) break;
+
+            uint32_t zer = 0;
+            memcpy(buf, &zer, 4);
+
+            int retries = 0;
+            for (;;) {
+                char put_url[1024];
+                snprintf(put_url, sizeof(put_url),
+                         "%s/v1/admin/pipe/%s/chunk/%04d",
+                         g_server, session, part);
+                struct curl_buf pr = {0};
+                CURL *pc = curl_easy_init();
+                if (!pc) { free(buf); return 1; }
+                curl_easy_setopt(pc, CURLOPT_URL, put_url);
+                curl_easy_setopt(pc, CURLOPT_WRITEFUNCTION, curl_write_cb);
+                curl_easy_setopt(pc, CURLOPT_WRITEDATA, &pr);
+                curl_easy_setopt(pc, CURLOPT_SSLCERT, g_cert_path);
+                curl_easy_setopt(pc, CURLOPT_SSLKEY, g_key_path);
+                curl_easy_setopt(pc, CURLOPT_CAINFO, g_ca_path);
+                curl_easy_setopt(pc, CURLOPT_SSL_VERIFYPEER, 1L);
+                curl_easy_setopt(pc, CURLOPT_SSL_VERIFYHOST, 2L);
+                curl_easy_setopt(pc, CURLOPT_TIMEOUT, 30L);
+                curl_easy_setopt(pc, CURLOPT_CONNECTTIMEOUT, 10L);
+                if (g_key_password[0])
+                    curl_easy_setopt(pc, CURLOPT_KEYPASSWD, g_key_password);
+                curl_easy_setopt(pc, CURLOPT_POSTFIELDSIZE, (long)(nread + 4));
+                curl_easy_setopt(pc, CURLOPT_POSTFIELDS, buf);
+                curl_easy_setopt(pc, CURLOPT_CUSTOMREQUEST, "PUT");
+                rc = curl_easy_perform(pc);
+                curl_easy_getinfo(pc, CURLINFO_RESPONSE_CODE, &http_code);
+                curl_easy_cleanup(pc);
+                free(pr.data);
+
+                if (rc != CURLE_OK) {
+                    fprintf(stderr, "pipe: chunk %d upload: %s\n",
+                            part, curl_easy_strerror(rc));
+                    free(buf);
+                    return 1;
+                }
+                if (http_code == 503) {
+                    if (retries++ > 60) {
+                        fprintf(stderr, "pipe: queue full too long\n");
+                        free(buf);
+                        return 1;
+                    }
+                    sleep(1);
+                    continue;
+                }
+                if (http_code != 200) {
+                    fprintf(stderr, "pipe: chunk %d HTTP %ld\n",
+                            part, http_code);
+                    free(buf);
+                    return 1;
+                }
+                break;
+            }
+            sent += nread;
+            part++;
+            if (progress)
+                fprintf(stderr, "\rpipe: %llu bytes sent (%d chunks)",
+                        (unsigned long long)sent, part);
+        }
+        free(buf);
+
+        char done_url[1024];
+        snprintf(done_url, sizeof(done_url),
+                 "%s/v1/admin/pipe/%s/done", g_server, session);
+        struct curl_buf dr = {0};
+        CURL *dc = curl_easy_init();
+        if (dc) {
+            curl_easy_setopt(dc, CURLOPT_URL, done_url);
+            curl_easy_setopt(dc, CURLOPT_WRITEFUNCTION, curl_write_cb);
+            curl_easy_setopt(dc, CURLOPT_WRITEDATA, &dr);
+            curl_easy_setopt(dc, CURLOPT_SSLCERT, g_cert_path);
+            curl_easy_setopt(dc, CURLOPT_SSLKEY, g_key_path);
+            curl_easy_setopt(dc, CURLOPT_CAINFO, g_ca_path);
+            curl_easy_setopt(dc, CURLOPT_SSL_VERIFYPEER, 1L);
+            curl_easy_setopt(dc, CURLOPT_SSL_VERIFYHOST, 2L);
+            curl_easy_setopt(dc, CURLOPT_TIMEOUT, 30L);
+            curl_easy_setopt(dc, CURLOPT_CONNECTTIMEOUT, 10L);
+            if (g_key_password[0])
+                curl_easy_setopt(dc, CURLOPT_KEYPASSWD, g_key_password);
+            rc = curl_easy_perform(dc);
+            curl_easy_getinfo(dc, CURLINFO_RESPONSE_CODE, &http_code);
+            curl_easy_cleanup(dc);
+            free(dr.data);
+        }
+
+        if (progress)
+            fprintf(stderr, "\npipe: recv complete — %llu bytes (%d chunks)\n",
+                    (unsigned long long)sent, part);
+        return 0;
+    }
+
     uint64_t total_size = 0, received = 0;
     char poll_url[1024];
     snprintf(poll_url, sizeof(poll_url), "%s/v1/admin/pipe/%s", g_server, session);
@@ -569,9 +689,24 @@ static int cmd_pipe(int argc, char *argv[]) {
         int is_done = (cl == 0);
 
         if (!is_done && pr.data && pr.len > 0) {
-            fwrite(pr.data, 1, pr.len, stdout);
-            fflush(stdout);
-            received += pr.len;
+            if (pr.len >= 4) {
+                uint32_t errlen;
+                memcpy(&errlen, pr.data, 4);
+                size_t stdout_len = pr.len - 4 - (size_t)errlen;
+                if (stdout_len <= pr.len - 4) {
+                    if (stdout_len > 0)
+                        fwrite(pr.data + 4, 1, stdout_len, stdout);
+                    if (errlen > 0)
+                        fwrite(pr.data + 4 + stdout_len, 1, errlen, stderr);
+                    fflush(stdout);
+                    fflush(stderr);
+                    received += stdout_len;
+                }
+            } else {
+                fwrite(pr.data, 1, pr.len, stdout);
+                fflush(stdout);
+                received += pr.len;
+            }
             if (total_size == 0) total_size = 1;
         }
         free(pr.data);
@@ -621,7 +756,7 @@ static void usage(const char *prog) {
         "  resume       Resume replication\n"
         "  promote      Promote client to master (--node CN)\n"
         "  rollback     Cluster rollback to snapshot (--snap NAME)\n"
-        "  pipe         Replicate ZFS stream from a node through the server\n"
+        "  pipe         Send/recv ZFS stream through the server (--recv for stdin→node)\n"
         "  snap         Manual snapshot create/destroy (--name NAME)\n"
         "  config       Server config get/set/list/rm\n"
         "\n"

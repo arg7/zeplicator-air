@@ -12,6 +12,7 @@
 #include <string.h>
 #include <getopt.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 static char g_db_path[ZEP_MAX_PATH] = "zep-air.db";
 
@@ -609,104 +610,186 @@ static int cmd_cron(int argc, char *argv[]) {
                     }
                     db_close(db);
                 }
-            } else if (strcmp(action->valuestring, "pipe") == 0 &&
-                       cfs && cJSON_IsString(cfs)) {
+            } else if (strcmp(action->valuestring, "pipe") == 0) {
                 cJSON *session_j = cJSON_GetObjectItem(task, "session");
-                cJSON *flags_j    = cJSON_GetObjectItem(task, "flags");
-                cJSON *snap_s     = cJSON_GetObjectItem(task, "snap_start");
-                cJSON *snap_t     = cJSON_GetObjectItem(task, "snap_stop");
+                cJSON *cmd_j      = cJSON_GetObjectItem(task, "command");
+                cJSON *dir_j      = cJSON_GetObjectItem(task, "direction");
+                cJSON *comp_j     = cJSON_GetObjectItem(task, "compress");
+                cJSON *buf_j      = cJSON_GetObjectItem(task, "buffer");
                 if (!session_j || !cJSON_IsString(session_j)) continue;
+                if (!cmd_j    || !cJSON_IsString(cmd_j))    continue;
 
-                char local_fs[ZEP_MAX_SNAPSHOT_NAME];
+                int direction_recv = (dir_j && cJSON_IsString(dir_j) &&
+                                       strcmp(dir_j->valuestring, "recv") == 0);
+                int do_compress = (comp_j && cJSON_IsTrue(comp_j)) ? 1 : 0;
+                int do_buffer   = (buf_j  && cJSON_IsTrue(buf_j))  ? 1 : 0;
+                const char *session = session_j->valuestring;
+
                 if (db_open(g_db_path, &db) != ZEP_ERR_OK) continue;
                 db_init_tables(db);
                 zep_config_t cfg2;
                 db_config_load(db, &cfg2);
 
-                if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
-                                        local_fs, sizeof(local_fs)) != ZEP_ERR_OK) {
-                    fprintf(stderr, "pipe: no mapping for '%s'\n", cfs->valuestring);
+                char resolved_cmd[4096];
+                if (pipeline_resolve_zfs_cmd(cmd_j->valuestring, cfg2.mapping,
+                                              resolved_cmd,
+                                              sizeof(resolved_cmd)) != ZEP_ERR_OK) {
+                    snprintf(resolved_cmd, sizeof(resolved_cmd), "%s",
+                             cmd_j->valuestring);
+                }
+
+                if (direction_recv) {
+                    char pipeline_cmd[8192];
+                    if (pipeline_build_pipe_recv(resolved_cmd, do_compress,
+                                                  do_buffer, &cfg2,
+                                                  pipeline_cmd,
+                                                  sizeof(pipeline_cmd)) != ZEP_ERR_OK) {
+                        fprintf(stderr, "pipe: build recv pipeline failed\n");
+                        db_close(db);
+                        continue;
+                    }
+                    fprintf(stderr, "pipe: recv session %s → %s\n",
+                            session, pipeline_cmd);
+
+                    char errfile[] = "/tmp/zep-pipe-err-XXXXXX";
+                    int err_fd = mkstemp(errfile);
+                    char full_cmd[8192 + 256];
+                    if (err_fd >= 0)
+                        snprintf(full_cmd, sizeof(full_cmd), "(%s) 2>%s",
+                                 pipeline_cmd, errfile);
+                    else
+                        snprintf(full_cmd, sizeof(full_cmd), "%s", pipeline_cmd);
+
+                    FILE *recv_fp = popen(full_cmd, "w");
+                    if (!recv_fp) {
+                        fprintf(stderr, "pipe: popen recv failed\n");
+                        if (err_fd >= 0) { close(err_fd); unlink(errfile); }
+                        db_close(db);
+                        continue;
+                    }
+
+                    int chunk_count = 0;
+                    for (;;) {
+                        void *data = NULL;
+                        size_t len = 0;
+                        int is_done = 0;
+                        err_t gret = http_get_pipe_chunk(&http_cfg, session,
+                                                          &data, &len, &is_done);
+                        if (is_done)
+                            break;
+                        if (gret == ZEP_ERR_NOT_FOUND) {
+                            sleep(1);
+                            continue;
+                        }
+                        if (gret != ZEP_ERR_OK || !data || len == 0) {
+                            fprintf(stderr, "pipe: chunk download failed "
+                                    "(err=%d)\n", gret);
+                            free(data);
+                            break;
+                        }
+                        if (len >= 4) {
+                            uint32_t errlen;
+                            memcpy(&errlen, data, 4);
+                            size_t stdout_len = len - 4 - (size_t)errlen;
+                            if (stdout_len <= len - 4) {
+                                fwrite((char *)data + 4, 1, stdout_len, recv_fp);
+                                fflush(recv_fp);
+                                if (errlen > 0)
+                                    fwrite((char *)data + 4 + stdout_len, 1,
+                                           errlen, stderr);
+                            }
+                        } else {
+                            fwrite(data, 1, len, recv_fp);
+                            fflush(recv_fp);
+                        }
+                        free(data);
+                        tasks_done++;
+                        chunk_count++;
+                    }
+                    pclose(recv_fp);
+
+                    if (err_fd >= 0) {
+                        close(err_fd);
+                        unlink(errfile);
+                    }
+
+                    if (http_post_pipe_done(&http_cfg, session) == ZEP_ERR_OK)
+                        fprintf(stderr, "pipe: recv complete (%d chunks)\n",
+                                chunk_count);
+                    else
+                        fprintf(stderr, "pipe: recv done signal failed — "
+                                "aborting\n");
                     db_close(db);
                     continue;
                 }
 
-                const char *fl = (flags_j && cJSON_IsString(flags_j)) ?
-                                  flags_j->valuestring : "full";
-                int send_all = (strcmp(fl, "all") == 0);
-                int incremental = (strcmp(fl, "incremental") == 0 || send_all);
-
-                const char *from_snap = NULL;
-                const char *to_snap = NULL;
-
-                if (incremental) {
-                    if (snap_s && cJSON_IsString(snap_s))
-                        from_snap = snap_s->valuestring;
-                    if (snap_t && cJSON_IsString(snap_t))
-                        to_snap = snap_t->valuestring;
-                } else {
-                    if (snap_s && cJSON_IsString(snap_s) && snap_s->valuestring[0])
-                        to_snap = snap_s->valuestring;
-                    else if (snap_t && cJSON_IsString(snap_t) && snap_t->valuestring[0])
-                        to_snap = snap_t->valuestring;
-                }
-
-                if (!to_snap) {
-                    fprintf(stderr, "pipe: no snapshot specified\n");
+                char pipeline_cmd[8192];
+                if (pipeline_build_pipe_send(resolved_cmd, do_compress,
+                                              do_buffer, &cfg2,
+                                              pipeline_cmd,
+                                              sizeof(pipeline_cmd)) != ZEP_ERR_OK) {
+                    fprintf(stderr, "pipe: build send pipeline failed\n");
                     db_close(db);
                     continue;
                 }
+                fprintf(stderr, "pipe: send: %s\n", pipeline_cmd);
 
-                const char *session = session_j->valuestring;
+                char errfile[] = "/tmp/zep-pipe-err-XXXXXX";
+                int err_fd = mkstemp(errfile);
+                char full_cmd[8192 + 256];
+                if (err_fd >= 0)
+                    snprintf(full_cmd, sizeof(full_cmd), "(%s) 2>%s",
+                             pipeline_cmd, errfile);
+                else
+                    snprintf(full_cmd, sizeof(full_cmd), "%s", pipeline_cmd);
 
-                char send_opts[512] = {0};
-                if (cfg2.send_options[0])
-                    snprintf(send_opts, sizeof(send_opts), "%s", cfg2.send_options);
-                cJSON *resume_tok = cJSON_GetObjectItem(task, "resume_token");
-                if (resume_tok && cJSON_IsString(resume_tok) && resume_tok->valuestring[0]) {
-                    size_t off = strlen(send_opts);
-                    snprintf(send_opts + off, sizeof(send_opts) - off,
-                             "%s-t %s", off > 0 ? " " : "", resume_tok->valuestring);
-                }
-
-                uint64_t est = zfs_send_estimate(local_fs, from_snap, to_snap,
-                                                  send_all, send_opts[0] ? send_opts : NULL);
-                if (est > 0)
-                    http_put_pipe_meta(&http_cfg, session, est);
-
-                if (cfg2.pipe_zip_cmd[0])
-                    fprintf(stderr, "pipe: using compression '%s' "
-                            "(set pipe_zip_cmd to \"\" to disable)\n",
-                            cfg2.pipe_zip_cmd);
-
-                FILE *send_fp = NULL;
-                err_t sret = zfs_send_open(local_fs, from_snap, to_snap,
-                                           send_all,
-                                           send_opts[0] ? send_opts : NULL,
-                                           cfg2.pipe_zip_cmd, cfg2.pipe_send_buf_cmd,
-                                           &send_fp);
-                if (sret != ZEP_ERR_OK) {
-                    fprintf(stderr, "pipe: zfs send failed\n");
+                FILE *send_fp = popen(full_cmd, "r");
+                if (!send_fp) {
+                    fprintf(stderr, "pipe: popen send failed\n");
+                    if (err_fd >= 0) { close(err_fd); unlink(errfile); }
                     db_close(db);
                     continue;
                 }
 
                 size_t chunk_size = cfg2.chunk_size;
-                unsigned char *buf = malloc(chunk_size);
+                unsigned char *buf = malloc(chunk_size + 65536 + 4);
                 if (!buf) {
-                    zfs_send_close(send_fp);
+                    pclose(send_fp);
+                    if (err_fd >= 0) { close(err_fd); unlink(errfile); }
                     db_close(db);
                     continue;
                 }
 
+                off_t err_pos = 0;
                 int part = 0;
                 while (1) {
-                    size_t nread = fread(buf, 1, chunk_size, send_fp);
+                    size_t nread = fread(buf + 4, 1, chunk_size, send_fp);
                     if (nread == 0) break;
-                    err_t put_ret = http_put_pipe_chunk(&http_cfg, session, part, buf, nread);
+
+                    uint32_t errlen = 0;
+                    if (err_fd >= 0) {
+                        struct stat st;
+                        if (fstat(err_fd, &st) == 0 &&
+                            (off_t)st.st_size > err_pos) {
+                            size_t new_err = (size_t)(st.st_size - err_pos);
+                            if (new_err > 65535) new_err = 65535;
+                            ssize_t rd = pread(err_fd,
+                                               buf + 4 + nread,
+                                               new_err, err_pos);
+                            if (rd > 0) errlen = (uint32_t)rd;
+                            err_pos += (off_t)errlen;
+                        }
+                    }
+
+                    memcpy(buf, &errlen, 4);
+                    size_t total = 4 + nread + (size_t)errlen;
+                    err_t put_ret = http_put_pipe_chunk(&http_cfg, session,
+                                                         part, buf, total);
                     if (put_ret != ZEP_ERR_OK) {
                         fprintf(stderr, "pipe: chunk %d upload failed\n", part);
                         free(buf);
-                        zfs_send_close(send_fp);
+                        pclose(send_fp);
+                        if (err_fd >= 0) { close(err_fd); unlink(errfile); }
                         db_close(db);
                         goto pipe_cleanup;
                     }
@@ -714,12 +797,15 @@ static int cmd_cron(int argc, char *argv[]) {
                     part++;
                 }
                 free(buf);
-                zfs_send_close(send_fp);
+                pclose(send_fp);
+                if (err_fd >= 0) { close(err_fd); unlink(errfile); }
 
                 if (http_post_pipe_done(&http_cfg, session) == ZEP_ERR_OK)
                     fprintf(stderr, "pipe: send complete (%d chunks)\n", part);
-                else
-                    fprintf(stderr, "pipe: done signal failed\n");
+                else {
+                    fprintf(stderr, "pipe: done signal failed, "
+                            "session=%s\n", session);
+                }
                 db_close(db);
                 continue;
 

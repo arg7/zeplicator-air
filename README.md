@@ -248,6 +248,7 @@ zep-air config list
 | `pipe_unzip_cmd` | Decompression command (default: `zstd -d`) |
 | `pipe_send_buf_cmd` | Buffer command before compression (e.g. `mbuffer -q -m 512M`) |
 | `pipe_recv_buf_cmd` | Buffer command after decompression |
+| `pipe_restrict` | Comma-separated allowed command prefixes for pipe (default: `zfs`; `*` = any) |
 
 ### `zep-air-serve`
 
@@ -297,75 +298,117 @@ Commands:
   rollback --snap NAME      Cluster-wide rollback to snapshot
   snap create --name NAME   Manual snapshot (no rotation)
   snap destroy --name NAME  Remove manual snapshot
-  pipe [options] <pool/fs>  Stream ZFS send from source node through server to stdout
+  pipe [flags] <command...>  Run command on remote node, stream stdout+stderr via server
 ```
 
-### `pipe` — Live ZFS stream relay
+### `pipe` — Run commands on remote nodes
 
-Streams a live `zfs send` from a source node through the server to stdout. Prefers clients over master for source selection to avoid burdening production hosts. Data flows in real-time via a 2-chunk FIFO on the server — no disk storage.
+Runs an arbitrary command on a remote node, streaming `stdout`+`stderr` through the server in real time. The server validates the command prefix against the `pipe_restrict` config (default: only `zfs`). For `zfs` commands, logical `<pool/fs>` names from the cluster definition are automatically resolved to the node's local filesystem via its mapping. Non-`zfs` commands pass through unchanged.
+
+A 2-chunk FIFO on the server provides backpressure — no disk storage. Stderr from the remote process is embedded in chunks and separated on the receiving side. Sessions expire after 5 minutes of inactivity.
 
 ```
-zep-air-admin pipe [--progress] [-t resume_token] [-i snapA snapB] [-I snapA snapB] [--node CN] <pool/fs>
+zep-air-admin pipe [--recv] [--compress] [--buffer] [--node CN] [--progress] <command...>
 ```
 
 | Option | Description |
 |--------|-------------|
-| `--progress` | Print bytes received to stderr |
-| `-t TOKEN` | ZFS resume token for interrupted sends (`zfs send -t`) |
-| `-i SNAP SNAP` | Incremental send between two snapshots |
-| `-I SNAP SNAP` | Send all intermediate snapshots between two |
-| `--node CN` | Source node (default: any non-suspended client, fallback to master) |
-| `<pool/fs>` | Cluster filesystem definition from cluster JSON (e.g. `tank-prod/data`) |
+| `--recv` | Reverse direction — admin sends data, node runs command with data on stdin |
+| `--compress` | Apply `pipe_zip_cmd` / `pipe_unzip_cmd` (typically `zstd`) |
+| `--buffer` | Apply `pipe_send_buf_cmd` / `pipe_recv_buf_cmd` (e.g. `mbuffer`) |
+| `--node CN` | Target node (default: any non-suspended client, fallback to master) |
+| `--progress` | Print transfer status to stderr |
+| `<command...>` | Full command line to launch on the remote node |
 
-**Examples:**
+**Send direction (node → admin):**
 
 ```sh
-# Full send
-zep-air-admin pipe tank-prod/data > /tmp/full.zfs
+# Full zfs send — pool/fs is auto-resolved via node mapping
+zep-air-admin pipe zfs send -R tank-prod/data > backup.zfs
 
-# Incremental with progress
-zep-air-admin pipe --progress -i "rpool/data@prod-min-20260506153045" \
-                                   "rpool/data@prod-min-20260506160000" tank-prod/data
+# Incremental with compression
+zep-air-admin pipe --compress --progress zfs send -i \
+  tank-prod/data@snap1 tank-prod/data@snap2
 
-# Resume interrupted send
-zep-air-admin pipe -t '1-c22a4b65-...' tank-prod/data
+# Resume interrupted send (-t token is part of the zfs command)
+zep-air-admin pipe zfs send -t '1-c22a4b65-...' tank-prod/data
 
 # Pipe directly into zfs recv on a new node
-zep-air-admin pipe tank-prod/data | zfs recv -F -u vault/data
+zep-air-admin pipe zfs send -R tank-prod/data | zfs recv -F -u vault/data
+
+# Non-zfs command (requires pipe_restrict = "zfs,dd" on server)
+zep-air-admin pipe dd if=/dev/urandom bs=1M count=100 > random.bin
+```
+
+**Recv direction (admin → node):**
+
+```sh
+# Send a backup file into a node's recv
+zep-air-admin pipe --recv --compress zfs recv -F -u tank-prod/data < backup.zfs
+
+# Write data to a file on the node
+zep-air-admin pipe --recv dd of=/tmp/blob bs=1M < data.bin
+```
+
+**Chunk format:** `[4-byte LE uint32 stderr_len][stdout…][stderr…]` — both sides parse the header.
+The `--compress`/`--buffer` flags prepend/append the configured pipeline commands:
+
+| Direction | Compress on | Buffer on | Effective pipeline |
+|-----------|-------------|-----------|--------------------|
+| send | `… \| zstd -c` | `… \| mbuffer` | `cmd \| mbuffer \| zstd -c` |
+| recv | `zstd -d \| …` | `… \| mbuffer` | `zstd -d \| mbuffer \| cmd` |
+
+**`pipe_restrict` server config:**
+
+```
+# Default — only zfs commands
+zep-air-admin config set pipe_restrict zfs
+
+# Allow zfs + dd + bash
+zep-air-admin config set pipe_restrict "zfs,dd,bash"
+
+# Allow any command
+zep-air-admin config set pipe_restrict "*"
+
+# Disable pipe entirely
+zep-air-admin config set pipe_restrict ""
 ```
 
 **Flow:**
 
 ```
-admin ──POST /v1/admin/pipe──▶ server (suspends source node, stores pipe task)
-node ◀── cron poll ───────────▶ server (returns pipe task, even if suspended)
-node ── zfs send | zstd | chunk ──▶ PUT /v1/pipe/<s>/chunk/N (queued, max 2)
-admin ── poll GET /v1/admin/pipe/<s> ──▶ 200+chunk or 204(wait) or 200+0(done)
-node ── POST /v1/pipe/<s>/done ──▶ server resumes node
+Admin ──POST /v1/admin/pipe──▶ Server (checks pipe_restrict, suspends target, stores task)
+Node  ◀── cron poll ──────────▶ Server (returns pipe task with command)
+Node  ── cmd | [buf] | [zip] ─▶ PUT /v1/pipe/<s>/chunk/N (send direction)
+Admin ── poll GET /v1/admin/pipe/<s> ─▶ 200+chunk or 204(wait) or 200+0(done)
+Node  ── POST /v1/pipe/<s>/done ─▶ Server resumes node
 ```
 
-The server FIFO holds at most 2 chunks, providing backpressure. Sessions expire after 5 minutes of inactivity. On success the source node is auto-resumed; on failure or abort the node stays suspended for manual retry.
+Reverse direction is symmetric: admin PUTs via `/v1/admin/pipe/<s>/chunk/N`, node GETs via `GET /v1/pipe/<s>`.
 
 ### REST API — Pipe routes
 
 ```
-POST /v1/admin/pipe               Initiate pipe session (admin cert required)
-     Body: {"pool_fs":"...","flags":"full|incremental|all","snap_start":"...","snap_stop":"...","node":"...","resume_token":"..."}
+POST /v1/admin/pipe                 Initiate pipe session (admin cert required)
+     Body: {"command":"zfs send -R tank/data","direction":"send|recv",
+            "compress":true,"buffer":true,"node":"optional-cn"}
      → {"session":"abc123"}
 
-GET  /v1/admin/pipe/<session>     Poll for next chunk (admin cert required)
-     → 200 + binary chunk         (X-Pipe-Done:0)
-     → 204                        (no chunks yet, retry)
-     → 200 + empty body           (pipe complete)
+GET  /v1/admin/pipe/<session>       Poll for next chunk (admin cert, send direction)
+     → 200 + binary chunk
+     → 204 (no chunks yet, retry)
+     → 200 + empty body (pipe complete)
 
-PUT  /v1/pipe/<session>/meta      Node sends estimated size (mTLS)
-     Body: {"size":1932735283}
-
-PUT  /v1/pipe/<session>/chunk/<N>  Node uploads a chunk (mTLS)
+PUT  /v1/admin/pipe/<session>/chunk/<N>  Admin uploads chunk (admin cert, recv direction)
      → 200 ok / 503 queue full, retry
+POST /v1/admin/pipe/<session>/done      Admin signals end of data (admin cert, recv direction)
 
-POST /v1/pipe/<session>/done      Node signals completion (mTLS)
-     → resumes source node
+PUT  /v1/pipe/<session>/chunk/<N>   Node uploads chunk (mTLS, send direction)
+     → 200 ok / 503 queue full, retry
+GET  /v1/pipe/<session>             Node downloads next chunk (mTLS, recv direction)
+     → 200 + binary chunk / 204 (wait) / 200+0 (producer done)
+POST /v1/pipe/<session>/done        Node signals completion (mTLS, both directions)
+     → resumes target node
 ```
 
 ## REST API
@@ -400,16 +443,19 @@ POST   /v1/admin/promote/<cn>          Promote client to master
 POST   /v1/admin/rollback/<snap>       Cluster rollback target
 POST   /v1/admin/snap/<name>           Manual snapshot (no rotation)
 POST   /v1/admin/unsnap/<name>         Remove manual snapshot
-POST   /v1/admin/pipe                  Initiate pipe session (admin)
-GET    /v1/admin/pipe/<session>        Poll for pipe chunk (admin)
+# Pipe (admin scope)
+POST   /v1/admin/pipe                  Initiate pipe session
+GET    /v1/admin/pipe/<session>        Poll for pipe chunk (send direction)
+PUT    /v1/admin/pipe/<session>/chunk/<N>  Admin uploads chunk (recv direction)
+POST   /v1/admin/pipe/<session>/done   Admin signals end of data (recv direction)
 ```
 
 ### Pipe routes (mTLS, node scope)
 
 ```
-PUT    /v1/pipe/<session>/meta         Send estimated stream size
-PUT    /v1/pipe/<session>/chunk/<N>    Upload a chunk (max 2 queued)
-POST   /v1/pipe/<session>/done         Signal completion, resumes source node
+PUT    /v1/pipe/<session>/chunk/<N>    Upload a chunk (send direction, max 2 queued)
+GET    /v1/pipe/<session>              Download next chunk (recv direction)
+POST   /v1/pipe/<session>/done         Signal completion, resumes target node
 ```
 
 ### Cron routes

@@ -52,6 +52,8 @@ struct pipe_session {
     struct pipe_chunk *chunks_tail;
     int chunk_count;
     int done;
+    int direction;
+    int producer_done;
     uint64_t estimated_size;
     time_t created;
     time_t last_activity;
@@ -328,11 +330,13 @@ static struct pipe_session *pipe_session_find(const char *token) {
     return NULL;
 }
 
-static struct pipe_session *pipe_session_create(const char *src_node) {
+static struct pipe_session *pipe_session_create(const char *src_node,
+                                                int direction) {
     struct pipe_session *ps = calloc(1, sizeof(*ps));
     if (!ps) return NULL;
     pipe_generate_token(ps->token);
     snprintf(ps->src_node, sizeof(ps->src_node), "%s", src_node);
+    ps->direction = direction;
     ps->created = time(NULL);
     ps->last_activity = ps->created;
     ps->next = g_pipe_sessions;
@@ -417,6 +421,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         *con_cls = ctx;
         snprintf(ctx->method, sizeof(ctx->method), "%s", method);
         snprintf(ctx->target_url, sizeof(ctx->target_url), "%s", url);
+        parse_url(url, ctx);
 
         const union MHD_ConnectionInfo *info = MHD_get_connection_info(
             conn, MHD_CONNECTION_INFO_GNUTLS_CLIENT_CERT);
@@ -463,15 +468,24 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 if (g_verbose)
                     fprintf(stderr, "auth: fp=%s role=%s url=%s\n", fp_hex, role, url);
 
-                size_t cn_size = 0;
-                if (gnutls_x509_crt_get_dn_by_oid(client_cert,
-                        GNUTLS_OID_X520_COMMON_NAME, 0, 0, NULL, &cn_size) >= 0) {
-                    char *cn = malloc(cn_size);
-                    if (cn) {
-                        gnutls_x509_crt_get_dn_by_oid(client_cert,
-                            GNUTLS_OID_X520_COMMON_NAME, 0, 0, cn, &cn_size);
-                        snprintf(ctx->node, sizeof(ctx->node), "%s", cn);
-                        free(cn);
+                size_t dn_size = 0;
+                gnutls_x509_crt_get_dn(client_cert, NULL, &dn_size);
+                if (dn_size > 0) {
+                    char *dn = malloc(dn_size);
+                    if (dn) {
+                        if (gnutls_x509_crt_get_dn(client_cert, dn, &dn_size) == 0) {
+                            const char *cn_start = strstr(dn, "CN=");
+                            if (cn_start) {
+                                cn_start += 3;
+                                const char *end = strchr(cn_start, ',');
+                                size_t n = end ? (size_t)(end - cn_start)
+                                               : strlen(cn_start);
+                                if (n >= sizeof(ctx->node)) n = sizeof(ctx->node) - 1;
+                                memcpy(ctx->node, cn_start, n);
+                                ctx->node[n] = '\0';
+                            }
+                        }
+                        free(dn);
                     }
                 }
 
@@ -483,7 +497,6 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         }
 
         ctx->authed = 1;
-        parse_url(url, ctx);
         return MHD_YES;
     }
 
@@ -690,31 +703,74 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             return send_error(conn, 400, "Missing key");
         }
 
+        /* ── pipe: admin sends chunk (recv direction) ── */
+        if (strcmp(ctx->method, "PUT") == 0 &&
+            strncmp(ctx->target_url, "/v1/admin/pipe/", 15) == 0) {
+            const char *token_start = ctx->target_url + 15;
+            const char *slash2 = strchr(token_start, '/');
+            if (slash2 && strncmp(slash2 + 1, "chunk/", 6) == 0) {
+                char token[64] = {0};
+                size_t tok_len = (size_t)(slash2 - token_start);
+                if (tok_len >= sizeof(token)) tok_len = sizeof(token) - 1;
+                memcpy(token, token_start, tok_len);
+                int part = atoi(slash2 + 7);
+                pipe_sessions_cleanup();
+                struct pipe_session *ps = pipe_session_find(token);
+                if (!ps) return send_error(conn, 404, "Session not found or expired");
+                if (ps->direction != 1)
+                    return send_error(conn, 400, "Not a recv session");
+                if (pipe_session_add_chunk(ps, part, ctx->body, ctx->body_len) != 0)
+                    return send_error(conn, 503, "Pipe queue full, retry");
+                return send_json(conn, 200, "{\"ok\":true}");
+            }
+        }
+
         /* ── pipe: admin initiates pipe session ── */
         if (strcmp(ctx->method, "POST") == 0 &&
             strcmp(ctx->target_url, "/v1/admin/pipe") == 0) {
             cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
             if (!json) return send_error(conn, 400, "Invalid JSON");
 
-            cJSON *pool_fs_j = cJSON_GetObjectItem(json, "pool_fs");
-            cJSON *flags_j   = cJSON_GetObjectItem(json, "flags");
-            cJSON *snap_s    = cJSON_GetObjectItem(json, "snap_start");
-            cJSON *snap_t    = cJSON_GetObjectItem(json, "snap_stop");
-            cJSON *node_j    = cJSON_GetObjectItem(json, "node");
-            cJSON *resume_j  = cJSON_GetObjectItem(json, "resume_token");
+            cJSON *cmd_j    = cJSON_GetObjectItem(json, "command");
+            cJSON *dir_j    = cJSON_GetObjectItem(json, "direction");
+            cJSON *node_j   = cJSON_GetObjectItem(json, "node");
+            cJSON *comp_j   = cJSON_GetObjectItem(json, "compress");
+            cJSON *buf_j    = cJSON_GetObjectItem(json, "buffer");
 
-            if (!pool_fs_j || !cJSON_IsString(pool_fs_j) || !pool_fs_j->valuestring[0] ||
-                !flags_j  || !cJSON_IsString(flags_j)) {
+            if (!cmd_j || !cJSON_IsString(cmd_j) || !cmd_j->valuestring[0]) {
                 cJSON_Delete(json);
-                return send_error(conn, 400, "Missing pool_fs or flags");
+                return send_error(conn, 400, "Missing command");
             }
-            const char *pool_fs = pool_fs_j->valuestring;
-            const char *flags  = flags_j->valuestring;
+            const char *command = cmd_j->valuestring;
+            int direction = (dir_j && cJSON_IsString(dir_j) &&
+                             strcmp(dir_j->valuestring, "recv") == 0) ? 1 : 0;
+            int compress = (comp_j && cJSON_IsTrue(comp_j)) ? 1 : 0;
+            int buffer   = (buf_j  && cJSON_IsTrue(buf_j))  ? 1 : 0;
 
-            if (strcmp(flags, "full") != 0 && strcmp(flags, "incremental") != 0 &&
-                strcmp(flags, "all") != 0) {
-                cJSON_Delete(json);
-                return send_error(conn, 400, "Invalid flags (full|incremental|all)");
+            char allow_list[256] = "zfs";
+            db_config_get(g_db, "pipe_restrict", allow_list, sizeof(allow_list));
+            if (allow_list[0] && strcmp(allow_list, "*") != 0) {
+                char cmd_prefix[64] = {0};
+                const char *sp = strchr(command, ' ');
+                size_t plen = sp ? (size_t)(sp - command) : strlen(command);
+                if (plen >= sizeof(cmd_prefix)) plen = sizeof(cmd_prefix) - 1;
+                memcpy(cmd_prefix, command, plen);
+                int is_ok = 0;
+                char *list_copy = strdup(allow_list);
+                if (list_copy) {
+                    char *save = NULL;
+                    char *tok = strtok_r(list_copy, ",", &save);
+                    while (tok) {
+                        while (*tok == ' ') tok++;
+                        if (strcmp(tok, cmd_prefix) == 0) { is_ok = 1; break; }
+                        tok = strtok_r(NULL, ",", &save);
+                    }
+                    free(list_copy);
+                }
+                if (!is_ok) {
+                    cJSON_Delete(json);
+                    return send_error(conn, 403, "Command not allowed by pipe_restrict");
+                }
             }
 
             char src_node[64] = {0};
@@ -746,7 +802,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
             if (!src_node[0]) {
                 cJSON_Delete(json);
-                return send_error(conn, 500, "No available source node");
+                return send_error(conn, 500, "No available node");
             }
 
             int suspended_now = 0;
@@ -763,32 +819,29 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             }
             if (suspended_now) {
                 cJSON_Delete(json);
-                return send_error(conn, 409, "Source node already suspended");
+                return send_error(conn, 409, "Target node already suspended");
             }
 
             db_set_suspended(g_db, src_node, 1);
             if (g_verbose)
-                fprintf(stderr, "pipe: suspended node %s\n", src_node);
+                fprintf(stderr, "pipe: suspended node %s (dir=%s, cmd=%s)\n",
+                        src_node, direction ? "recv" : "send", command);
 
-            struct pipe_session *ps = pipe_session_create(src_node);
+            struct pipe_session *ps = pipe_session_create(src_node, direction);
             if (!ps) {
                 db_set_suspended(g_db, src_node, 0);
                 cJSON_Delete(json);
                 return send_error(conn, 500, "Failed to create session");
             }
 
-            const char *snap_start = (snap_s && cJSON_IsString(snap_s)) ? snap_s->valuestring : NULL;
-            const char *snap_stop  = (snap_t && cJSON_IsString(snap_t)) ? snap_t->valuestring : NULL;
-
+            const char *dir_str = direction ? "recv" : "send";
             cJSON *task_j = cJSON_CreateObject();
             cJSON_AddStringToObject(task_j, "action", "pipe");
             cJSON_AddStringToObject(task_j, "session", ps->token);
-            cJSON_AddStringToObject(task_j, "flags", flags);
-            cJSON_AddStringToObject(task_j, "cluster_fs", pool_fs);
-            if (snap_start) cJSON_AddStringToObject(task_j, "snap_start", snap_start);
-            if (snap_stop)  cJSON_AddStringToObject(task_j, "snap_stop", snap_stop);
-            if (resume_j && cJSON_IsString(resume_j) && resume_j->valuestring[0])
-                cJSON_AddStringToObject(task_j, "resume_token", resume_j->valuestring);
+            cJSON_AddStringToObject(task_j, "direction", dir_str);
+            cJSON_AddStringToObject(task_j, "command", command);
+            if (compress) cJSON_AddBoolToObject(task_j, "compress", 1);
+            if (buffer)   cJSON_AddBoolToObject(task_j, "buffer", 1);
             char *task_str = cJSON_PrintUnformatted(task_j);
             cJSON_Delete(task_j);
             cJSON_Delete(json);
@@ -804,6 +857,168 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             enum MHD_Result ret = send_json(conn, 200, resp);
             free(resp);
             return ret;
+        }
+
+        /* ── pipe: admin signals done (recv direction) ── */
+        if (strcmp(ctx->method, "POST") == 0 &&
+            strncmp(ctx->target_url, "/v1/admin/pipe/", 15) == 0) {
+            const char *token_start = ctx->target_url + 15;
+            const char *slash2 = strchr(token_start, '/');
+            if (slash2 && strncmp(slash2 + 1, "done", 4) == 0) {
+                char token[64] = {0};
+                size_t tok_len = (size_t)(slash2 - token_start);
+                if (tok_len >= sizeof(token)) tok_len = sizeof(token) - 1;
+                memcpy(token, token_start, tok_len);
+                pipe_sessions_cleanup();
+                struct pipe_session *ps = pipe_session_find(token);
+                if (!ps) return send_error(conn, 404, "Session not found or expired");
+                if (ps->direction != 1)
+                    return send_error(conn, 400, "Not a recv session");
+                ps->producer_done = 1;
+                if (g_verbose)
+                    fprintf(stderr, "pipe: session %s producer done\n", token);
+                return send_json(conn, 200, "{\"ok\":true}");
+            }
+        }
+
+        /* ── admin pipe poll ── */
+        if (strcmp(ctx->method, "GET") == 0 &&
+            strncmp(ctx->target_url, "/v1/admin/pipe/", 15) == 0) {
+            const char *token = ctx->target_url + 15;
+            if (!token[0]) return send_error(conn, 400, "Missing session token");
+            pipe_sessions_cleanup();
+            struct pipe_session *ps = pipe_session_find(token);
+            if (!ps) return send_error(conn, 404, "Session not found or expired");
+            struct pipe_chunk *pc = pipe_session_pop_chunk(ps);
+            if (!pc) {
+                if (ps->done) {
+                    struct MHD_Response *resp = MHD_create_response_from_buffer(
+                        0, "", MHD_RESPMEM_PERSISTENT);
+                    MHD_add_response_header(resp, "X-Pipe-Done", "1");
+                    MHD_add_response_header(resp, "Content-Type", "application/octet-stream");
+                    enum MHD_Result ret = MHD_queue_response(conn, 200, resp);
+                    MHD_destroy_response(resp);
+                    return ret;
+                }
+                return send_error(conn, 204, "No chunks yet");
+            }
+            char size_buf[32];
+            snprintf(size_buf, sizeof(size_buf), "%llu", (unsigned long long)ps->estimated_size);
+            struct MHD_Response *resp = MHD_create_response_from_buffer(
+                pc->len, pc->data, MHD_RESPMEM_MUST_FREE);
+            free(pc);
+            MHD_add_response_header(resp, "Content-Type", "application/octet-stream");
+            MHD_add_response_header(resp, "X-Pipe-Chunk", "1");
+            if (ps->estimated_size > 0)
+                MHD_add_response_header(resp, "X-Pipe-Size", size_buf);
+            enum MHD_Result ret = MHD_queue_response(conn, 200, resp);
+            MHD_destroy_response(resp);
+            return ret;
+        }
+
+        /* ── config set / suspend / resume / promote / rollback / snap ── */
+        if (strcmp(ctx->method, "POST") == 0 || strcmp(ctx->method, "PUT") == 0) {
+            const char *rest = ctx->target_url + 10;
+
+            if (strncmp(rest, "config/", 7) == 0) {
+                const char *key = rest + 7;
+                if (!key[0]) return send_error(conn, 400, "Missing key");
+                cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
+                if (json) {
+                    cJSON *val = cJSON_GetObjectItem(json, "value");
+                    if (val && cJSON_IsString(val))
+                        db_config_set(g_db, key, val->valuestring);
+                    cJSON_Delete(json);
+                }
+                return send_json(conn, 200, "{\"ok\":true}");
+            }
+
+            if (strncmp(rest, "suspend", 7) == 0) {
+                const char *arg = rest + 7;
+                sqlite3_stmt *st = NULL;
+                if (*arg == '/') arg++;
+                if (strcmp(arg, "master") == 0 || strcmp(arg, "clients") == 0 || arg[0]) {
+                    if (strcmp(arg, "master") == 0)
+                        sqlite3_prepare_v2(g_db,
+                            "UPDATE auth SET suspended = 0 WHERE role = 'master'", -1, &st, NULL);
+                    else if (strcmp(arg, "clients") == 0)
+                        sqlite3_prepare_v2(g_db,
+                            "UPDATE auth SET suspended = 0 WHERE role = 'client'", -1, &st, NULL);
+                    else
+                        db_set_suspended(g_db, arg, 0);
+                    if (st) { sqlite3_step(st); sqlite3_finalize(st); }
+                    return send_json(conn, 200, "{\"ok\":true}");
+                }
+                sqlite3_prepare_v2(g_db,
+                    "UPDATE auth SET suspended = 0", -1, &st, NULL);
+                if (st) { sqlite3_step(st); sqlite3_finalize(st); }
+                return send_json(conn, 200, "{\"ok\":true}");
+            }
+
+            if (strncmp(rest, "promote/", 8) == 0) {
+                const char *new_master = rest + 8;
+                if (!new_master[0]) return send_error(conn, 400, "Missing node");
+                char cluster[64] = {0}, old_master_cn[64] = {0};
+                sqlite3_stmt *st = NULL;
+                sqlite3_prepare_v2(g_db,
+                    "SELECT cluster FROM auth WHERE cn = ?", -1, &st, NULL);
+                if (st) {
+                    sqlite3_bind_text(st, 1, new_master, -1, SQLITE_STATIC);
+                    if (sqlite3_step(st) == SQLITE_ROW)
+                        snprintf(cluster, sizeof(cluster), "%s",
+                                 (const char *)sqlite3_column_text(st, 0));
+                    sqlite3_finalize(st);
+                }
+                if (!cluster[0]) return send_error(conn, 400, "Node not in any cluster");
+                sqlite3_prepare_v2(g_db,
+                    "SELECT cn FROM auth WHERE cluster = ? AND role = 'master'",
+                    -1, &st, NULL);
+                if (st) {
+                    sqlite3_bind_text(st, 1, cluster, -1, SQLITE_STATIC);
+                    if (sqlite3_step(st) == SQLITE_ROW)
+                        snprintf(old_master_cn, sizeof(old_master_cn), "%s",
+                                 (const char *)sqlite3_column_text(st, 0));
+                    sqlite3_finalize(st);
+                }
+                if (old_master_cn[0]) {
+                    db_set_suspended(g_db, old_master_cn, 1);
+                    db_update_role(g_db, old_master_cn, "client");
+                }
+                db_update_role(g_db, new_master, "master");
+                db_set_suspended(g_db, new_master, 0);
+                return send_json(conn, 200, "{\"ok\":true}");
+            }
+
+            if (strncmp(rest, "rollback/", 9) == 0) {
+                const char *snap = rest + 9;
+                if (!snap[0]) return send_error(conn, 400, "Missing snapshot name");
+                char key[256];
+                snprintf(key, sizeof(key), "rollback_target");
+                db_config_set(g_db, key, snap);
+                sqlite3_stmt *st = NULL;
+                sqlite3_prepare_v2(g_db,
+                    "UPDATE auth SET suspended = 1", -1, &st, NULL);
+                if (st) { sqlite3_step(st); sqlite3_finalize(st); }
+                return send_json(conn, 200, "{\"ok\":true}");
+            }
+
+            if (strncmp(rest, "snap/", 5) == 0) {
+                const char *snap_name = rest + 5;
+                if (!snap_name[0]) return send_error(conn, 400, "Missing snapshot name");
+                char key[256];
+                snprintf(key, sizeof(key), "manual_snap_%s", snap_name);
+                db_config_set(g_db, key, "pending");
+                return send_json(conn, 200, "{\"ok\":true}");
+            }
+
+            if (strncmp(rest, "unsnap/", 7) == 0) {
+                const char *snap_name = rest + 7;
+                if (!snap_name[0]) return send_error(conn, 400, "Missing snapshot name");
+                char key[256];
+                snprintf(key, sizeof(key), "manual_snap_%s", snap_name);
+                db_config_set(g_db, key, "");
+                return send_json(conn, 200, "{\"ok\":true}");
+            }
         }
 
         return send_error(conn, 404, "Admin endpoint not found");
@@ -824,6 +1039,34 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
         struct pipe_session *ps = pipe_session_find(token);
         if (!ps) return send_error(conn, 404, "Session not found");
+
+        /* GET /v1/pipe/<s> — node downloads next chunk (recv direction) */
+        if (strcmp(ctx->method, "GET") == 0 && !slash) {
+            if (ps->direction != 1)
+                return send_error(conn, 400, "Not a recv session");
+            struct pipe_chunk *pc = pipe_session_pop_chunk(ps);
+            if (!pc) {
+                if (ps->producer_done) {
+                    struct MHD_Response *resp = MHD_create_response_from_buffer(
+                        0, "", MHD_RESPMEM_PERSISTENT);
+                    MHD_add_response_header(resp, "X-Pipe-Done", "1");
+                    MHD_add_response_header(resp, "Content-Type",
+                                            "application/octet-stream");
+                    enum MHD_Result ret = MHD_queue_response(conn, 200, resp);
+                    MHD_destroy_response(resp);
+                    return ret;
+                }
+                return send_error(conn, 204, "No chunks yet");
+            }
+            struct MHD_Response *resp = MHD_create_response_from_buffer(
+                pc->len, pc->data, MHD_RESPMEM_MUST_FREE);
+            free(pc);
+            MHD_add_response_header(resp, "Content-Type",
+                                    "application/octet-stream");
+            enum MHD_Result ret = MHD_queue_response(conn, 200, resp);
+            MHD_destroy_response(resp);
+            return ret;
+        }
 
         if (strcmp(ctx->method, "PUT") == 0 && slash) {
             const char *sub = slash + 1;
@@ -858,159 +1101,6 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         }
 
         return send_error(conn, 404, "Pipe endpoint not found");
-    }
-
-    /* ── suspend / resume ── */
-    if ((strcmp(ctx->method, "POST") == 0 || strcmp(ctx->method, "PUT") == 0) &&
-        strncmp(ctx->target_url, "/v1/admin/", 10) == 0) {
-        const char *rest = ctx->target_url + 10;
-
-        if (strncmp(rest, "config/", 7) == 0) {
-            const char *key = rest + 7;
-            if (!key[0]) return send_error(conn, 400, "Missing key");
-            cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
-            if (json) {
-                cJSON *val = cJSON_GetObjectItem(json, "value");
-                if (val && cJSON_IsString(val))
-                    db_config_set(g_db, key, val->valuestring);
-                cJSON_Delete(json);
-            }
-            return send_json(conn, 200, "{\"ok\":true}");
-        }
-
-        if (strncmp(rest, "suspend", 7) == 0) {
-            const char *arg = rest + 7;
-            sqlite3_stmt *st = NULL;
-            if (*arg == '/') arg++;
-            if (strcmp(arg, "master") == 0 || strcmp(arg, "clients") == 0 || arg[0]) {
-                if (strcmp(arg, "master") == 0) {
-                    sqlite3_prepare_v2(g_db,
-                        "UPDATE auth SET suspended = 0 WHERE role = 'master'", -1, &st, NULL);
-                } else if (strcmp(arg, "clients") == 0) {
-                    sqlite3_prepare_v2(g_db,
-                        "UPDATE auth SET suspended = 0 WHERE role = 'client'", -1, &st, NULL);
-                } else {
-                    db_set_suspended(g_db, arg, 0);
-                }
-                if (st) { sqlite3_step(st); sqlite3_finalize(st); }
-                return send_json(conn, 200, "{\"ok\":true}");
-            }
-            sqlite3_prepare_v2(g_db,
-                "UPDATE auth SET suspended = 0", -1, &st, NULL);
-            if (st) { sqlite3_step(st); sqlite3_finalize(st); }
-            return send_json(conn, 200, "{\"ok\":true}");
-        }
-
-        /* ── promote ── */
-        if (strncmp(rest, "promote/", 8) == 0) {
-            const char *new_master = rest + 8;
-            if (!new_master[0]) return send_error(conn, 400, "Missing node");
-            /* find current master for this cluster */
-            char cluster[64] = {0}, old_master_cn[64] = {0};
-            sqlite3_stmt *st = NULL;
-            sqlite3_prepare_v2(g_db,
-                "SELECT cluster FROM auth WHERE cn = ?", -1, &st, NULL);
-            if (st) {
-                sqlite3_bind_text(st, 1, new_master, -1, SQLITE_STATIC);
-                if (sqlite3_step(st) == SQLITE_ROW)
-                    snprintf(cluster, sizeof(cluster), "%s",
-                             (const char *)sqlite3_column_text(st, 0));
-                sqlite3_finalize(st);
-            }
-            if (!cluster[0]) return send_error(conn, 400, "Node not in any cluster");
-            sqlite3_prepare_v2(g_db,
-                "SELECT cn FROM auth WHERE cluster = ? AND role = 'master'",
-                -1, &st, NULL);
-            if (st) {
-                sqlite3_bind_text(st, 1, cluster, -1, SQLITE_STATIC);
-                if (sqlite3_step(st) == SQLITE_ROW)
-                    snprintf(old_master_cn, sizeof(old_master_cn), "%s",
-                             (const char *)sqlite3_column_text(st, 0));
-                sqlite3_finalize(st);
-            }
-            if (old_master_cn[0]) {
-                db_set_suspended(g_db, old_master_cn, 1);
-                db_update_role(g_db, old_master_cn, "client");
-            }
-            db_update_role(g_db, new_master, "master");
-            db_set_suspended(g_db, new_master, 0);
-            return send_json(conn, 200, "{\"ok\":true}");
-        }
-
-        /* ── rollback ── */
-        if (strncmp(rest, "rollback/", 9) == 0) {
-            const char *snap = rest + 9;
-            if (!snap[0]) return send_error(conn, 400, "Missing snapshot name");
-            /* suspend all nodes in cluster(s), mark snapshot for rollback */
-            /* For now: just mark the config — actual rollback is on the master */
-            char key[256];
-            snprintf(key, sizeof(key), "rollback_target");
-            db_config_set(g_db, key, snap);
-            sqlite3_stmt *st = NULL;
-            sqlite3_prepare_v2(g_db,
-                "UPDATE auth SET suspended = 1", -1, &st, NULL);
-            if (st) { sqlite3_step(st); sqlite3_finalize(st); }
-            return send_json(conn, 200, "{\"ok\":true}");
-        }
-
-        /* ── manual snap create ── */
-        if (strncmp(rest, "snap/", 5) == 0) {
-            const char *snap_name = rest + 5;
-            if (!snap_name[0]) return send_error(conn, 400, "Missing snapshot name");
-            char key[256];
-            snprintf(key, sizeof(key), "manual_snap_%s", snap_name);
-            db_config_set(g_db, key, "pending");
-            return send_json(conn, 200, "{\"ok\":true}");
-        }
-
-        if (strncmp(rest, "unsnap/", 7) == 0) {
-            const char *snap_name = rest + 7;
-            if (!snap_name[0]) return send_error(conn, 400, "Missing snapshot name");
-            char key[256];
-            snprintf(key, sizeof(key), "manual_snap_%s", snap_name);
-            db_config_set(g_db, key, "");
-            return send_json(conn, 200, "{\"ok\":true}");
-        }
-
-        return send_error(conn, 404, "Admin action not found");
-    }
-
-    /* ── admin pipe poll ── */
-    if (strcmp(ctx->method, "GET") == 0 &&
-        strncmp(ctx->target_url, "/v1/admin/pipe/", 15) == 0) {
-        const char *token = ctx->target_url + 15;
-        if (!token[0]) return send_error(conn, 400, "Missing session token");
-
-        pipe_sessions_cleanup();
-        struct pipe_session *ps = pipe_session_find(token);
-        if (!ps) return send_error(conn, 404, "Session not found or expired");
-
-        struct pipe_chunk *pc = pipe_session_pop_chunk(ps);
-        if (!pc) {
-            if (ps->done) {
-                struct MHD_Response *resp = MHD_create_response_from_buffer(
-                    0, "", MHD_RESPMEM_PERSISTENT);
-                MHD_add_response_header(resp, "X-Pipe-Done", "1");
-                MHD_add_response_header(resp, "Content-Type", "application/octet-stream");
-                enum MHD_Result ret = MHD_queue_response(conn, 200, resp);
-                MHD_destroy_response(resp);
-                return ret;
-            }
-            return send_error(conn, 204, "No chunks yet");
-        }
-
-        char size_buf[32];
-        snprintf(size_buf, sizeof(size_buf), "%llu", (unsigned long long)ps->estimated_size);
-        struct MHD_Response *resp = MHD_create_response_from_buffer(
-            pc->len, pc->data, MHD_RESPMEM_MUST_FREE);
-        free(pc);
-        MHD_add_response_header(resp, "Content-Type", "application/octet-stream");
-        MHD_add_response_header(resp, "X-Pipe-Chunk", "1");
-        if (ps->estimated_size > 0)
-            MHD_add_response_header(resp, "X-Pipe-Size", size_buf);
-        enum MHD_Result ret = MHD_queue_response(conn, 200, resp);
-        MHD_destroy_response(resp);
-        return ret;
     }
 
     /* ── cron sync endpoint ── */

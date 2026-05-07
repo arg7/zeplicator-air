@@ -32,5 +32,7 @@ err_t http_put_pipe_meta(const http_config_t *cfg, const char *session, uint64_t
 err_t http_put_pipe_chunk(const http_config_t *cfg, const char *session,
                           int part, const void *data, size_t len);
 err_t http_post_pipe_done(const http_config_t *cfg, const char *session);
+err_t http_get_pipe_chunk(const http_config_t *cfg, const char *session,
+                          void **data, size_t *len, int *is_done);
 
 #endif
