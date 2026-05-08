@@ -5,7 +5,7 @@
 Zeplicator Air is an air-gapped ZFS replication system in pure C (~4,600 LOC). No SSH between nodes — a central HTTPS server (`zep-air-serve`) is the sole communication channel. Nodes push ZFS snapshots to it and pull from it. Mutual TLS authenticates every connection.
 
 ```
-master ──push──▶ [zep-air-serve] ──pull──▶ middle ──push──▶ [zep-air-serve] ──pull──▶ sink
+master ──push──▶ [zep-air-serve] ◀──pull── client
 ```
 
 ## Build

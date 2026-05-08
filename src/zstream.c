@@ -34,14 +34,21 @@ err_t zstream_parse(const void *data, size_t len,
     if (!zp) { unlink(tmpl); perror("popen"); return ZEP_ERR_ZFS; }
 
     char line[256];
+    int has_begin = 0;
     while (fgets(line, sizeof(line), zp)) {
         unsigned long long val;
         if (strstr(line, "toguid")) {
-            if (sscanf(line, " toguid = %llu", &val) == 1)
+            if (sscanf(line, " toguid = %llx", &val) == 1)
                 snprintf(toguid, toguid_len, "%llu", val);
         } else if (strstr(line, "fromguid")) {
-            if (sscanf(line, " fromguid = %llu", &val) == 1)
+            if (sscanf(line, " fromguid = %llx", &val) == 1)
                 snprintf(fromguid, fromguid_len, "%llu", val);
+        }
+        if (strstr(line, "DRR_BEGIN records")) {
+            const char *p = strstr(line, "DRR_BEGIN records = ");
+            unsigned long long cnt;
+            if (p && sscanf(p, "DRR_BEGIN records = %llu", &cnt) == 1 && cnt > 0)
+                has_begin = 1;
         }
     }
 
@@ -49,6 +56,12 @@ err_t zstream_parse(const void *data, size_t len,
     unlink(tmpl);
 
     if (!toguid[0]) {
+        if (!has_begin) {
+            /* Empty stream — no BEGIN record, treat as full send with zero guid */
+            snprintf(toguid, toguid_len, "0");
+            snprintf(fromguid, fromguid_len, "0");
+            return ZEP_ERR_OK;
+        }
         fprintf(stderr, "zstream_parse: failed to extract toguid (zstreamdump rc=%d)\n", rc);
         return ZEP_ERR_ZFS;
     }

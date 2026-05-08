@@ -394,6 +394,7 @@ err_t http_post_pipe_done(const http_config_t *cfg, const char *session) {
     free(url);
     if (!curl) return ZEP_ERR_NETWORK;
 
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "POST");
     int rc = http_do(curl);
     free(rb.data);
     return rc;

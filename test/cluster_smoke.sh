@@ -127,8 +127,13 @@ sudo -u za-client-1 "$ZEP" --db /tmp/zep-air/za-client-1.db config set mapping \
 sudo -u za-client-2 "$ZEP" --db /tmp/zep-air/za-client-2.db config set mapping \
     "za-pool-1/za-data-1:za-client-2-pool/slave"
 
+# ---- create cluster on server ----
+cat > /tmp/zep-air/cluster.json << 'CEOF'
+{"name":"test","pools":{"za-pool-1":{"za-data-1":{"labels":{"min":60,"hour":24,"day":30}}}}}
+CEOF
+"$ADMIN" $BASE cluster set --file /tmp/zep-air/cluster.json >/dev/null
+
 # ---- register nodes via admin ----
-BASE="--server https://master.zep.lan:18443 --cert $PKI/admin.crt --key $PKI/admin.key --ca $PKI/ca.crt"
 "$ADMIN" $BASE join --role master --node za-master --cert "$PKI/za-master.crt" --cluster test \
     --map "za-pool-1/za-data-1:za-master-pool/master" >/dev/null
 "$ADMIN" $BASE join --role client --node za-client-1 --cert "$PKI/za-client-1.crt" --cluster test \
@@ -229,10 +234,13 @@ fi
 
 # stop cron daemons
 for pid in "${CRON_PIDS[@]}"; do kill "$pid" 2>/dev/null; done
-wait 2>/dev/null
+for pid in "${CRON_PIDS[@]}"; do
+    timeout 10s bash -c "wait $pid" 2>/dev/null || true
+done
 
 # ---- stop server ----
-kill $SERV_PID 2>/dev/null; wait $SERV_PID 2>/dev/null
+kill $SERV_PID 2>/dev/null
+timeout 10s bash -c "wait $SERV_PID" 2>/dev/null || true
 
 echo ""
 echo -e "${GREEN}Passed: $pass${NC}  ${RED}Failed: $fail${NC}"

@@ -5,7 +5,7 @@ Air-gapped ZFS replication over HTTPS with mutual TLS. No SSH between nodes — 
 ## Synopsis
 
 ```
-master ──push──▶ [zep-air-serve] ──pull──▶ middle ──push──▶ [zep-air-serve] ──pull──▶ sink
+master ──push──▶ [zep-air-serve] ◀──pull── client
 ```
 
 Each node runs `zep-air cron --daemon`. The server (the *only* network-facing component) tells each node what to do: master gets a list of labels due to push, clients get filesystems to poll for new snapshots. Push pipeline: `zfs send → zstd → chunk → SHA256 → HTTPS PUT`. Pull pipeline: `HTTPS GET → verify → reassemble → zstd -d → zfs recv`. The server parses every received stream with `zstream dump` and is the authoritative source of the GUID chain — fast SQLite lookups replace slow `zfs list` on pools with thousands of snapshots.
