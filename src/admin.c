@@ -16,6 +16,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <ctype.h>
 
 static char g_server[512] = "https://master.zep.lan:8443";
 static char g_cert_path[ZEP_MAX_PATH];
@@ -680,6 +681,7 @@ static int cmd_pipe(int argc, char *argv[]) {
     int recv_mode = 0;
     int compress = 0;
     int buffer = 0;
+    (void)compress; (void)buffer;
     int cmd_start = -1;
 
     for (int i = 1; i < argc; i++) {
@@ -722,99 +724,52 @@ static int cmd_pipe(int argc, char *argv[]) {
         strncat(cmd_buf, argv[i], sizeof(cmd_buf) - strlen(cmd_buf) - 1);
     }
 
-    cJSON *json = cJSON_CreateObject();
-    cJSON_AddStringToObject(json, "command", cmd_buf);
-    if (recv_mode)       cJSON_AddStringToObject(json, "direction", "recv");
-    if (compress)        cJSON_AddBoolToObject(json, "compress", 1);
-    if (buffer)          cJSON_AddBoolToObject(json, "buffer", 1);
-    if (node)            cJSON_AddStringToObject(json, "node", node);
-    char *body = cJSON_PrintUnformatted(json);
-    cJSON_Delete(json);
-
-    char url[1024];
-    snprintf(url, sizeof(url), "%s/v1/admin/pipe", g_server);
-
-    struct curl_buf resp = {0};
-    CURL *curl = curl_easy_init();
-    if (!curl) { free(body); return 1; }
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
-    curl_easy_setopt(curl, CURLOPT_SSLCERT, g_cert_path);
-    curl_easy_setopt(curl, CURLOPT_SSLKEY, g_key_path);
-    curl_easy_setopt(curl, CURLOPT_CAINFO, g_ca_path);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    if (g_key_password[0])
-        curl_easy_setopt(curl, CURLOPT_KEYPASSWD, g_key_password);
-
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
-
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    CURLcode rc = curl_easy_perform(curl);
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    free(body);
-
-    if (rc != CURLE_OK) {
-        fprintf(stderr, "pipe: curl error: %s\n", curl_easy_strerror(rc));
-        free(resp.data);
-        return 1;
-    }
-    if (http_code != 200) {
-        fprintf(stderr, "pipe: HTTP %ld — %s\n", http_code, resp.data ? resp.data : "");
-        free(resp.data);
+    const char *target_node = node;
+    if (!target_node) {
+        /* Auto-select: check which nodes are connected via WS */
+        fprintf(stderr, "pipe: --node required for WS pipe\n");
         return 1;
     }
 
-    cJSON *init_resp = cJSON_Parse(resp.data);
-    free(resp.data);
-    if (!init_resp) { fprintf(stderr, "pipe: invalid init response\n"); return 1; }
-    cJSON *sess_j = cJSON_GetObjectItem(init_resp, "session");
-    if (!sess_j || !cJSON_IsString(sess_j)) {
-        cJSON_Delete(init_resp);
-        fprintf(stderr, "pipe: no session in response\n");
+    /* Build WS path: /v1/ws/pipe?node=<cn>&direction=<dir>&command=<cmd> */
+    char ws_path[1024];
+    const char *dir = recv_mode ? "recv" : "send";
+
+    /* URL-encode command (limit to 800 chars encoded to fit in ws_path) */
+    char cmd_encoded[800] = {0};
+    int ei = 0;
+    for (int ci = 0; cmd_buf[ci] && ei < (int)sizeof(cmd_encoded) - 4; ci++) {
+        unsigned char c = (unsigned char)cmd_buf[ci];
+        if (c == ' ') { cmd_encoded[ei++] = '+'; }
+        else if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') { cmd_encoded[ei++] = c; }
+        else { ei += snprintf(cmd_encoded + ei, sizeof(cmd_encoded) - ei, "%%%02X", c); }
+    }
+
+    snprintf(ws_path, sizeof(ws_path),
+             "/v1/ws/pipe?node=%s&direction=%s&command=%s",
+             target_node, dir, cmd_encoded);
+
+    if (g_verbose || progress)
+        fprintf(stderr, "pipe: opening WebSocket to %s (dir=%s)\n",
+                target_node, dir);
+
+    ws_conn_t *wc = ws_connect(g_server, ws_path);
+    if (!wc) {
+        fprintf(stderr, "pipe: WebSocket connect failed\n");
         return 1;
     }
-    char session[64];
-    snprintf(session, sizeof(session), "%s", sess_j->valuestring);
-    cJSON_Delete(init_resp);
 
     if (recv_mode) {
-        char ws_path[1024];
-        snprintf(ws_path, sizeof(ws_path), "/v1/ws/pipe/%s", session);
-
-        if (g_verbose || progress)
-            fprintf(stderr, "pipe: recv session %s, opening WebSocket...\n", session);
-
-        ws_conn_t *wc = ws_connect(g_server, ws_path);
-        if (!wc) {
-            fprintf(stderr, "pipe: WebSocket connect failed, falling back to HTTP\n");
-            goto recv_http_fallback;
-        }
-
+        /* Admin sends stdin → node */
         unsigned char *buf = malloc(WS_SUBCHUNK);
         if (!buf) { fprintf(stderr, "pipe: OOM\n"); ws_close(wc); return 1; }
         uint64_t sent = 0;
 
         for (;;) {
             size_t nread = fread(buf, 1, WS_SUBCHUNK, stdin);
-            if (g_verbose)
-                fprintf(stderr, "pipe: read %zu bytes from stdin\n", nread);
             if (nread == 0) break;
 
-            int sr = ws_send_data_ssl(wc, WS_OP_BIN, buf, nread);
-            if (g_verbose)
-                fprintf(stderr, "pipe: ws_send returned %d\n", sr);
-            if (sr < 0) {
+            if (ws_send_data_ssl(wc, WS_OP_BIN, buf, nread) < 0) {
                 fprintf(stderr, "pipe: WebSocket send failed\n");
                 ws_close(wc);
                 free(buf);
@@ -826,257 +781,36 @@ static int cmd_pipe(int argc, char *argv[]) {
         }
         free(buf);
 
-        ws_send_frame_ssl(wc, WS_OP_CLOSE, NULL, 0);
         ws_close(wc);
-
         if (progress)
             fprintf(stderr, "\npipe: recv complete — %llu bytes\n", (unsigned long long)sent);
         return 0;
-
-recv_http_fallback:
-        {
-        unsigned char *buf = malloc(WS_SUBCHUNK + 4);
-        if (!buf) { fprintf(stderr, "pipe: OOM\n"); return 1; }
-        int part = 0;
-        uint64_t sent = 0;
+    } else {
+        /* Node sends stdout/stderr → admin */
+        unsigned char *buf = malloc(WS_SUBCHUNK);
+        unsigned char *out = malloc(WS_SUBCHUNK);
+        if (!buf || !out) { fprintf(stderr, "pipe: OOM\n"); free(buf); free(out); ws_close(wc); return 1; }
 
         for (;;) {
-            size_t nread = fread(buf + 4, 1, WS_SUBCHUNK, stdin);
-            if (nread == 0) break;
-
-            uint32_t zer = 0;
-            memcpy(buf, &zer, 4);
-
-            int retries = 0;
-            for (;;) {
-                char put_url[1024];
-                snprintf(put_url, sizeof(put_url),
-                         "%s/v1/admin/pipe/%s/chunk/%04d",
-                         g_server, session, part);
-                struct curl_buf pr = {0};
-                CURL *pc = curl_easy_init();
-                if (!pc) { free(buf); return 1; }
-                curl_easy_setopt(pc, CURLOPT_URL, put_url);
-                curl_easy_setopt(pc, CURLOPT_WRITEFUNCTION, curl_write_cb);
-                curl_easy_setopt(pc, CURLOPT_WRITEDATA, &pr);
-                curl_easy_setopt(pc, CURLOPT_SSLCERT, g_cert_path);
-                curl_easy_setopt(pc, CURLOPT_SSLKEY, g_key_path);
-                curl_easy_setopt(pc, CURLOPT_CAINFO, g_ca_path);
-                curl_easy_setopt(pc, CURLOPT_SSL_VERIFYPEER, 1L);
-                curl_easy_setopt(pc, CURLOPT_SSL_VERIFYHOST, 2L);
-                curl_easy_setopt(pc, CURLOPT_TIMEOUT, 30L);
-                curl_easy_setopt(pc, CURLOPT_CONNECTTIMEOUT, 10L);
-                if (g_key_password[0])
-                    curl_easy_setopt(pc, CURLOPT_KEYPASSWD, g_key_password);
-                curl_easy_setopt(pc, CURLOPT_POSTFIELDSIZE, (long)(nread + 4));
-                curl_easy_setopt(pc, CURLOPT_POSTFIELDS, buf);
-                curl_easy_setopt(pc, CURLOPT_CUSTOMREQUEST, "PUT");
-                rc = curl_easy_perform(pc);
-                curl_easy_getinfo(pc, CURLINFO_RESPONSE_CODE, &http_code);
-                curl_easy_cleanup(pc);
-                free(pr.data);
-
-                if (rc != CURLE_OK) {
-                    fprintf(stderr, "pipe: chunk %d upload: %s\n",
-                            part, curl_easy_strerror(rc));
-                    free(buf);
-                    return 1;
-                }
-                if (http_code == 503) {
-                    if (retries++ > 60) {
-                        fprintf(stderr, "pipe: queue full too long\n");
-                        free(buf);
-                        return 1;
-                    }
-                    sleep(1);
-                    continue;
-                }
-                if (http_code != 200) {
-                    fprintf(stderr, "pipe: chunk %d HTTP %ld\n",
-                            part, http_code);
-                    free(buf);
-                    return 1;
-                }
-                break;
+            ssize_t n = ws_recv_frame(wc, out, WS_SUBCHUNK, &buf[0]);
+            unsigned char opcode = buf[0] & 0x0F;
+            if (n < 0) break;
+            if (opcode == WS_OP_CLOSE) break;
+            if (opcode == WS_OP_PING) {
+                ws_send_frame_ssl(wc, WS_OP_PONG, out, (size_t)n);
+                continue;
             }
-            sent += nread;
-            part++;
-            if (progress)
-                fprintf(stderr, "\rpipe: %llu bytes sent (%d chunks)",
-                        (unsigned long long)sent, part);
+            if (opcode == WS_OP_PONG) continue;
+            if (opcode == WS_OP_BIN || opcode == WS_OP_TEXT) {
+                fwrite(out, 1, (size_t)n, stdout);
+            }
         }
+        fflush(stdout);
         free(buf);
-
-        char done_url[1024];
-        snprintf(done_url, sizeof(done_url),
-                 "%s/v1/admin/pipe/%s/done", g_server, session);
-        struct curl_buf dr = {0};
-        CURL *dc = curl_easy_init();
-        if (dc) {
-            curl_easy_setopt(dc, CURLOPT_URL, done_url);
-            curl_easy_setopt(dc, CURLOPT_WRITEFUNCTION, curl_write_cb);
-            curl_easy_setopt(dc, CURLOPT_WRITEDATA, &dr);
-            curl_easy_setopt(dc, CURLOPT_SSLCERT, g_cert_path);
-            curl_easy_setopt(dc, CURLOPT_SSLKEY, g_key_path);
-            curl_easy_setopt(dc, CURLOPT_CAINFO, g_ca_path);
-            curl_easy_setopt(dc, CURLOPT_SSL_VERIFYPEER, 1L);
-            curl_easy_setopt(dc, CURLOPT_SSL_VERIFYHOST, 2L);
-            curl_easy_setopt(dc, CURLOPT_TIMEOUT, 30L);
-            curl_easy_setopt(dc, CURLOPT_CONNECTTIMEOUT, 10L);
-            if (g_key_password[0])
-                curl_easy_setopt(dc, CURLOPT_KEYPASSWD, g_key_password);
-            curl_easy_setopt(dc, CURLOPT_CUSTOMREQUEST, "POST");
-            rc = curl_easy_perform(dc);
-            curl_easy_getinfo(dc, CURLINFO_RESPONSE_CODE, &http_code);
-            curl_easy_cleanup(dc);
-            free(dr.data);
-        }
-
-        if (progress)
-            fprintf(stderr, "\npipe: recv complete — %llu bytes (%d chunks)\n",
-                    (unsigned long long)sent, part);
-        }
+        free(out);
+        ws_close(wc);
         return 0;
     }
-
-    uint64_t received = 0;
-    char ws_path[1024];
-    snprintf(ws_path, sizeof(ws_path), "/v1/ws/pipe/%s", session);
-
-    if (g_verbose || progress)
-        fprintf(stderr, "pipe: session %s, opening WebSocket...\n", session);
-
-    ws_conn_t *wc = ws_connect(g_server, ws_path);
-    if (!wc) {
-        fprintf(stderr, "pipe: WebSocket connect failed, falling back to HTTP poll\n");
-        goto http_fallback;
-    }
-
-    unsigned char *frame = malloc(WS_FRAME_MAX);
-    if (!frame) { ws_close(wc); return 1; }
-    unsigned char opcode = 0;
-    for (;;) {
-        ssize_t plen = ws_recv_frame(wc, frame, WS_FRAME_MAX, &opcode);
-        if (g_verbose)
-            fprintf(stderr, "ws: recv_frame returned %zd opcode=0x%02x\n", plen, opcode);
-        if (plen < 0) {
-            fprintf(stderr, "pipe: WebSocket read error\n");
-            ws_close(wc);
-            return 1;
-        }
-        if (opcode == WS_OP_CLOSE) {
-            ws_close(wc);
-            break;
-        }
-        if (opcode == WS_OP_PING) {
-            ws_send_frame_ssl(wc, WS_OP_PONG, frame, (size_t)plen);
-            continue;
-        }
-        if (opcode == WS_OP_PONG) continue;
-
-        if (plen > 0) {
-            if ((size_t)plen >= 4) {
-                uint32_t errlen;
-                memcpy(&errlen, frame, 4);
-                size_t stdout_len = (size_t)plen - 4 - (size_t)errlen;
-                if (stdout_len <= (size_t)plen - 4) {
-                    if (stdout_len > 0)
-                        fwrite(frame + 4, 1, stdout_len, stdout);
-                    if (errlen > 0)
-                        fwrite(frame + 4 + stdout_len, 1, errlen, stderr);
-                    fflush(stdout);
-                    fflush(stderr);
-                    received += stdout_len;
-                }
-            } else {
-                fwrite(frame, 1, (size_t)plen, stdout);
-                fflush(stdout);
-                received += (size_t)plen;
-            }
-            if (progress)
-                fprintf(stderr, "\rpipe: %llu bytes received", (unsigned long long)received);
-        }
-    }
-
-    if (progress)
-        fprintf(stderr, "\npipe: complete — %llu bytes\n", (unsigned long long)received);
-    free(frame);
-    return 0;
-
-http_fallback:
-    {
-    uint64_t total_size = 0;
-    char poll_url[1024];
-    snprintf(poll_url, sizeof(poll_url), "%s/v1/admin/pipe/%s", g_server, session);
-    for (;;) {
-        struct curl_buf pr = {0};
-        CURL *pc = curl_easy_init();
-        if (!pc) return 1;
-        curl_easy_setopt(pc, CURLOPT_URL, poll_url);
-        curl_easy_setopt(pc, CURLOPT_WRITEFUNCTION, curl_write_cb);
-        curl_easy_setopt(pc, CURLOPT_WRITEDATA, &pr);
-        curl_easy_setopt(pc, CURLOPT_SSLCERT, g_cert_path);
-        curl_easy_setopt(pc, CURLOPT_SSLKEY, g_key_path);
-        curl_easy_setopt(pc, CURLOPT_CAINFO, g_ca_path);
-        curl_easy_setopt(pc, CURLOPT_SSL_VERIFYPEER, 1L);
-        curl_easy_setopt(pc, CURLOPT_SSL_VERIFYHOST, 2L);
-        curl_easy_setopt(pc, CURLOPT_TIMEOUT, 30L);
-        curl_easy_setopt(pc, CURLOPT_CONNECTTIMEOUT, 10L);
-        if (g_key_password[0])
-            curl_easy_setopt(pc, CURLOPT_KEYPASSWD, g_key_password);
-        rc = curl_easy_perform(pc);
-        curl_easy_getinfo(pc, CURLINFO_RESPONSE_CODE, &http_code);
-        curl_off_t cl = 0;
-        curl_easy_getinfo(pc, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
-        curl_easy_cleanup(pc);
-        if (rc != CURLE_OK) {
-            fprintf(stderr, "pipe: curl error: %s\n", curl_easy_strerror(rc));
-            free(pr.data);
-            return 1;
-        }
-        if (http_code == 204) {
-            free(pr.data);
-            sleep(1);
-            continue;
-        }
-        if (http_code != 200) {
-            fprintf(stderr, "pipe: HTTP %ld — aborting\n", http_code);
-            free(pr.data);
-            return 1;
-        }
-        int is_done = (cl == 0);
-        if (!is_done && pr.data && pr.len > 0) {
-            if (pr.len >= 4) {
-                uint32_t errlen;
-                memcpy(&errlen, pr.data, 4);
-                size_t stdout_len = pr.len - 4 - (size_t)errlen;
-                if (stdout_len <= pr.len - 4) {
-                    if (stdout_len > 0)
-                        fwrite(pr.data + 4, 1, stdout_len, stdout);
-                    if (errlen > 0)
-                        fwrite(pr.data + 4 + stdout_len, 1, errlen, stderr);
-                    fflush(stdout);
-                    fflush(stderr);
-                    received += stdout_len;
-                }
-            } else {
-                fwrite(pr.data, 1, pr.len, stdout);
-                fflush(stdout);
-                received += pr.len;
-            }
-            if (total_size == 0) total_size = 1;
-        }
-        free(pr.data);
-        if (is_done) break;
-        if (progress && total_size > 0) {
-            fprintf(stderr, "\rpipe: %llu bytes received", (unsigned long long)received);
-            fflush(stderr);
-        }
-    }
-    if (progress)
-        fprintf(stderr, "\npipe: complete — %llu bytes\n", (unsigned long long)received);
-    }
-    return 0;
 }
 
 static int cmd_list_nodes(int argc, char *argv[]) {

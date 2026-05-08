@@ -29,7 +29,7 @@ node_config "$NDB" benchie "https://$FQDN:$PORT" "$PKI/benchie.crt" "$PKI/benchi
 cron_spawn "$NDB" 1
 
 echo "=== PIPE 4KB ==="
-timeout 10s "$ADMIN" $ADMIN_BASE pipe dd if=/dev/urandom bs=1K count=4 >"$TMP/out" 2>"$TMP/err" || true
+timeout 10s "$ADMIN" $ADMIN_BASE pipe --node benchie dd if=/dev/urandom bs=1K count=4 >"$TMP/out" 2>"$TMP/err" || true
 echo "stdout: $(wc -c < "$TMP/out") bytes"
 echo "stderr:"
 cat "$TMP/err"

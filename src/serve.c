@@ -44,35 +44,29 @@ static int  g_setup_mode = 0;
 static struct MHD_Daemon *g_daemon = NULL;
 static sqlite3 *g_db = NULL;
 
-struct pipe_chunk {
-    struct pipe_chunk *next;
-    unsigned char *data;
-    size_t len;
-    int part;
-};
-
-struct pipe_session {
-    struct pipe_session *next;
-    char token[33];
-    char src_node[64];
-    struct pipe_chunk *chunks_head;
-    struct pipe_chunk *chunks_tail;
-    int chunk_count;
-    int done;
-    int direction;
-    int producer_done;
-    uint64_t estimated_size;
-    time_t created;
-    time_t last_activity;
-    /* WebSocket fields */
-    int ws_sock;
+/* Persistent node WebSocket connection */
+struct node_ws {
+    struct node_ws *next;
+    char cn[64];
+    int sock;
     int ws_connected;
     int ws_closed;
-    pthread_mutex_t ws_lock;
+    pthread_mutex_t lock;
+    time_t last_ping;
+    time_t last_pong;
+    /* Pipe bridge fields */
+    int pipe_active;
+    int pipe_admin_sock;
+    struct MHD_UpgradeResponseHandle *pipe_admin_urh;
+    pthread_mutex_t pipe_lock;
+    /* Thread for WS loop */
+    pthread_t thread;
+    int thread_running;
 };
 
-#define ZEP_PIPE_MAX_CHUNKS 4
-static struct pipe_session *g_pipe_sessions = NULL;
+#define MAX_NODE_WS 64
+static struct node_ws *g_node_ws = NULL;
+static pthread_mutex_t g_node_ws_lock = PTHREAD_MUTEX_INITIALIZER;
 
 struct conn_ctx {
     char method[8];
@@ -327,103 +321,69 @@ static void verify_snapshot(const char *cluster_key, const char *prefix) {
     storage_meta_free(&meta);
 }
 
-static void pipe_generate_token(char token[33]) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    srand((unsigned int)(tv.tv_sec ^ tv.tv_usec ^ getpid()));
-    for (int i = 0; i < 32; i++)
-        token[i] = (char)("0123456789abcdef"[rand() % 16]);
-    token[32] = '\0';
-}
-
-static struct pipe_session *pipe_session_find(const char *token) {
-    for (struct pipe_session *ps = g_pipe_sessions; ps; ps = ps->next)
-        if (strcmp(ps->token, token) == 0) return ps;
+static struct node_ws *node_ws_find_locked(const char *cn) {
+    for (struct node_ws *nw = g_node_ws; nw; nw = nw->next)
+        if (strcmp(nw->cn, cn) == 0) return nw;
     return NULL;
 }
 
-static struct pipe_session *pipe_session_create(const char *src_node,
-                                                int direction) {
-    struct pipe_session *ps = calloc(1, sizeof(*ps));
-    if (!ps) return NULL;
-    pipe_generate_token(ps->token);
-    snprintf(ps->src_node, sizeof(ps->src_node), "%s", src_node);
-    ps->direction = direction;
-    ps->created = time(NULL);
-    ps->last_activity = ps->created;
-    ps->ws_sock = -1;
-    ps->ws_connected = 0;
-    ps->ws_closed = 0;
-    pthread_mutex_init(&ps->ws_lock, NULL);
-    ps->next = g_pipe_sessions;
-    g_pipe_sessions = ps;
-    return ps;
+static struct node_ws *node_ws_find(const char *cn) {
+    pthread_mutex_lock(&g_node_ws_lock);
+    struct node_ws *nw = node_ws_find_locked(cn);
+    pthread_mutex_unlock(&g_node_ws_lock);
+    return nw;
 }
 
-static int pipe_session_add_chunk(struct pipe_session *ps, int part,
-                                   const void *data, size_t len) {
-    if (ps->chunk_count >= ZEP_PIPE_MAX_CHUNKS) return -1;
-    struct pipe_chunk *pc = calloc(1, sizeof(*pc));
-    if (!pc) return -1;
-    pc->data = malloc(len);
-    if (!pc->data) { free(pc); return -1; }
-    memcpy(pc->data, data, len);
-    pc->len = len;
-    pc->part = part;
-    if (ps->chunks_tail) {
-        ps->chunks_tail->next = pc;
-        ps->chunks_tail = pc;
-    } else {
-        ps->chunks_head = ps->chunks_tail = pc;
-    }
-    ps->chunk_count++;
-    ps->last_activity = time(NULL);
-    return 0;
-}
-
-static struct pipe_chunk *pipe_session_pop_chunk(struct pipe_session *ps) {
-    if (!ps->chunks_head) return NULL;
-    struct pipe_chunk *pc = ps->chunks_head;
-    ps->chunks_head = pc->next;
-    if (!ps->chunks_head) ps->chunks_tail = NULL;
-    ps->chunk_count--;
-    ps->last_activity = time(NULL);
-    return pc;
-}
-
-static void pipe_session_destroy(struct pipe_session *ps) {
-    if (!ps) return;
-    struct pipe_chunk *pc = ps->chunks_head;
-    while (pc) {
-        struct pipe_chunk *next = pc->next;
-        free(pc->data);
-        free(pc);
-        pc = next;
-    }
-    /* ws_sock is closed by MHD_upgrade_action, don't double-close */
-    pthread_mutex_destroy(&ps->ws_lock);
-    free(ps);
-}
-
-static void pipe_sessions_cleanup(void) {
-    time_t now = time(NULL);
-    struct pipe_session *prev = NULL, *ps = g_pipe_sessions;
-    while (ps) {
-        struct pipe_session *next = ps->next;
-        if ((now - ps->last_activity) > 300) {
-            if (!ps->done && ps->src_node[0])
-                db_set_pipe_active(g_db, ps->src_node, 0);
-            char pipe_key[128];
-            snprintf(pipe_key, sizeof(pipe_key), "pipe_task_%s", ps->src_node);
-            db_config_set(g_db, pipe_key, "");
-            if (prev) prev->next = next;
-            else g_pipe_sessions = next;
-            pipe_session_destroy(ps);
-        } else {
-            prev = ps;
+static struct node_ws *node_ws_register(const char *cn, int sock) {
+    pthread_mutex_lock(&g_node_ws_lock);
+    /* Remove existing connection for this node */
+    struct node_ws *prev = NULL, *nw = g_node_ws;
+    while (nw) {
+        if (strcmp(nw->cn, cn) == 0) {
+            if (prev) prev->next = nw->next;
+            else g_node_ws = nw->next;
+            pthread_mutex_unlock(&nw->lock);
+            pthread_mutex_destroy(&nw->lock);
+            free(nw);
+            break;
         }
-        ps = next;
+        prev = nw;
+        nw = nw->next;
     }
+    nw = calloc(1, sizeof(*nw));
+    if (!nw) { pthread_mutex_unlock(&g_node_ws_lock); return NULL; }
+    snprintf(nw->cn, sizeof(nw->cn), "%s", cn);
+    nw->sock = sock;
+    nw->ws_connected = 1;
+    nw->ws_closed = 0;
+    nw->last_ping = time(NULL);
+    nw->last_pong = time(NULL);
+    pthread_mutex_init(&nw->lock, NULL);
+    nw->next = g_node_ws;
+    g_node_ws = nw;
+    if (g_verbose)
+        fprintf(stderr, "ws: node %s registered sock=%d\n", cn, sock);
+    pthread_mutex_unlock(&g_node_ws_lock);
+    return nw;
+}
+
+static void node_ws_unregister(const char *cn) {
+    pthread_mutex_lock(&g_node_ws_lock);
+    struct node_ws *prev = NULL, *nw = g_node_ws;
+    while (nw) {
+        if (strcmp(nw->cn, cn) == 0) {
+            if (prev) prev->next = nw->next;
+            else g_node_ws = nw->next;
+            if (g_verbose)
+                fprintf(stderr, "ws: node %s unregistered\n", cn);
+            pthread_mutex_destroy(&nw->lock);
+            free(nw);
+            break;
+        }
+        prev = nw;
+        nw = nw->next;
+    }
+    pthread_mutex_unlock(&g_node_ws_lock);
 }
 
 /* === WebSocket Support === */
@@ -547,43 +507,6 @@ static ssize_t ws_send_frame(int sock, unsigned char opcode,
     return (ssize_t)flen;
 }
 
-/* Send data as a single WS frame on a blocking socket */
-static int ws_send_data(int sock, unsigned char opcode,
-                         const unsigned char *payload, size_t payload_len) {
-    if (g_verbose)
-        fprintf(stderr, "ws: send opcode=0x%02x len=%zu\n", opcode, payload_len);
-    unsigned char *frame = malloc(payload_len + 14);
-    if (!frame) return -1;
-    size_t flen = ws_build_frame(frame, payload_len + 14, opcode, payload, payload_len);
-    if (flen == 0) { free(frame); return -1; }
-    ssize_t sent = 0;
-    while ((size_t)sent < flen) {
-        ssize_t n = send(sock, frame + sent, flen - (size_t)sent, MSG_NOSIGNAL);
-        if (n <= 0) {
-            if (g_verbose)
-                fprintf(stderr, "ws: send failed: n=%zd errno=%d\n", n, errno);
-            free(frame);
-            return -1;
-        }
-        sent += n;
-    }
-    free(frame);
-    return 0;
-}
-
-static void ws_send_close(int sock) {
-    unsigned char frame[6];
-    size_t flen = ws_build_frame(frame, sizeof(frame), WS_OP_CLOSE, NULL, 0);
-    send(sock, frame, flen, MSG_NOSIGNAL);
-}
-
-/* WebSocket upgrade handler: bridges admin WS ↔ node HTTP chunks */
-struct ws_bridge_ctx {
-    struct pipe_session *session;
-    int sock;
-    struct MHD_UpgradeResponseHandle *urh;
-};
-
 static void ws_make_blocking(int fd) {
     int flags = fcntl(fd, F_GETFL);
     if (flags == -1) return;
@@ -591,195 +514,259 @@ static void ws_make_blocking(int fd) {
         fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
 }
 
-static void *ws_bridge_thread(void *arg) {
-    struct ws_bridge_ctx *ctx = (struct ws_bridge_ctx *)arg;
-    struct pipe_session *ps = ctx->session;
+static void ws_set_keepalive(int fd) {
+    int keepalive = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+#if defined(TCP_KEEPIDLE) && defined(TCP_KEEPINTVL) && defined(TCP_KEEPCNT)
+    int idle = 30, interval = 10, count = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+#endif
+}
+
+struct node_ws_thread_ctx {
+    struct node_ws *nw;
+    int sock;
+    struct MHD_UpgradeResponseHandle *urh;
+};
+
+static void *node_ws_thread(void *arg) {
+    struct node_ws_thread_ctx *ctx = (struct node_ws_thread_ctx *)arg;
+    struct node_ws *nw = ctx->nw;
     int sock = ctx->sock;
     struct MHD_UpgradeResponseHandle *urh = ctx->urh;
     free(ctx);
 
-    /* MHD gives us a non-blocking socket; make it blocking for ws_send_data */
     ws_make_blocking(sock);
-
     unsigned char *buf = malloc(WS_SUBCHUNK);
     unsigned char *out = malloc(WS_SUBCHUNK);
-    unsigned char opcode = 0;
     if (!buf || !out) { free(buf); free(out); MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return NULL; }
 
-    /* Drain any queued chunks from before WS connected (send direction) */
-    if (ps->direction == 0) {
-        if (g_verbose) fprintf(stderr, "ws: draining queued chunks\n");
-        pthread_mutex_lock(&ps->ws_lock);
-        while (ps->chunks_head) {
-            struct pipe_chunk *pc = ps->chunks_head;
-            ps->chunks_head = pc->next;
-            ps->chunk_count--;
-            pthread_mutex_unlock(&ps->ws_lock);
-            if (g_verbose)
-                fprintf(stderr, "ws: draining chunk %d (%zu bytes)\n", pc->part, pc->len);
-            if (ws_send_data(sock, WS_OP_BIN, pc->data, pc->len) < 0) {
-                if (g_verbose) fprintf(stderr, "ws: drain send failed\n");
-                free(pc->data); free(pc);
-                goto ws_done;
-            }
-            free(pc->data); free(pc);
-            pthread_mutex_lock(&ps->ws_lock);
-        }
-        if (!ps->chunks_head) ps->chunks_tail = NULL;
-        pthread_mutex_unlock(&ps->ws_lock);
-    }
+    fprintf(stderr, "ws: node %s listening sock=%d\n", nw->cn, sock);
+    fflush(stderr);
 
-    if (g_verbose)
-        fprintf(stderr, "ws: bridge started sock=%d dir=%d\n", sock, ps->direction);
+    time_t last_ping = time(NULL);
+    FILE *cmd_fp = NULL;
+    char cmd_errfile[256] = {0};
+    int in_pipe = 0;
+    int pipe_recv_mode = 0;
+
     for (;;) {
         struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(sock, &rfds);
         int sel = select(sock + 1, &rfds, NULL, NULL, &tv);
+        if (sel > 0) {
+            fprintf(stderr, "ws: node %s select returned %d\n", nw->cn, sel);
+            fflush(stderr);
+        }
+
+        time_t now = time(NULL);
+        if (now - last_ping >= 60) {
+            ws_send_frame(sock, WS_OP_PING, NULL, 0);
+            last_ping = now;
+        }
 
         if (sel > 0 && FD_ISSET(sock, &rfds)) {
             ssize_t n = recv(sock, buf, WS_SUBCHUNK, 0);
             if (g_verbose)
-                fprintf(stderr, "ws: bridge recv n=%zd\n", n);
+                fprintf(stderr, "ws: node %s recv n=%zd\n", nw->cn, n);
             if (n <= 0) break;
 
-            ssize_t plen = ws_parse_frame(buf, (size_t)n, out, WS_SUBCHUNK, &opcode);
+            ssize_t plen = ws_parse_frame(buf, (size_t)n, out, WS_SUBCHUNK, &buf[0]);
+            unsigned char opcode = buf[0] & 0x0F;
             if (g_verbose)
-                fprintf(stderr, "ws: bridge parse plen=%zd opcode=0x%02x\n", plen, opcode);
+                fprintf(stderr, "ws: node %s parse plen=%zd opcode=0x%02x\n", nw->cn, plen, opcode);
             if (plen < 0) break;
 
-            if (opcode == WS_OP_CLOSE) {
-                ws_send_close(sock);
-                break;
-            }
+            if (opcode == WS_OP_CLOSE) break;
             if (opcode == WS_OP_PING) {
                 ws_send_frame(sock, WS_OP_PONG, out, (size_t)plen);
                 continue;
             }
-            if (opcode == WS_OP_PONG) continue;
+            if (opcode == WS_OP_PONG) {
+                nw->last_pong = time(NULL);
+                continue;
+            }
 
-            /* Admin→node (recv direction): store for node HTTP poll */
-            if ((opcode == WS_OP_BIN || opcode == WS_OP_TEXT) && ps->direction == 1) {
-                pthread_mutex_lock(&ps->ws_lock);
-                struct pipe_chunk *pc = calloc(1, sizeof(*pc));
-                if (pc) {
-                    pc->data = malloc((size_t)plen);
-                    if (pc->data) {
-                        memcpy(pc->data, out, (size_t)plen);
-                        pc->len = (size_t)plen;
-                        pc->part = ps->chunk_count;
-                        pc->next = NULL;
-                        if (!ps->chunks_head) ps->chunks_head = pc;
-                        else ps->chunks_tail->next = pc;
-                        ps->chunks_tail = pc;
-                        ps->chunk_count++;
-                    } else { free(pc); }
+            /* Handle pipe task or data */
+            if (opcode == WS_OP_TEXT && !in_pipe && plen > 0) {
+                out[plen] = '\0';
+                cJSON *task = cJSON_Parse((char *)out);
+                if (task) {
+                    cJSON *action = cJSON_GetObjectItem(task, "action");
+                    cJSON *command = cJSON_GetObjectItem(task, "command");
+                    cJSON *dir = cJSON_GetObjectItem(task, "direction");
+                    if (action && command && cJSON_IsString(action) && cJSON_IsString(command)) {
+                        if (strcmp(action->valuestring, "pipe") == 0) {
+                            int recv_mode = (dir && cJSON_IsString(dir) && strcmp(dir->valuestring, "recv") == 0);
+                            char resolved[4096];
+                            snprintf(resolved, sizeof(resolved), "%s", command->valuestring);
+                            char errfile[] = "/tmp/zep-pipe-err-XXXXXX";
+                            int err_fd = mkstemp(errfile);
+                            char full_cmd[4096 + 256];
+                            if (err_fd >= 0) {
+                                snprintf(full_cmd, sizeof(full_cmd), "(%s) 2>%s", resolved, errfile);
+                                snprintf(cmd_errfile, sizeof(cmd_errfile), "%s", errfile);
+                            } else {
+                                snprintf(full_cmd, sizeof(full_cmd), "%s", resolved);
+                                cmd_errfile[0] = '\0';
+                            }
+                            if (recv_mode) {
+                                /* Admin sends data → node stdin */
+                                cmd_fp = popen(full_cmd, "w");
+                            } else {
+                                /* Node stdout → admin receives data */
+                                cmd_fp = popen(full_cmd, "r");
+                            }
+                            if (cmd_fp) {
+                                in_pipe = 1;
+                                pipe_recv_mode = recv_mode;
+                                if (g_verbose)
+                                    fprintf(stderr, "ws: node %s pipe started (%s): %s\n", nw->cn, recv_mode ? "recv" : "send", resolved);
+                            } else {
+                                fprintf(stderr, "ws: node %s popen failed: %s\n", nw->cn, resolved);
+                            }
+                        }
+                    }
+                    cJSON_Delete(task);
                 }
-                pthread_mutex_unlock(&ps->ws_lock);
+            } else if (in_pipe && cmd_fp && (opcode == WS_OP_BIN || opcode == WS_OP_TEXT) && plen > 0) {
+                if (pipe_recv_mode) {
+                    /* Write to command stdin */
+                    fwrite(out, 1, (size_t)plen, cmd_fp);
+                    fflush(cmd_fp);
+                }
+            }
+
+            /* Read from command stdout and send to admin (send mode) */
+            if (in_pipe && cmd_fp && !pipe_recv_mode) {
+                size_t nread = fread(out, 1, WS_SUBCHUNK, cmd_fp);
+                if (nread > 0) {
+                    ws_send_frame(sock, WS_OP_BIN, out, nread);
+                }
             }
         }
 
-        /* Forward node→admin chunks (send direction) */
-        pthread_mutex_lock(&ps->ws_lock);
-        struct pipe_chunk *pc = ps->chunks_head;
-        if (pc) {
-            ps->chunks_head = pc->next;
-            if (!ps->chunks_head) ps->chunks_tail = NULL;
-            ps->chunk_count--;
-            pthread_mutex_unlock(&ps->ws_lock);
-
-            if (ws_send_data(sock, WS_OP_BIN, pc->data, pc->len) < 0) {
-                free(pc->data); free(pc);
-                break;
-            }
-            free(pc->data); free(pc);
-        } else if (ps->done) {
-            pthread_mutex_unlock(&ps->ws_lock);
-            ws_send_close(sock);
-            break;
-        } else {
-            pthread_mutex_unlock(&ps->ws_lock);
-        }
+        if (time(NULL) - nw->last_pong > 180) break;
     }
 
-ws_done:
-    pthread_mutex_lock(&ps->ws_lock);
-    ps->ws_connected = 0;
-    ps->ws_closed = 1;
-    pthread_mutex_unlock(&ps->ws_lock);
+    if (g_verbose)
+        fprintf(stderr, "ws: node %s disconnected\n", nw->cn);
+
+    if (cmd_fp) {
+        pclose(cmd_fp);
+        if (cmd_errfile[0]) unlink(cmd_errfile);
+    }
+
+    free(buf); free(out);
+
+    /* Clear pipe state */
+    pthread_mutex_lock(&nw->lock);
+    nw->pipe_active = 0;
+    nw->pipe_admin_sock = -1;
+    nw->pipe_admin_urh = NULL;
+    pthread_mutex_unlock(&nw->lock);
+
+    node_ws_unregister(nw->cn);
     MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
-    free(buf);
-    free(out);
     return NULL;
 }
 
-/* Send node chunk directly to admin WS socket (send direction) */
-static int ws_send_node_chunk(struct pipe_session *ps, const void *data, size_t len) {
-    pthread_mutex_lock(&ps->ws_lock);
-    int ret = 0;
-    if (ps->ws_connected && !ps->ws_closed && ps->ws_sock >= 0) {
-        if (ws_send_data(ps->ws_sock, WS_OP_BIN, data, len) < 0) {
-            fprintf(stderr, "ws: send_node_chunk failed sock=%d connected=%d closed=%d\n",
-                    ps->ws_sock, ps->ws_connected, ps->ws_closed);
-            ps->ws_closed = 1;
-            ret = -1;
-        }
-    } else {
-        fprintf(stderr, "ws: send_node_chunk skipped sock=%d connected=%d closed=%d\n",
-                ps->ws_sock, ps->ws_connected, ps->ws_closed);
-        ret = -1;
-    }
-    pthread_mutex_unlock(&ps->ws_lock);
-    return ret;
+/* Node WS upgrade handler */
+static void ws_node_upgrade_handler(void *cls, struct MHD_Connection *conn,
+                                     void *con_cls, const char *extra_in,
+                                     size_t extra_in_size, int sock,
+                                     struct MHD_UpgradeResponseHandle *urh) {
+    (void)cls; (void)conn; (void)con_cls; (void)extra_in; (void)extra_in_size;
+
+    const char *cn = (const char *)cls;
+    if (!cn) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
+
+    ws_set_keepalive(sock);
+
+    struct node_ws *nw = node_ws_register(cn, sock);
+    if (!nw) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
+
+    /* Spawn thread for WS loop */
+    struct node_ws_thread_ctx *ctx = malloc(sizeof(*ctx));
+    ctx->nw = nw;
+    ctx->sock = sock;
+    ctx->urh = urh;
+    pthread_create(&nw->thread, NULL, node_ws_thread, ctx);
+    pthread_detach(nw->thread);
+    nw->thread_running = 1;
 }
 
-static void ws_upgrade_handler(void *cls, struct MHD_Connection *conn,
-                                void *con_cls, const char *extra_in,
-                                size_t extra_in_size, int sock,
-                                struct MHD_UpgradeResponseHandle *urh) {
-    (void)cls; (void)conn; (void)con_cls;
-    (void)extra_in; (void)extra_in_size;
+/* Admin pipe WS upgrade handler - bridges to node WS */
+static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
+                                     void *con_cls, const char *extra_in,
+                                     size_t extra_in_size, int sock,
+                                     struct MHD_UpgradeResponseHandle *urh) {
+    (void)cls; (void)conn; (void)con_cls; (void)extra_in; (void)extra_in_size;
 
-    const char *token = (const char *)cls;
-    if (!token) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
+    const char *node_cn = (const char *)cls;
+    if (!node_cn) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
 
-    struct pipe_session *ps = pipe_session_find(token);
-    if (!ps) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
+    ws_set_keepalive(sock);
 
-    pthread_mutex_lock(&ps->ws_lock);
-    if (ps->ws_connected) {
-        pthread_mutex_unlock(&ps->ws_lock);
-        ws_send_close(sock);
+    /* Find node connection */
+    struct node_ws *nw = node_ws_find(node_cn);
+    if (!nw) {
+        fprintf(stderr, "ws: pipe request for %s — not connected\n", node_cn);
+        fflush(stderr);
         MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
         return;
     }
-    ps->ws_sock = sock;
-    ps->ws_connected = 1;
-    ps->ws_closed = 0;
-    pthread_mutex_unlock(&ps->ws_lock);
+    fprintf(stderr, "ws: pipe found node %s sock=%d\n", node_cn, nw->sock);
+    fflush(stderr);
 
-    struct ws_bridge_ctx *ctx = malloc(sizeof(*ctx));
-    ctx->session = ps;
-    ctx->sock = sock;
-    ctx->urh = urh;
+    /* Signal node thread that pipe is starting */
+    pthread_mutex_lock(&nw->lock);
+    nw->pipe_active = 1;
+    nw->pipe_admin_sock = sock;
+    nw->pipe_admin_urh = urh;
+    pthread_mutex_unlock(&nw->lock);
 
-    pthread_t tid;
-    pthread_create(&tid, NULL, ws_bridge_thread, ctx);
-    pthread_detach(tid);
+    /* Send task JSON to node */
+    const char *direction = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "direction");
+    const char *command = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "command");
+    if (command) {
+        char *task_json = NULL;
+        if (asprintf(&task_json, "{\"action\":\"pipe\",\"command\":\"%s\",\"direction\":\"%s\"}",
+                     command, direction ? direction : "send") > 0) {
+            if (g_verbose)
+                fprintf(stderr, "ws: sending task to node: %s\n", task_json);
+            ws_send_frame(nw->sock, WS_OP_TEXT, (unsigned char *)task_json, strlen(task_json));
+            free(task_json);
+        }
+    }
+
+    /* Node thread will handle the pipe - this handler just waits for completion */
+    /* The node thread will close both sockets when done */
+    /* We need to wait here for the pipe to complete */
+    for (;;) {
+        pthread_mutex_lock(&nw->lock);
+        int done = !nw->pipe_active;
+        pthread_mutex_unlock(&nw->lock);
+        if (done) break;
+        usleep(50000);
+    }
+
+    if (g_verbose)
+        fprintf(stderr, "ws: pipe complete for node %s\n", node_cn);
 }
 
-static enum MHD_Result ws_handle_pipe(struct MHD_Connection *conn,
-                                       const char *token) {
+static enum MHD_Result ws_handle_node(struct MHD_Connection *conn,
+                                       const char *cn) {
     if (g_verbose)
-        fprintf(stderr, "ws: upgrade request for session %s\n", token);
+        fprintf(stderr, "ws: node upgrade request for %s\n", cn);
 
-    const char *upgrade = MHD_lookup_connection_value(conn, MHD_HEADER_KIND,
-                                                       "Upgrade");
-    const char *ws_key = MHD_lookup_connection_value(conn, MHD_HEADER_KIND,
-                                                      "Sec-WebSocket-Key");
-    const char *ws_ver = MHD_lookup_connection_value(conn, MHD_HEADER_KIND,
-                                                      "Sec-WebSocket-Version");
+    const char *upgrade = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Upgrade");
+    const char *ws_key = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Sec-WebSocket-Key");
+    const char *ws_ver = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Sec-WebSocket-Version");
 
     if (!upgrade || strcasecmp(upgrade, "websocket") != 0)
         return send_error(conn, 400, "Upgrade: websocket required");
@@ -788,22 +775,52 @@ static enum MHD_Result ws_handle_pipe(struct MHD_Connection *conn,
     if (!ws_ver || strcmp(ws_ver, "13") != 0)
         return send_error(conn, 400, "Sec-WebSocket-Version: 13 required");
 
-    struct pipe_session *ps = pipe_session_find(token);
-    if (!ps) return send_error(conn, 404, "Session not found");
-
     char accept[128];
     ws_build_accept(ws_key, accept, sizeof(accept));
 
     struct MHD_Response *resp = MHD_create_response_for_upgrade(
-        &ws_upgrade_handler, (void *)ps->token);
+        &ws_node_upgrade_handler, (void *)cn);
     if (!resp) return send_error(conn, 500, "Failed to create upgrade response");
 
     MHD_add_response_header(resp, "Upgrade", "websocket");
     MHD_add_response_header(resp, "Connection", "Upgrade");
     MHD_add_response_header(resp, "Sec-WebSocket-Accept", accept);
 
-    if (g_verbose)
-        fprintf(stderr, "ws: queuing 101 for session %s\n", token);
+    enum MHD_Result ret = MHD_queue_response(conn, 101, resp);
+    MHD_destroy_response(resp);
+    return ret;
+}
+
+static enum MHD_Result ws_handle_pipe(struct MHD_Connection *conn,
+                                       const char *node_cn) {
+    fprintf(stderr, "ws: pipe upgrade request for node %s\n", node_cn);
+    fflush(stderr);
+
+    const char *upgrade = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Upgrade");
+    const char *ws_key = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Sec-WebSocket-Key");
+    const char *ws_ver = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Sec-WebSocket-Version");
+
+    if (!upgrade || strcasecmp(upgrade, "websocket") != 0)
+        return send_error(conn, 400, "Upgrade: websocket required");
+    if (!ws_key || !ws_key[0])
+        return send_error(conn, 400, "Sec-WebSocket-Key required");
+    if (!ws_ver || strcmp(ws_ver, "13") != 0)
+        return send_error(conn, 400, "Sec-WebSocket-Version: 13 required");
+
+    if (!node_ws_find(node_cn))
+        return send_error(conn, 503, "Node not connected");
+
+    char accept[128];
+    ws_build_accept(ws_key, accept, sizeof(accept));
+
+    struct MHD_Response *resp = MHD_create_response_for_upgrade(
+        &ws_pipe_upgrade_handler, (void *)node_cn);
+    if (!resp) return send_error(conn, 500, "Failed to create upgrade response");
+
+    MHD_add_response_header(resp, "Upgrade", "websocket");
+    MHD_add_response_header(resp, "Connection", "Upgrade");
+    MHD_add_response_header(resp, "Sec-WebSocket-Accept", accept);
+
     enum MHD_Result ret = MHD_queue_response(conn, 101, resp);
     MHD_destroy_response(resp);
     return ret;
@@ -1106,217 +1123,15 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             return send_error(conn, 400, "Missing key");
         }
 
-        /* ── pipe: admin sends chunk (recv direction) ── */
-        if (strcmp(ctx->method, "PUT") == 0 &&
-            strncmp(ctx->target_url, "/v1/admin/pipe/", 15) == 0) {
-            const char *token_start = ctx->target_url + 15;
-            const char *slash2 = strchr(token_start, '/');
-            if (slash2 && strncmp(slash2 + 1, "chunk/", 6) == 0) {
-                char token[64] = {0};
-                size_t tok_len = (size_t)(slash2 - token_start);
-                if (tok_len >= sizeof(token)) tok_len = sizeof(token) - 1;
-                memcpy(token, token_start, tok_len);
-                int part = atoi(slash2 + 7);
-                pipe_sessions_cleanup();
-                struct pipe_session *ps = pipe_session_find(token);
-                if (!ps) return send_error(conn, 404, "Session not found or expired");
-                if (ps->direction != 1)
-                    return send_error(conn, 400, "Not a recv session");
-                if (pipe_session_add_chunk(ps, part, ctx->body, ctx->body_len) != 0)
-                    return send_error(conn, 503, "Pipe queue full, retry");
-                return send_json(conn, 200, "{\"ok\":true}");
-            }
-        }
-
-        /* ── pipe: admin initiates pipe session ── */
-        if (strcmp(ctx->method, "POST") == 0 &&
-            strcmp(ctx->target_url, "/v1/admin/pipe") == 0) {
-            cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
-            if (!json) return send_error(conn, 400, "Invalid JSON");
-
-            cJSON *cmd_j    = cJSON_GetObjectItem(json, "command");
-            cJSON *dir_j    = cJSON_GetObjectItem(json, "direction");
-            cJSON *node_j   = cJSON_GetObjectItem(json, "node");
-            cJSON *comp_j   = cJSON_GetObjectItem(json, "compress");
-            cJSON *buf_j    = cJSON_GetObjectItem(json, "buffer");
-
-            if (!cmd_j || !cJSON_IsString(cmd_j) || !cmd_j->valuestring[0]) {
-                cJSON_Delete(json);
-                return send_error(conn, 400, "Missing command");
-            }
-            const char *command = cmd_j->valuestring;
-            int direction = (dir_j && cJSON_IsString(dir_j) &&
-                             strcmp(dir_j->valuestring, "recv") == 0) ? 1 : 0;
-            int compress = (comp_j && cJSON_IsTrue(comp_j)) ? 1 : 0;
-            int buffer   = (buf_j  && cJSON_IsTrue(buf_j))  ? 1 : 0;
-
-            char allow_list[256] = "zfs";
-            db_config_get(g_db, "pipe_restrict", allow_list, sizeof(allow_list));
-            if (allow_list[0] && strcmp(allow_list, "*") != 0) {
-                char cmd_prefix[64] = {0};
-                const char *sp = strchr(command, ' ');
-                size_t plen = sp ? (size_t)(sp - command) : strlen(command);
-                if (plen >= sizeof(cmd_prefix)) plen = sizeof(cmd_prefix) - 1;
-                memcpy(cmd_prefix, command, plen);
-                int is_ok = 0;
-                char *list_copy = strdup(allow_list);
-                if (list_copy) {
-                    char *save = NULL;
-                    char *tok = strtok_r(list_copy, ",", &save);
-                    while (tok) {
-                        while (*tok == ' ') tok++;
-                        if (strcmp(tok, cmd_prefix) == 0) { is_ok = 1; break; }
-                        tok = strtok_r(NULL, ",", &save);
-                    }
-                    free(list_copy);
-                }
-                if (!is_ok) {
-                    cJSON_Delete(json);
-                    return send_error(conn, 403, "Command not allowed by pipe_restrict");
-                }
-            }
-
-            char src_node[64] = {0};
-            if (node_j && cJSON_IsString(node_j) && node_j->valuestring[0]) {
-                snprintf(src_node, sizeof(src_node), "%s", node_j->valuestring);
-            } else {
-                sqlite3_stmt *st = NULL;
-                sqlite3_prepare_v2(g_db,
-                    "SELECT cn FROM auth WHERE role = 'client' AND pipe_active = 0 "
-                    "LIMIT 1", -1, &st, NULL);
-                if (st) {
-                    if (sqlite3_step(st) == SQLITE_ROW)
-                        snprintf(src_node, sizeof(src_node), "%s",
-                                 (const char *)sqlite3_column_text(st, 0));
-                    sqlite3_finalize(st);
-                }
-                if (!src_node[0]) {
-                    sqlite3_prepare_v2(g_db,
-                        "SELECT cn FROM auth WHERE role = 'master' AND pipe_active = 0 "
-                        "LIMIT 1", -1, &st, NULL);
-                    if (st) {
-                        if (sqlite3_step(st) == SQLITE_ROW)
-                            snprintf(src_node, sizeof(src_node), "%s",
-                                     (const char *)sqlite3_column_text(st, 0));
-                        sqlite3_finalize(st);
-                    }
-                }
-            }
-
-            if (!src_node[0]) {
-                cJSON_Delete(json);
-                return send_error(conn, 500, "No available node");
-            }
-
-            int active_now = 0;
-            {
-                sqlite3_stmt *st = NULL;
-                sqlite3_prepare_v2(g_db,
-                    "SELECT pipe_active FROM auth WHERE cn = ?", -1, &st, NULL);
-                if (st) {
-                    sqlite3_bind_text(st, 1, src_node, -1, SQLITE_STATIC);
-                    if (sqlite3_step(st) == SQLITE_ROW)
-                        active_now = sqlite3_column_int(st, 0);
-                    sqlite3_finalize(st);
-                }
-            }
-            if (active_now) {
-                cJSON_Delete(json);
-                return send_error(conn, 409, "Node already has active pipe");
-            }
-
-            db_set_pipe_active(g_db, src_node, 1);
-            if (g_verbose)
-                fprintf(stderr, "pipe: reserved node %s (dir=%s, cmd=%s)\n",
-                        src_node, direction ? "recv" : "send", command);
-
-            struct pipe_session *ps = pipe_session_create(src_node, direction);
-            if (!ps) {
-                db_set_pipe_active(g_db, src_node, 0);
-                cJSON_Delete(json);
-                return send_error(conn, 500, "Failed to create session");
-            }
-
-            const char *dir_str = direction ? "recv" : "send";
-            cJSON *task_j = cJSON_CreateObject();
-            cJSON_AddStringToObject(task_j, "action", "pipe");
-            cJSON_AddStringToObject(task_j, "session", ps->token);
-            cJSON_AddStringToObject(task_j, "direction", dir_str);
-            cJSON_AddStringToObject(task_j, "command", command);
-            if (compress) cJSON_AddBoolToObject(task_j, "compress", 1);
-            if (buffer)   cJSON_AddBoolToObject(task_j, "buffer", 1);
-            char *task_str = cJSON_PrintUnformatted(task_j);
-            cJSON_Delete(task_j);
-            cJSON_Delete(json);
-
-            char pipe_key[128];
-            snprintf(pipe_key, sizeof(pipe_key), "pipe_task_%s", src_node);
-            db_config_set(g_db, pipe_key, task_str);
-            free(task_str);
-
-            char *resp = NULL;
-            if (asprintf(&resp, "{\"session\":\"%s\"}", ps->token) < 0)
-                return send_error(conn, 500, "OOM");
-            enum MHD_Result ret = send_json(conn, 200, resp);
-            free(resp);
-            return ret;
-        }
-
-        /* ── pipe: admin signals done (recv direction) ── */
-        if (strcmp(ctx->method, "POST") == 0 &&
-            strncmp(ctx->target_url, "/v1/admin/pipe/", 15) == 0) {
-            const char *token_start = ctx->target_url + 15;
-            const char *slash2 = strchr(token_start, '/');
-            if (slash2 && strncmp(slash2 + 1, "done", 4) == 0) {
-                char token[64] = {0};
-                size_t tok_len = (size_t)(slash2 - token_start);
-                if (tok_len >= sizeof(token)) tok_len = sizeof(token) - 1;
-                memcpy(token, token_start, tok_len);
-                pipe_sessions_cleanup();
-                struct pipe_session *ps = pipe_session_find(token);
-                if (!ps) return send_error(conn, 404, "Session not found or expired");
-                if (ps->direction != 1)
-                    return send_error(conn, 400, "Not a recv session");
-                ps->producer_done = 1;
-                if (g_verbose)
-                    fprintf(stderr, "pipe: session %s producer done\n", token);
-                return send_json(conn, 200, "{\"ok\":true}");
-            }
-        }
-
-        /* ── admin pipe poll ── */
+        /* ── pipe: admin checks if node is connected (WS-only pipe) ── */
         if (strcmp(ctx->method, "GET") == 0 &&
-            strncmp(ctx->target_url, "/v1/admin/pipe/", 15) == 0) {
-            const char *token = ctx->target_url + 15;
-            if (!token[0]) return send_error(conn, 400, "Missing session token");
-            pipe_sessions_cleanup();
-            struct pipe_session *ps = pipe_session_find(token);
-            if (!ps) return send_error(conn, 404, "Session not found or expired");
-            struct pipe_chunk *pc = pipe_session_pop_chunk(ps);
-            if (!pc) {
-                if (ps->done) {
-                    struct MHD_Response *resp = MHD_create_response_from_buffer(
-                        0, "", MHD_RESPMEM_PERSISTENT);
-                    MHD_add_response_header(resp, "X-Pipe-Done", "1");
-                    MHD_add_response_header(resp, "Content-Type", "application/octet-stream");
-                    enum MHD_Result ret = MHD_queue_response(conn, 200, resp);
-                    MHD_destroy_response(resp);
-                    return ret;
-                }
-                return send_error(conn, 204, "No chunks yet");
-            }
-            char size_buf[32];
-            snprintf(size_buf, sizeof(size_buf), "%llu", (unsigned long long)ps->estimated_size);
-            struct MHD_Response *resp = MHD_create_response_from_buffer(
-                pc->len, pc->data, MHD_RESPMEM_MUST_FREE);
-            free(pc);
-            MHD_add_response_header(resp, "Content-Type", "application/octet-stream");
-            MHD_add_response_header(resp, "X-Pipe-Chunk", "1");
-            if (ps->estimated_size > 0)
-                MHD_add_response_header(resp, "X-Pipe-Size", size_buf);
-            enum MHD_Result ret = MHD_queue_response(conn, 200, resp);
-            MHD_destroy_response(resp);
-            return ret;
+            strcmp(ctx->target_url, "/v1/admin/pipe") == 0) {
+            const char *node_param = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "node");
+            if (!node_param || !node_param[0])
+                return send_error(conn, 400, "Missing node parameter");
+            if (!node_ws_find(node_param))
+                return send_error(conn, 503, "Node not connected");
+            return send_json(conn, 200, "{\"ok\":true}");
         }
 
         /* ── config set / suspend / resume / promote / rollback / snap ── */
@@ -1435,127 +1250,18 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         return send_error(conn, 404, "Admin endpoint not found");
     }
 
-    /* ── WebSocket pipe endpoint ── */
-    if (strncmp(ctx->target_url, "/v1/ws/pipe/", 12) == 0) {
-        const char *token = ctx->target_url + 12;
-        if (!token[0]) return send_error(conn, 400, "Missing session token");
-        return ws_handle_pipe(conn, token);
+    /* ── WebSocket: node persistent connection ── */
+    if (strncmp(ctx->target_url, "/v1/ws/node", 11) == 0) {
+        const char *cn = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "cn");
+        if (!cn || !cn[0]) return send_error(conn, 400, "Missing cn parameter");
+        return ws_handle_node(conn, cn);
     }
 
-    /* ── pipe node endpoints (mTLS authenticated, not admin) ── */
-    if (strncmp(ctx->target_url, "/v1/pipe/", 9) == 0) {
-        const char *rest = ctx->target_url + 9;
-        char token[64] = {0};
-        const char *slash = strchr(rest, '/');
-        if (slash) {
-            size_t tok_len = (size_t)(slash - rest);
-            if (tok_len >= sizeof(token)) tok_len = sizeof(token) - 1;
-            memcpy(token, rest, tok_len);
-        } else {
-            snprintf(token, sizeof(token), "%s", rest);
-        }
-
-        if (g_verbose)
-            fprintf(stderr, "pipe: node request token=%s method=%s url=%s\n",
-                    token, ctx->method, ctx->target_url);
-
-        struct pipe_session *ps = pipe_session_find(token);
-        if (!ps) {
-            if (g_verbose)
-                fprintf(stderr, "pipe: session not found, dumping sessions:\n");
-            for (struct pipe_session *s = g_pipe_sessions; s; s = s->next) {
-                if (g_verbose)
-                    fprintf(stderr, "  session=%s node=%s dir=%d done=%d ws=%d\n",
-                            s->token, s->src_node, s->direction, s->done, s->ws_connected);
-            }
-            return send_error(conn, 404, "Session not found");
-        }
-
-        /* GET /v1/pipe/<s> — node downloads next chunk (recv direction) */
-        if (strcmp(ctx->method, "GET") == 0 && !slash) {
-            if (ps->direction != 1)
-                return send_error(conn, 400, "Not a recv session");
-            struct pipe_chunk *pc = pipe_session_pop_chunk(ps);
-            if (!pc) {
-                if (ps->producer_done) {
-                    struct MHD_Response *resp = MHD_create_response_from_buffer(
-                        0, "", MHD_RESPMEM_PERSISTENT);
-                    MHD_add_response_header(resp, "X-Pipe-Done", "1");
-                    MHD_add_response_header(resp, "Content-Type",
-                                            "application/octet-stream");
-                    enum MHD_Result ret = MHD_queue_response(conn, 200, resp);
-                    MHD_destroy_response(resp);
-                    return ret;
-                }
-                return send_error(conn, 204, "No chunks yet");
-            }
-            struct MHD_Response *resp = MHD_create_response_from_buffer(
-                pc->len, pc->data, MHD_RESPMEM_MUST_FREE);
-            free(pc);
-            MHD_add_response_header(resp, "Content-Type",
-                                    "application/octet-stream");
-            enum MHD_Result ret = MHD_queue_response(conn, 200, resp);
-            MHD_destroy_response(resp);
-            return ret;
-        }
-
-        if (strcmp(ctx->method, "PUT") == 0 && slash) {
-            const char *sub = slash + 1;
-            if (strncmp(sub, "meta", 4) == 0) {
-                cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
-                if (json) {
-                    cJSON *sz = cJSON_GetObjectItem(json, "size");
-                    if (sz && cJSON_IsNumber(sz))
-                        ps->estimated_size = (uint64_t)sz->valuedouble;
-                    cJSON_Delete(json);
-                }
-                return send_json(conn, 200, "{\"ok\":true}");
-            }
-            if (strncmp(sub, "chunk/", 6) == 0) {
-                int part = atoi(sub + 6);
-                (void)part;
-                if (ps->direction == 0) {
-                    /* Send direction: try direct WS, fall back to queue */
-                    if (ws_send_node_chunk(ps, ctx->body, ctx->body_len) != 0) {
-                        if (g_verbose)
-                            fprintf(stderr, "pipe: WS send failed, queuing chunk\n");
-                        pthread_mutex_lock(&ps->ws_lock);
-                        int ret = pipe_session_add_chunk(ps, part, ctx->body, ctx->body_len);
-                        pthread_mutex_unlock(&ps->ws_lock);
-                        if (ret != 0)
-                            return send_error(conn, 503, "Pipe queue full, retry");
-                    }
-                } else {
-                    /* Recv direction: store for node HTTP poll */
-                    pthread_mutex_lock(&ps->ws_lock);
-                    int ret = pipe_session_add_chunk(ps, part, ctx->body, ctx->body_len);
-                    pthread_mutex_unlock(&ps->ws_lock);
-                    if (ret != 0)
-                        return send_error(conn, 503, "Pipe queue full, retry");
-                }
-                ps->last_activity = time(NULL);
-                return send_json(conn, 200, "{\"ok\":true}");
-            }
-        }
-
-        if (strcmp(ctx->method, "POST") == 0 && slash &&
-            strncmp(slash + 1, "done", 4) == 0) {
-            ps->done = 1;
-            db_set_pipe_active(g_db, ps->src_node, 0);
-            char pipe_key[128];
-            snprintf(pipe_key, sizeof(pipe_key), "pipe_task_%s", ps->src_node);
-            db_config_set(g_db, pipe_key, "");
-            /* Signal done via WebSocket close frame */
-            pthread_mutex_lock(&ps->ws_lock);
-            if (ps->ws_connected && !ps->ws_closed && ps->ws_sock >= 0)
-                ws_send_close(ps->ws_sock);
-            pthread_mutex_unlock(&ps->ws_lock);
-            if (g_verbose)
-                fprintf(stderr, "pipe: session %s done, released %s\n", token, ps->src_node);
-            return send_json(conn, 200, "{\"ok\":true}");
-        }
-
-        return send_error(conn, 404, "Pipe endpoint not found");
+    /* ── WebSocket: admin pipe connection ── */
+    if (strncmp(ctx->target_url, "/v1/ws/pipe", 11) == 0) {
+        const char *node_cn = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "node");
+        if (!node_cn || !node_cn[0]) return send_error(conn, 400, "Missing node parameter");
+        return ws_handle_pipe(conn, node_cn);
     }
 
     /* ── cron sync endpoint ── */
@@ -1563,31 +1269,12 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         strcmp(ctx->target_url, "/v1/cron/sync") == 0) {
         cJSON *tasks = cJSON_CreateArray();
 
-        if (ctx->node[0]) {
-            char pipe_key[128];
-            snprintf(pipe_key, sizeof(pipe_key), "pipe_task_%s", ctx->node);
-            char pipe_task_json[4096] = {0};
-            if (db_config_get(g_db, pipe_key, pipe_task_json,
-                              sizeof(pipe_task_json)) == ZEP_ERR_OK &&
-                pipe_task_json[0]) {
-                cJSON *pt = cJSON_Parse(pipe_task_json);
-                if (pt) {
-                    cJSON_AddItemToArray(tasks, pt);
-                    char *js = cJSON_PrintUnformatted(tasks);
-                    cJSON_Delete(tasks);
-                    enum MHD_Result ret = send_json(conn, 200, js);
-                    free(js);
-                    return ret;
-                }
-            }
-        }
-
         char role[16] = {0}, cluster_name[64] = {0};
-        int suspended = 0, pipe_active = 0;
+        int suspended = 0;
         if (ctx->node[0]) {
             sqlite3_stmt *st = NULL;
             sqlite3_prepare_v2(g_db,
-                "SELECT role, cluster, suspended, pipe_active FROM auth WHERE cn = ?",
+                "SELECT role, cluster, suspended FROM auth WHERE cn = ?",
                 -1, &st, NULL);
             if (st) {
                 sqlite3_bind_text(st, 1, ctx->node, -1, SQLITE_STATIC);
@@ -1595,7 +1282,6 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     const char *r = (const char *)sqlite3_column_text(st, 0);
                     const char *c = (const char *)sqlite3_column_text(st, 1);
                     suspended = sqlite3_column_int(st, 2);
-                    pipe_active = sqlite3_column_int(st, 3);
                     snprintf(role, sizeof(role), "%s", r ? r : "");
                     snprintf(cluster_name, sizeof(cluster_name), "%s", c ? c : "");
                 }
@@ -1605,9 +1291,9 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
         time_t now = time(NULL);
 
-        if (suspended || pipe_active) {
+        if (suspended) {
             cJSON_AddItemToArray(tasks, cJSON_CreateObject());
-            /* empty task list — no work for suspended or pipe-active nodes */
+            /* empty task list — no work for suspended nodes */
         } else if (strcmp(role, "master") == 0 && cluster_name[0]) {
             char cfg_key[128], cluster_json[65536] = {0};
             snprintf(cfg_key, sizeof(cfg_key), "cluster_%s", cluster_name);
