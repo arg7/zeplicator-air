@@ -54,9 +54,14 @@ struct node_ws {
     pthread_mutex_t lock;
     time_t last_ping;
     time_t last_pong;
-    /* Pipe coordination */
-    int pipe_starting;
+    /* Pipe coordination: bridge thread sets these, node thread reads them */
+    char pipe_cmd[4096];
+    int pipe_cmd_ready;
     int pipe_done;
+    int pipe_recv_mode;
+    /* Pipes for inter-thread data transfer */
+    int pipe_admin_to_node[2];  /* bridge→node: admin data */
+    int pipe_node_to_admin[2];  /* node→bridge: node data */
     pthread_t thread;
 };
 
@@ -354,6 +359,10 @@ static struct node_ws *node_ws_register(const char *cn, int sock) {
     nw->ws_closed = 0;
     nw->last_ping = time(NULL);
     nw->last_pong = time(NULL);
+    nw->pipe_admin_to_node[0] = -1;
+    nw->pipe_admin_to_node[1] = -1;
+    nw->pipe_node_to_admin[0] = -1;
+    nw->pipe_node_to_admin[1] = -1;
     pthread_mutex_init(&nw->lock, NULL);
     nw->next = g_node_ws;
     g_node_ws = nw;
@@ -680,7 +689,9 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
                      command, direction ? direction : "send") > 0) {
             if (g_verbose)
                 fprintf(stderr, "ws: sending task to node: %s\n", task_json);
-            ws_send_frame(node_sock, WS_OP_TEXT, (unsigned char *)task_json, strlen(task_json));
+            ssize_t sr = ws_send_frame(node_sock, WS_OP_TEXT, (unsigned char *)task_json, strlen(task_json));
+            fprintf(stderr, "ws: send_frame returned %zd\n", sr);
+            fflush(stderr);
             free(task_json);
         }
     }
