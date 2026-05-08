@@ -867,7 +867,6 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
         fprintf(stderr, "ws: pipe bridge ended admin=%d node=%d\n", admin_alive, node_alive);
 
     ws_send_close(sock);
-    close(sock);
     MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
 
     free(admin_buf); free(node_buf); free(admin_out); free(node_out);
