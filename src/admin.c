@@ -8,6 +8,14 @@
 #include <unistd.h>
 #include <curl/curl.h>
 #include <cjson/cJSON.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/sha.h>
+#include <openssl/bio.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 
 static char g_server[512] = "https://master.zep.lan:8443";
 static char g_cert_path[ZEP_MAX_PATH];
@@ -49,6 +57,256 @@ static CURL *curl_init(struct curl_buf *resp) {
         curl_easy_setopt(curl, CURLOPT_KEYPASSWD, g_key_password);
     if (g_verbose) curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
     return curl;
+}
+
+/* === WebSocket Client === */
+
+#define WS_MAGIC "258EAFA5-E914-47DA-95CA-5AB5AC88212E"
+#define WS_FRAME_MAX (32 * 1024 * 1024)
+#define WS_SUBCHUNK (128 * 1024)
+#define WS_OP_TEXT  0x01
+#define WS_OP_BIN   0x02
+#define WS_OP_CLOSE 0x08
+#define WS_OP_PING  0x09
+#define WS_OP_PONG  0x0A
+
+typedef struct {
+    int sock;
+    SSL *ssl;
+    SSL_CTX *ssl_ctx;
+} ws_conn_t;
+
+static size_t ws_build_frame(unsigned char *buf, size_t buf_size,
+                              unsigned char opcode, const unsigned char *payload, size_t payload_len) {
+    size_t header_len = 2;
+    if (payload_len >= 126) header_len += payload_len < 65536 ? 2 : 8;
+    if (buf_size < header_len + payload_len) return 0;
+    buf[0] = 0x80 | opcode;
+    if (payload_len < 126) {
+        buf[1] = (unsigned char)payload_len;
+    } else if (payload_len < 65536) {
+        buf[1] = 126;
+        buf[2] = (unsigned char)((payload_len >> 8) & 0xFF);
+        buf[3] = (unsigned char)(payload_len & 0xFF);
+    } else {
+        buf[1] = 127;
+        for (int i = 0; i < 8; i++)
+            buf[2 + i] = (unsigned char)((payload_len >> (56 - i * 8)) & 0xFF);
+    }
+    memcpy(buf + header_len, payload, payload_len);
+    return header_len + payload_len;
+}
+
+static ssize_t ws_ssl_read(ws_conn_t *wc, void *buf, size_t len) {
+    int n = SSL_read(wc->ssl, buf, (int)len);
+    if (n <= 0 && g_verbose) {
+        int err = SSL_get_error(wc->ssl, n);
+        fprintf(stderr, "ws: SSL_read error=%d\n", err);
+    }
+    return n;
+}
+
+static ssize_t ws_ssl_write(ws_conn_t *wc, const void *buf, size_t len) {
+    ssize_t total = 0;
+    while ((size_t)total < len) {
+        int n = SSL_write(wc->ssl, (const char *)buf + total, (int)(len - (size_t)total));
+        if (n <= 0) return total > 0 ? total : -1;
+        total += n;
+    }
+    return total;
+}
+
+static ssize_t ws_recv_frame(ws_conn_t *wc, unsigned char *out, size_t out_size,
+                              unsigned char *opcode_out) {
+    unsigned char hdr[14];
+    ssize_t n = ws_ssl_read(wc, hdr, 2);
+    if (g_verbose)
+        fprintf(stderr, "ws: recv hdr n=%zd\n", n);
+    if (n < 2) return -1;
+
+    uint64_t payload_len = hdr[1] & 0x7F;
+    size_t extra = 0;
+    if (payload_len == 126) extra = 2;
+    else if (payload_len == 127) extra = 8;
+
+    if (extra > 0) {
+        n = ws_ssl_read(wc, hdr + 2, extra);
+        if (n < (ssize_t)extra) return -1;
+        if (payload_len == 126)
+            payload_len = (hdr[2] << 8) | hdr[3];
+        else {
+            payload_len = 0;
+            for (int i = 0; i < 8; i++)
+                payload_len = (payload_len << 8) | hdr[2 + i];
+        }
+    }
+
+    if (g_verbose)
+        fprintf(stderr, "ws: recv payload_len=%lu\n", (unsigned long)payload_len);
+    if (payload_len > out_size) return -1;
+    if (payload_len == 0) {
+        *opcode_out = hdr[0] & 0x0F;
+        return 0;
+    }
+
+    ssize_t total = 0;
+    while ((size_t)total < payload_len) {
+        n = ws_ssl_read(wc, out + total, payload_len - (size_t)total);
+        if (n <= 0) return -1;
+        total += n;
+    }
+    *opcode_out = hdr[0] & 0x0F;
+    return (ssize_t)payload_len;
+}
+
+static int ws_send_frame_ssl(ws_conn_t *wc, unsigned char opcode,
+                              const unsigned char *payload, size_t payload_len) {
+    unsigned char frame[WS_FRAME_MAX + 14];
+    size_t flen = ws_build_frame(frame, sizeof(frame), opcode, payload, payload_len);
+    if (flen == 0) return -1;
+    return ws_ssl_write(wc, frame, flen) > 0 ? 0 : -1;
+}
+
+static int ws_send_data_ssl(ws_conn_t *wc, unsigned char opcode,
+                             const unsigned char *payload, size_t payload_len) {
+    return ws_send_frame_ssl(wc, opcode, payload, payload_len);
+}
+
+static ws_conn_t *ws_connect(const char *server_url, const char *path) {
+    /* Parse URL: https://host:port */
+    char host[512] = {0};
+    int port = 443;
+    const char *scheme = server_url;
+    if (strncmp(scheme, "https://", 8) == 0) scheme += 8;
+    else if (strncmp(scheme, "http://", 7) == 0) { port = 80; scheme += 7; }
+
+    const char *colon = strchr(scheme, ':');
+    const char *slash = strchr(scheme, '/');
+    if (colon && (!slash || colon < slash)) {
+        size_t hl = (size_t)(colon - scheme);
+        if (hl >= sizeof(host)) hl = sizeof(host) - 1;
+        memcpy(host, scheme, hl);
+        port = atoi(colon + 1);
+    } else if (slash) {
+        size_t hl = (size_t)(slash - scheme);
+        if (hl >= sizeof(host)) hl = sizeof(host) - 1;
+        memcpy(host, scheme, hl);
+    } else {
+        size_t sl = strlen(scheme);
+        if (sl >= sizeof(host)) sl = sizeof(host) - 1;
+        memcpy(host, scheme, sl);
+        host[sl] = '\0';
+    }
+
+    if (g_verbose)
+        fprintf(stderr, "ws: connecting to %s:%d%s\n", host, port, path);
+
+    /* Resolve host */
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
+        fprintf(stderr, "ws: cannot resolve %s\n", host);
+        return NULL;
+    }
+
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) { freeaddrinfo(res); return NULL; }
+
+    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+        if (g_verbose) fprintf(stderr, "ws: connect failed\n");
+        close(sock); freeaddrinfo(res); return NULL;
+    }
+    freeaddrinfo(res);
+
+    /* TLS */
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) { close(sock); return NULL; }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    if (SSL_CTX_use_certificate_file(ctx, g_cert_path, SSL_FILETYPE_PEM) != 1) {
+        SSL_CTX_free(ctx); close(sock); return NULL;
+    }
+    if (SSL_CTX_use_PrivateKey_file(ctx, g_key_path, SSL_FILETYPE_PEM) != 1) {
+        SSL_CTX_free(ctx); close(sock); return NULL;
+    }
+    if (g_ca_path[0]) SSL_CTX_load_verify_locations(ctx, g_ca_path, NULL);
+
+    SSL *ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, sock);
+    if (SSL_connect(ssl) <= 0) {
+        if (g_verbose) fprintf(stderr, "ws: SSL_connect failed\n");
+        SSL_free(ssl); SSL_CTX_free(ctx); close(sock); return NULL;
+    }
+    if (g_verbose) fprintf(stderr, "ws: TLS connected\n");
+
+    /* WebSocket handshake */
+    unsigned char key_bytes[16];
+    char key_b64[32];
+    for (int i = 0; i < 16; i++) key_bytes[i] = (unsigned char)(rand() & 0xFF);
+    BIO *b64 = BIO_new(BIO_f_base64());
+    BIO *bmem = BIO_new(BIO_s_mem());
+    b64 = BIO_push(b64, bmem);
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+    BIO_write(b64, key_bytes, 16);
+    BIO_flush(b64);
+    BUF_MEM *bptr;
+    BIO_get_mem_ptr(b64, &bptr);
+    snprintf(key_b64, sizeof(key_b64), "%.*s", (int)(bptr->length - 1), bptr->data);
+    BIO_free_all(b64);
+
+    char req[2048];
+    snprintf(req, sizeof(req),
+             "GET %s HTTP/1.1\r\n"
+             "Host: %s:%d\r\n"
+             "Upgrade: websocket\r\n"
+             "Connection: Upgrade\r\n"
+             "Sec-WebSocket-Key: %s\r\n"
+             "Sec-WebSocket-Version: 13\r\n"
+             "\r\n", path, host, port, key_b64);
+
+    SSL_write(ssl, req, (int)strlen(req));
+    if (g_verbose) fprintf(stderr, "ws: sent handshake request\n");
+
+    /* Read response */
+    char resp_buf[1024];
+    int resp_len = 0;
+    for (;;) {
+        int n = SSL_read(ssl, resp_buf + resp_len, sizeof(resp_buf) - resp_len - 1);
+        if (g_verbose) fprintf(stderr, "ws: SSL_read returned %d\n", n);
+        if (n <= 0) {
+            if (g_verbose) fprintf(stderr, "ws: SSL_read error\n");
+            SSL_free(ssl); SSL_CTX_free(ctx); close(sock); return NULL;
+        }
+        resp_len += n;
+        resp_buf[resp_len] = '\0';
+        if (strstr(resp_buf, "\r\n\r\n")) break;
+        if (resp_len >= (int)sizeof(resp_buf) - 1) break;
+    }
+    if (g_verbose) fprintf(stderr, "ws: got response: %.*s\n", resp_len, resp_buf);
+
+    if (strstr(resp_buf, "101") == NULL) {
+        fprintf(stderr, "ws: handshake failed: %.*s\n", resp_len, resp_buf);
+        SSL_free(ssl); SSL_CTX_free(ctx); close(sock); return NULL;
+    }
+
+    ws_conn_t *wc = calloc(1, sizeof(*wc));
+    wc->sock = sock;
+    wc->ssl = ssl;
+    wc->ssl_ctx = ctx;
+    return wc;
+}
+
+static void ws_close(ws_conn_t *wc) {
+    if (!wc) return;
+    if (wc->sock >= 0) {
+        shutdown(wc->sock, SHUT_WR);
+        close(wc->sock);
+    }
+    if (wc->ssl) SSL_free(wc->ssl);
+    if (wc->ssl_ctx) SSL_CTX_free(wc->ssl_ctx);
+    free(wc);
 }
 
 static int do_post(const char *path, const char *json_body) {
@@ -531,16 +789,59 @@ static int cmd_pipe(int argc, char *argv[]) {
     cJSON_Delete(init_resp);
 
     if (recv_mode) {
-        unsigned char *buf = malloc(ZEP_ADMIN_PIPE_CHUNK + 4);
+        char ws_path[1024];
+        snprintf(ws_path, sizeof(ws_path), "/v1/ws/pipe/%s", session);
+
+        if (g_verbose || progress)
+            fprintf(stderr, "pipe: recv session %s, opening WebSocket...\n", session);
+
+        ws_conn_t *wc = ws_connect(g_server, ws_path);
+        if (!wc) {
+            fprintf(stderr, "pipe: WebSocket connect failed, falling back to HTTP\n");
+            goto recv_http_fallback;
+        }
+
+        unsigned char *buf = malloc(WS_SUBCHUNK);
+        if (!buf) { fprintf(stderr, "pipe: OOM\n"); ws_close(wc); return 1; }
+        uint64_t sent = 0;
+
+        for (;;) {
+            size_t nread = fread(buf, 1, WS_SUBCHUNK, stdin);
+            if (g_verbose)
+                fprintf(stderr, "pipe: read %zu bytes from stdin\n", nread);
+            if (nread == 0) break;
+
+            int sr = ws_send_data_ssl(wc, WS_OP_BIN, buf, nread);
+            if (g_verbose)
+                fprintf(stderr, "pipe: ws_send returned %d\n", sr);
+            if (sr < 0) {
+                fprintf(stderr, "pipe: WebSocket send failed\n");
+                ws_close(wc);
+                free(buf);
+                return 1;
+            }
+            sent += nread;
+            if (progress)
+                fprintf(stderr, "\rpipe: %llu bytes sent", (unsigned long long)sent);
+        }
+        free(buf);
+
+        ws_send_frame_ssl(wc, WS_OP_CLOSE, NULL, 0);
+        ws_close(wc);
+
+        if (progress)
+            fprintf(stderr, "\npipe: recv complete — %llu bytes\n", (unsigned long long)sent);
+        return 0;
+
+recv_http_fallback:
+        {
+        unsigned char *buf = malloc(WS_SUBCHUNK + 4);
         if (!buf) { fprintf(stderr, "pipe: OOM\n"); return 1; }
         int part = 0;
         uint64_t sent = 0;
 
-        if (g_verbose || progress)
-            fprintf(stderr, "pipe: recv session %s, reading stdin...\n", session);
-
         for (;;) {
-            size_t nread = fread(buf + 4, 1, ZEP_ADMIN_PIPE_CHUNK, stdin);
+            size_t nread = fread(buf + 4, 1, WS_SUBCHUNK, stdin);
             if (nread == 0) break;
 
             uint32_t zer = 0;
@@ -634,20 +935,83 @@ static int cmd_pipe(int argc, char *argv[]) {
         if (progress)
             fprintf(stderr, "\npipe: recv complete — %llu bytes (%d chunks)\n",
                     (unsigned long long)sent, part);
+        }
         return 0;
     }
 
-    uint64_t total_size = 0, received = 0;
-    char poll_url[1024];
-    snprintf(poll_url, sizeof(poll_url), "%s/v1/admin/pipe/%s", g_server, session);
+    uint64_t received = 0;
+    char ws_path[1024];
+    snprintf(ws_path, sizeof(ws_path), "/v1/ws/pipe/%s", session);
 
     if (g_verbose || progress)
-        fprintf(stderr, "pipe: session %s, waiting for chunks...\n", session);
+        fprintf(stderr, "pipe: session %s, opening WebSocket...\n", session);
 
+    ws_conn_t *wc = ws_connect(g_server, ws_path);
+    if (!wc) {
+        fprintf(stderr, "pipe: WebSocket connect failed, falling back to HTTP poll\n");
+        goto http_fallback;
+    }
+
+    unsigned char *frame = malloc(WS_FRAME_MAX);
+    if (!frame) { ws_close(wc); return 1; }
+    unsigned char opcode = 0;
+    for (;;) {
+        ssize_t plen = ws_recv_frame(wc, frame, WS_FRAME_MAX, &opcode);
+        if (g_verbose)
+            fprintf(stderr, "ws: recv_frame returned %zd opcode=0x%02x\n", plen, opcode);
+        if (plen < 0) {
+            fprintf(stderr, "pipe: WebSocket read error\n");
+            ws_close(wc);
+            return 1;
+        }
+        if (opcode == WS_OP_CLOSE) {
+            ws_close(wc);
+            break;
+        }
+        if (opcode == WS_OP_PING) {
+            ws_send_frame_ssl(wc, WS_OP_PONG, frame, (size_t)plen);
+            continue;
+        }
+        if (opcode == WS_OP_PONG) continue;
+
+        if (plen > 0) {
+            if ((size_t)plen >= 4) {
+                uint32_t errlen;
+                memcpy(&errlen, frame, 4);
+                size_t stdout_len = (size_t)plen - 4 - (size_t)errlen;
+                if (stdout_len <= (size_t)plen - 4) {
+                    if (stdout_len > 0)
+                        fwrite(frame + 4, 1, stdout_len, stdout);
+                    if (errlen > 0)
+                        fwrite(frame + 4 + stdout_len, 1, errlen, stderr);
+                    fflush(stdout);
+                    fflush(stderr);
+                    received += stdout_len;
+                }
+            } else {
+                fwrite(frame, 1, (size_t)plen, stdout);
+                fflush(stdout);
+                received += (size_t)plen;
+            }
+            if (progress)
+                fprintf(stderr, "\rpipe: %llu bytes received", (unsigned long long)received);
+        }
+    }
+
+    if (progress)
+        fprintf(stderr, "\npipe: complete — %llu bytes\n", (unsigned long long)received);
+    free(frame);
+    return 0;
+
+http_fallback:
+    {
+    uint64_t total_size = 0;
+    char poll_url[1024];
+    snprintf(poll_url, sizeof(poll_url), "%s/v1/admin/pipe/%s", g_server, session);
     for (;;) {
         struct curl_buf pr = {0};
         CURL *pc = curl_easy_init();
-        if (!pc) { fprintf(stderr, "pipe: curl init failed\n"); return 1; }
+        if (!pc) return 1;
         curl_easy_setopt(pc, CURLOPT_URL, poll_url);
         curl_easy_setopt(pc, CURLOPT_WRITEFUNCTION, curl_write_cb);
         curl_easy_setopt(pc, CURLOPT_WRITEDATA, &pr);
@@ -660,35 +1024,27 @@ static int cmd_pipe(int argc, char *argv[]) {
         curl_easy_setopt(pc, CURLOPT_CONNECTTIMEOUT, 10L);
         if (g_key_password[0])
             curl_easy_setopt(pc, CURLOPT_KEYPASSWD, g_key_password);
-
         rc = curl_easy_perform(pc);
         curl_easy_getinfo(pc, CURLINFO_RESPONSE_CODE, &http_code);
-
         curl_off_t cl = 0;
         curl_easy_getinfo(pc, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
-
         curl_easy_cleanup(pc);
-
         if (rc != CURLE_OK) {
             fprintf(stderr, "pipe: curl error: %s\n", curl_easy_strerror(rc));
             free(pr.data);
             return 1;
         }
-
         if (http_code == 204) {
             free(pr.data);
             sleep(1);
             continue;
         }
-
         if (http_code != 200) {
             fprintf(stderr, "pipe: HTTP %ld — aborting\n", http_code);
             free(pr.data);
             return 1;
         }
-
         int is_done = (cl == 0);
-
         if (!is_done && pr.data && pr.len > 0) {
             if (pr.len >= 4) {
                 uint32_t errlen;
@@ -711,18 +1067,14 @@ static int cmd_pipe(int argc, char *argv[]) {
             if (total_size == 0) total_size = 1;
         }
         free(pr.data);
-
-        if (is_done) {
-            if (progress)
-                fprintf(stderr, "\npipe: complete — %llu bytes\n",
-                        (unsigned long long)received);
-            break;
-        }
-
+        if (is_done) break;
         if (progress && total_size > 0) {
             fprintf(stderr, "\rpipe: %llu bytes received", (unsigned long long)received);
             fflush(stderr);
         }
+    }
+    if (progress)
+        fprintf(stderr, "\npipe: complete — %llu bytes\n", (unsigned long long)received);
     }
     return 0;
 }

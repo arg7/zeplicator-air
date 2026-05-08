@@ -23,6 +23,13 @@
 #include <cjson/cJSON.h>
 #include <gnutls/gnutls.h>
 #include <gnutls/x509.h>
+#include <openssl/sha.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 
 static char g_storage_root[ZEP_MAX_PATH] = "/var/lib/zep-air";
 static char g_db_path[ZEP_MAX_PATH]       = "/var/lib/zep-air/zep-air.db";
@@ -57,9 +64,14 @@ struct pipe_session {
     uint64_t estimated_size;
     time_t created;
     time_t last_activity;
+    /* WebSocket fields */
+    int ws_sock;
+    int ws_connected;
+    int ws_closed;
+    pthread_mutex_t ws_lock;
 };
 
-#define ZEP_PIPE_MAX_CHUNKS 2
+#define ZEP_PIPE_MAX_CHUNKS 4
 static struct pipe_session *g_pipe_sessions = NULL;
 
 struct conn_ctx {
@@ -339,6 +351,10 @@ static struct pipe_session *pipe_session_create(const char *src_node,
     ps->direction = direction;
     ps->created = time(NULL);
     ps->last_activity = ps->created;
+    ps->ws_sock = -1;
+    ps->ws_connected = 0;
+    ps->ws_closed = 0;
+    pthread_mutex_init(&ps->ws_lock, NULL);
     ps->next = g_pipe_sessions;
     g_pipe_sessions = ps;
     return ps;
@@ -384,6 +400,8 @@ static void pipe_session_destroy(struct pipe_session *ps) {
         free(pc);
         pc = next;
     }
+    /* ws_sock is closed by MHD_upgrade_action, don't double-close */
+    pthread_mutex_destroy(&ps->ws_lock);
     free(ps);
 }
 
@@ -406,6 +424,389 @@ static void pipe_sessions_cleanup(void) {
         }
         ps = next;
     }
+}
+
+/* === WebSocket Support === */
+
+#define WS_MAGIC "258EAFA5-E914-47DA-95CA-5AB5AC88212E"
+#define WS_FRAME_MAX (32 * 1024 * 1024)
+#define WS_OP_TEXT  0x01
+#define WS_OP_BIN   0x02
+#define WS_OP_CLOSE 0x08
+#define WS_OP_PING  0x09
+#define WS_OP_PONG  0x0A
+
+static int ws_build_accept(const char *client_key, char *accept, size_t accept_size) {
+    unsigned char hash[SHA_DIGEST_LENGTH];
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s%s", client_key, WS_MAGIC);
+    SHA1((unsigned char *)buf, strlen(buf), hash);
+    BIO *b64 = BIO_new(BIO_f_base64());
+    BIO *bmem = BIO_new(BIO_s_mem());
+    b64 = BIO_push(b64, bmem);
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+    BIO_write(b64, hash, SHA_DIGEST_LENGTH);
+    BIO_flush(b64);
+    BUF_MEM *bptr;
+    BIO_get_mem_ptr(b64, &bptr);
+    snprintf(accept, accept_size, "%.*s", (int)(bptr->length - 1), bptr->data);
+    BIO_free_all(b64);
+    return 0;
+}
+
+static ssize_t ws_parse_frame(const unsigned char *buf, size_t buf_len,
+                               unsigned char *out, size_t out_size,
+                               unsigned char *opcode_out) {
+    if (buf_len < 2) return -1;
+    unsigned char opcode = buf[0] & 0x0F;
+    int masked = (buf[1] >> 7) & 1;
+    uint64_t payload_len = buf[1] & 0x7F;
+    size_t header_len = 2;
+    if (payload_len == 126) {
+        if (buf_len < 4) return -1;
+        payload_len = (buf[2] << 8) | buf[3];
+        header_len = 4;
+    } else if (payload_len == 127) {
+        if (buf_len < 10) return -1;
+        payload_len = 0;
+        for (int i = 0; i < 8; i++)
+            payload_len = (payload_len << 8) | buf[2 + i];
+        header_len = 10;
+    }
+    size_t mask_offset = header_len;
+    if (masked) {
+        header_len += 4;
+        if (buf_len < header_len) return -1;
+    }
+    if (payload_len > out_size) return -1;
+    if (buf_len < header_len + payload_len) return -1;
+    const unsigned char *mask = masked ? buf + mask_offset : NULL;
+    for (size_t i = 0; i < payload_len; i++)
+        out[i] = masked ? buf[header_len + i] ^ mask[i % 4] : buf[header_len + i];
+    *opcode_out = opcode;
+    return (ssize_t)payload_len;
+}
+
+static size_t ws_build_frame(unsigned char *buf, size_t buf_size,
+                              unsigned char opcode, const unsigned char *payload, size_t payload_len) {
+    size_t header_len = 2;
+    if (payload_len >= 126) header_len += payload_len < 65536 ? 2 : 8;
+    if (buf_size < header_len + payload_len) return 0;
+    buf[0] = 0x80 | opcode;
+    if (payload_len < 126) {
+        buf[1] = (unsigned char)payload_len;
+    } else if (payload_len < 65536) {
+        buf[1] = 126;
+        buf[2] = (unsigned char)((payload_len >> 8) & 0xFF);
+        buf[3] = (unsigned char)(payload_len & 0xFF);
+    } else {
+        buf[1] = 127;
+        for (int i = 0; i < 8; i++)
+            buf[2 + i] = (unsigned char)((payload_len >> (56 - i * 8)) & 0xFF);
+    }
+    memcpy(buf + header_len, payload, payload_len);
+    return header_len + payload_len;
+}
+
+#define WS_SUBCHUNK (128 * 1024)
+
+static ssize_t ws_send_frame(int sock, unsigned char opcode,
+                              const unsigned char *payload, size_t payload_len) {
+    unsigned char *frame = malloc(payload_len + 14);
+    if (!frame) return -1;
+    size_t flen = ws_build_frame(frame, payload_len + 14, opcode, payload, payload_len);
+    if (flen == 0) {
+        fprintf(stderr, "ws: build_frame failed for opcode=0x%02x len=%zu\n", opcode, payload_len);
+        free(frame);
+        return -1;
+    }
+    ssize_t sent = 0;
+    while ((size_t)sent < flen) {
+        ssize_t n = send(sock, frame + sent, flen - (size_t)sent, MSG_NOSIGNAL);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(sock, &wfds);
+            struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+            if (select(sock + 1, NULL, &wfds, NULL, &tv) <= 0) {
+                fprintf(stderr, "ws: send timeout\n");
+                free(frame);
+                return -1;
+            }
+            continue;
+        }
+        if (n <= 0) {
+            fprintf(stderr, "ws: send failed: n=%zd errno=%d (%s)\n",
+                    n, errno, strerror(errno));
+            free(frame);
+            return -1;
+        }
+        sent += n;
+    }
+    free(frame);
+    return (ssize_t)flen;
+}
+
+/* Send data as a single WS frame on a blocking socket */
+static int ws_send_data(int sock, unsigned char opcode,
+                         const unsigned char *payload, size_t payload_len) {
+    if (g_verbose)
+        fprintf(stderr, "ws: send opcode=0x%02x len=%zu\n", opcode, payload_len);
+    unsigned char *frame = malloc(payload_len + 14);
+    if (!frame) return -1;
+    size_t flen = ws_build_frame(frame, payload_len + 14, opcode, payload, payload_len);
+    if (flen == 0) { free(frame); return -1; }
+    ssize_t sent = 0;
+    while ((size_t)sent < flen) {
+        ssize_t n = send(sock, frame + sent, flen - (size_t)sent, MSG_NOSIGNAL);
+        if (n <= 0) {
+            if (g_verbose)
+                fprintf(stderr, "ws: send failed: n=%zd errno=%d\n", n, errno);
+            free(frame);
+            return -1;
+        }
+        sent += n;
+    }
+    free(frame);
+    return 0;
+}
+
+static void ws_send_close(int sock) {
+    unsigned char frame[6];
+    size_t flen = ws_build_frame(frame, sizeof(frame), WS_OP_CLOSE, NULL, 0);
+    send(sock, frame, flen, MSG_NOSIGNAL);
+}
+
+/* WebSocket upgrade handler: bridges admin WS ↔ node HTTP chunks */
+struct ws_bridge_ctx {
+    struct pipe_session *session;
+    int sock;
+    struct MHD_UpgradeResponseHandle *urh;
+};
+
+static void ws_make_blocking(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags == -1) return;
+    if (flags & O_NONBLOCK)
+        fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+}
+
+static void *ws_bridge_thread(void *arg) {
+    struct ws_bridge_ctx *ctx = (struct ws_bridge_ctx *)arg;
+    struct pipe_session *ps = ctx->session;
+    int sock = ctx->sock;
+    struct MHD_UpgradeResponseHandle *urh = ctx->urh;
+    free(ctx);
+
+    /* MHD gives us a non-blocking socket; make it blocking for ws_send_data */
+    ws_make_blocking(sock);
+
+    unsigned char *buf = malloc(WS_SUBCHUNK);
+    unsigned char *out = malloc(WS_SUBCHUNK);
+    unsigned char opcode = 0;
+    if (!buf || !out) { free(buf); free(out); MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return NULL; }
+
+    /* Drain any queued chunks from before WS connected (send direction) */
+    if (ps->direction == 0) {
+        if (g_verbose) fprintf(stderr, "ws: draining queued chunks\n");
+        pthread_mutex_lock(&ps->ws_lock);
+        while (ps->chunks_head) {
+            struct pipe_chunk *pc = ps->chunks_head;
+            ps->chunks_head = pc->next;
+            ps->chunk_count--;
+            pthread_mutex_unlock(&ps->ws_lock);
+            if (g_verbose)
+                fprintf(stderr, "ws: draining chunk %d (%zu bytes)\n", pc->part, pc->len);
+            if (ws_send_data(sock, WS_OP_BIN, pc->data, pc->len) < 0) {
+                if (g_verbose) fprintf(stderr, "ws: drain send failed\n");
+                free(pc->data); free(pc);
+                goto ws_done;
+            }
+            free(pc->data); free(pc);
+            pthread_mutex_lock(&ps->ws_lock);
+        }
+        if (!ps->chunks_head) ps->chunks_tail = NULL;
+        pthread_mutex_unlock(&ps->ws_lock);
+    }
+
+    if (g_verbose)
+        fprintf(stderr, "ws: bridge started sock=%d dir=%d\n", sock, ps->direction);
+    for (;;) {
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(sock, &rfds);
+        int sel = select(sock + 1, &rfds, NULL, NULL, &tv);
+
+        if (sel > 0 && FD_ISSET(sock, &rfds)) {
+            ssize_t n = recv(sock, buf, WS_SUBCHUNK, 0);
+            if (g_verbose)
+                fprintf(stderr, "ws: bridge recv n=%zd\n", n);
+            if (n <= 0) break;
+
+            ssize_t plen = ws_parse_frame(buf, (size_t)n, out, WS_SUBCHUNK, &opcode);
+            if (g_verbose)
+                fprintf(stderr, "ws: bridge parse plen=%zd opcode=0x%02x\n", plen, opcode);
+            if (plen < 0) break;
+
+            if (opcode == WS_OP_CLOSE) {
+                ws_send_close(sock);
+                break;
+            }
+            if (opcode == WS_OP_PING) {
+                ws_send_frame(sock, WS_OP_PONG, out, (size_t)plen);
+                continue;
+            }
+            if (opcode == WS_OP_PONG) continue;
+
+            /* Admin→node (recv direction): store for node HTTP poll */
+            if ((opcode == WS_OP_BIN || opcode == WS_OP_TEXT) && ps->direction == 1) {
+                pthread_mutex_lock(&ps->ws_lock);
+                struct pipe_chunk *pc = calloc(1, sizeof(*pc));
+                if (pc) {
+                    pc->data = malloc((size_t)plen);
+                    if (pc->data) {
+                        memcpy(pc->data, out, (size_t)plen);
+                        pc->len = (size_t)plen;
+                        pc->part = ps->chunk_count;
+                        pc->next = NULL;
+                        if (!ps->chunks_head) ps->chunks_head = pc;
+                        else ps->chunks_tail->next = pc;
+                        ps->chunks_tail = pc;
+                        ps->chunk_count++;
+                    } else { free(pc); }
+                }
+                pthread_mutex_unlock(&ps->ws_lock);
+            }
+        }
+
+        /* Forward node→admin chunks (send direction) */
+        pthread_mutex_lock(&ps->ws_lock);
+        struct pipe_chunk *pc = ps->chunks_head;
+        if (pc) {
+            ps->chunks_head = pc->next;
+            if (!ps->chunks_head) ps->chunks_tail = NULL;
+            ps->chunk_count--;
+            pthread_mutex_unlock(&ps->ws_lock);
+
+            if (ws_send_data(sock, WS_OP_BIN, pc->data, pc->len) < 0) {
+                free(pc->data); free(pc);
+                break;
+            }
+            free(pc->data); free(pc);
+        } else if (ps->done) {
+            pthread_mutex_unlock(&ps->ws_lock);
+            ws_send_close(sock);
+            break;
+        } else {
+            pthread_mutex_unlock(&ps->ws_lock);
+        }
+    }
+
+ws_done:
+    pthread_mutex_lock(&ps->ws_lock);
+    ps->ws_connected = 0;
+    ps->ws_closed = 1;
+    pthread_mutex_unlock(&ps->ws_lock);
+    MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
+    free(buf);
+    free(out);
+    return NULL;
+}
+
+/* Send node chunk directly to admin WS socket (send direction) */
+static int ws_send_node_chunk(struct pipe_session *ps, const void *data, size_t len) {
+    pthread_mutex_lock(&ps->ws_lock);
+    int ret = 0;
+    if (ps->ws_connected && !ps->ws_closed && ps->ws_sock >= 0) {
+        if (ws_send_data(ps->ws_sock, WS_OP_BIN, data, len) < 0) {
+            fprintf(stderr, "ws: send_node_chunk failed sock=%d connected=%d closed=%d\n",
+                    ps->ws_sock, ps->ws_connected, ps->ws_closed);
+            ps->ws_closed = 1;
+            ret = -1;
+        }
+    } else {
+        fprintf(stderr, "ws: send_node_chunk skipped sock=%d connected=%d closed=%d\n",
+                ps->ws_sock, ps->ws_connected, ps->ws_closed);
+        ret = -1;
+    }
+    pthread_mutex_unlock(&ps->ws_lock);
+    return ret;
+}
+
+static void ws_upgrade_handler(void *cls, struct MHD_Connection *conn,
+                                void *con_cls, const char *extra_in,
+                                size_t extra_in_size, int sock,
+                                struct MHD_UpgradeResponseHandle *urh) {
+    (void)cls; (void)conn; (void)con_cls;
+    (void)extra_in; (void)extra_in_size;
+
+    const char *token = (const char *)cls;
+    if (!token) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
+
+    struct pipe_session *ps = pipe_session_find(token);
+    if (!ps) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
+
+    pthread_mutex_lock(&ps->ws_lock);
+    if (ps->ws_connected) {
+        pthread_mutex_unlock(&ps->ws_lock);
+        ws_send_close(sock);
+        MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
+        return;
+    }
+    ps->ws_sock = sock;
+    ps->ws_connected = 1;
+    ps->ws_closed = 0;
+    pthread_mutex_unlock(&ps->ws_lock);
+
+    struct ws_bridge_ctx *ctx = malloc(sizeof(*ctx));
+    ctx->session = ps;
+    ctx->sock = sock;
+    ctx->urh = urh;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, ws_bridge_thread, ctx);
+    pthread_detach(tid);
+}
+
+static enum MHD_Result ws_handle_pipe(struct MHD_Connection *conn,
+                                       const char *token) {
+    if (g_verbose)
+        fprintf(stderr, "ws: upgrade request for session %s\n", token);
+
+    const char *upgrade = MHD_lookup_connection_value(conn, MHD_HEADER_KIND,
+                                                       "Upgrade");
+    const char *ws_key = MHD_lookup_connection_value(conn, MHD_HEADER_KIND,
+                                                      "Sec-WebSocket-Key");
+    const char *ws_ver = MHD_lookup_connection_value(conn, MHD_HEADER_KIND,
+                                                      "Sec-WebSocket-Version");
+
+    if (!upgrade || strcasecmp(upgrade, "websocket") != 0)
+        return send_error(conn, 400, "Upgrade: websocket required");
+    if (!ws_key || !ws_key[0])
+        return send_error(conn, 400, "Sec-WebSocket-Key required");
+    if (!ws_ver || strcmp(ws_ver, "13") != 0)
+        return send_error(conn, 400, "Sec-WebSocket-Version: 13 required");
+
+    struct pipe_session *ps = pipe_session_find(token);
+    if (!ps) return send_error(conn, 404, "Session not found");
+
+    char accept[128];
+    ws_build_accept(ws_key, accept, sizeof(accept));
+
+    struct MHD_Response *resp = MHD_create_response_for_upgrade(
+        &ws_upgrade_handler, (void *)ps->token);
+    if (!resp) return send_error(conn, 500, "Failed to create upgrade response");
+
+    MHD_add_response_header(resp, "Upgrade", "websocket");
+    MHD_add_response_header(resp, "Connection", "Upgrade");
+    MHD_add_response_header(resp, "Sec-WebSocket-Accept", accept);
+
+    if (g_verbose)
+        fprintf(stderr, "ws: queuing 101 for session %s\n", token);
+    enum MHD_Result ret = MHD_queue_response(conn, 101, resp);
+    MHD_destroy_response(resp);
+    return ret;
 }
 
 static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
@@ -925,12 +1326,20 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             if (strncmp(rest, "config/", 7) == 0) {
                 const char *key = rest + 7;
                 if (!key[0]) return send_error(conn, 400, "Missing key");
+                if (g_verbose)
+                    fprintf(stderr, "config set: key=%s body_len=%zu body=%.*s\n",
+                            key, ctx->body_len, (int)ctx->body_len, ctx->body);
                 cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
                 if (json) {
                     cJSON *val = cJSON_GetObjectItem(json, "value");
-                    if (val && cJSON_IsString(val))
-                        db_config_set(g_db, key, val->valuestring);
+                    if (val && cJSON_IsString(val)) {
+                        err_t ret = db_config_set(g_db, key, val->valuestring);
+                        if (g_verbose)
+                            fprintf(stderr, "config set: db_config_set returned %d\n", ret);
+                    }
                     cJSON_Delete(json);
+                } else if (g_verbose) {
+                    fprintf(stderr, "config set: JSON parse failed\n");
                 }
                 return send_json(conn, 200, "{\"ok\":true}");
             }
@@ -1026,6 +1435,13 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         return send_error(conn, 404, "Admin endpoint not found");
     }
 
+    /* ── WebSocket pipe endpoint ── */
+    if (strncmp(ctx->target_url, "/v1/ws/pipe/", 12) == 0) {
+        const char *token = ctx->target_url + 12;
+        if (!token[0]) return send_error(conn, 400, "Missing session token");
+        return ws_handle_pipe(conn, token);
+    }
+
     /* ── pipe node endpoints (mTLS authenticated, not admin) ── */
     if (strncmp(ctx->target_url, "/v1/pipe/", 9) == 0) {
         const char *rest = ctx->target_url + 9;
@@ -1039,8 +1455,21 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             snprintf(token, sizeof(token), "%s", rest);
         }
 
+        if (g_verbose)
+            fprintf(stderr, "pipe: node request token=%s method=%s url=%s\n",
+                    token, ctx->method, ctx->target_url);
+
         struct pipe_session *ps = pipe_session_find(token);
-        if (!ps) return send_error(conn, 404, "Session not found");
+        if (!ps) {
+            if (g_verbose)
+                fprintf(stderr, "pipe: session not found, dumping sessions:\n");
+            for (struct pipe_session *s = g_pipe_sessions; s; s = s->next) {
+                if (g_verbose)
+                    fprintf(stderr, "  session=%s node=%s dir=%d done=%d ws=%d\n",
+                            s->token, s->src_node, s->direction, s->done, s->ws_connected);
+            }
+            return send_error(conn, 404, "Session not found");
+        }
 
         /* GET /v1/pipe/<s> — node downloads next chunk (recv direction) */
         if (strcmp(ctx->method, "GET") == 0 && !slash) {
@@ -1084,8 +1513,27 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             }
             if (strncmp(sub, "chunk/", 6) == 0) {
                 int part = atoi(sub + 6);
-                if (pipe_session_add_chunk(ps, part, ctx->body, ctx->body_len) != 0)
-                    return send_error(conn, 503, "Pipe queue full, retry");
+                (void)part;
+                if (ps->direction == 0) {
+                    /* Send direction: try direct WS, fall back to queue */
+                    if (ws_send_node_chunk(ps, ctx->body, ctx->body_len) != 0) {
+                        if (g_verbose)
+                            fprintf(stderr, "pipe: WS send failed, queuing chunk\n");
+                        pthread_mutex_lock(&ps->ws_lock);
+                        int ret = pipe_session_add_chunk(ps, part, ctx->body, ctx->body_len);
+                        pthread_mutex_unlock(&ps->ws_lock);
+                        if (ret != 0)
+                            return send_error(conn, 503, "Pipe queue full, retry");
+                    }
+                } else {
+                    /* Recv direction: store for node HTTP poll */
+                    pthread_mutex_lock(&ps->ws_lock);
+                    int ret = pipe_session_add_chunk(ps, part, ctx->body, ctx->body_len);
+                    pthread_mutex_unlock(&ps->ws_lock);
+                    if (ret != 0)
+                        return send_error(conn, 503, "Pipe queue full, retry");
+                }
+                ps->last_activity = time(NULL);
                 return send_json(conn, 200, "{\"ok\":true}");
             }
         }
@@ -1097,6 +1545,11 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             char pipe_key[128];
             snprintf(pipe_key, sizeof(pipe_key), "pipe_task_%s", ps->src_node);
             db_config_set(g_db, pipe_key, "");
+            /* Signal done via WebSocket close frame */
+            pthread_mutex_lock(&ps->ws_lock);
+            if (ps->ws_connected && !ps->ws_closed && ps->ws_sock >= 0)
+                ws_send_close(ps->ws_sock);
+            pthread_mutex_unlock(&ps->ws_lock);
             if (g_verbose)
                 fprintf(stderr, "pipe: session %s done, released %s\n", token, ps->src_node);
             return send_json(conn, 200, "{\"ok\":true}");
@@ -1643,7 +2096,7 @@ int serve_main(int argc, char *argv[]) {
         }
     }
 
-    unsigned int flags = MHD_USE_TLS | MHD_USE_AUTO | MHD_USE_INTERNAL_POLLING_THREAD;
+    unsigned int flags = MHD_USE_TLS | MHD_USE_AUTO | MHD_USE_INTERNAL_POLLING_THREAD | MHD_ALLOW_UPGRADE;
 
     g_daemon = MHD_start_daemon(flags, (unsigned int)g_port, NULL, NULL,
                                  &handle_request, NULL,

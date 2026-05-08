@@ -753,6 +753,7 @@ static int cmd_cron(int argc, char *argv[]) {
                 }
 
                 size_t chunk_size = cfg2.chunk_size;
+                if (chunk_size > 131072) chunk_size = 131072;
                 unsigned char *buf = malloc(chunk_size + 65536 + 4);
                 if (!buf) {
                     pclose(send_fp);
