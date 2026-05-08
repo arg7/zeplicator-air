@@ -235,6 +235,7 @@ static void *ws_node_pipe_thread(void *arg) {
         FILE *cmd_fp = NULL;
         char cmd_errfile[256] = {0};
         int in_pipe = 0;
+        int pipe_recv_mode = 0;
 
         for (;;) {
             ssize_t n = ws_node_recv_frame(ssl, out, WS_NODE_FRAME_MAX, &buf[0]);
@@ -261,8 +262,10 @@ static void *ws_node_pipe_thread(void *arg) {
                     if (task) {
                         cJSON *action = cJSON_GetObjectItem(task, "action");
                         cJSON *command = cJSON_GetObjectItem(task, "command");
+                        cJSON *dir = cJSON_GetObjectItem(task, "direction");
                         if (action && command && cJSON_IsString(action) && cJSON_IsString(command)) {
                             if (strcmp(action->valuestring, "pipe") == 0) {
+                                int recv_mode = (dir && cJSON_IsString(dir) && strcmp(dir->valuestring, "recv") == 0);
                                 char resolved[4096];
                                 snprintf(resolved, sizeof(resolved), "%s", command->valuestring);
                                 char errfile[] = "/tmp/zep-pipe-err-XXXXXX";
@@ -275,10 +278,11 @@ static void *ws_node_pipe_thread(void *arg) {
                                     snprintf(full_cmd, sizeof(full_cmd), "%s", resolved);
                                     cmd_errfile[0] = '\0';
                                 }
-                                cmd_fp = popen(full_cmd, "w");
+                                cmd_fp = popen(full_cmd, recv_mode ? "w" : "r");
+                                pipe_recv_mode = recv_mode;
                                 if (cmd_fp) {
                                     in_pipe = 1;
-                                    fprintf(stderr, "ws-node: pipe started: %s\n", resolved);
+                                    fprintf(stderr, "ws-node: pipe started (%s): %s\n", recv_mode ? "recv" : "send", resolved);
                                 } else {
                                     fprintf(stderr, "ws-node: popen failed: %s\n", resolved);
                                 }
@@ -287,8 +291,27 @@ static void *ws_node_pipe_thread(void *arg) {
                         cJSON_Delete(task);
                     }
                 } else if (in_pipe && cmd_fp && n > 0) {
-                    fwrite(out, 1, (size_t)n, cmd_fp);
-                    fflush(cmd_fp);
+                    if (pipe_recv_mode) {
+                        fwrite(out, 1, (size_t)n, cmd_fp);
+                        fflush(cmd_fp);
+                    }
+                }
+            }
+
+            /* Send command stdout to server (send mode) */
+            if (in_pipe && cmd_fp && !pipe_recv_mode) {
+                size_t nread = fread(out, 1, WS_NODE_FRAME_MAX, cmd_fp);
+                if (nread > 0) {
+                    ws_node_send_frame(ssl, WS_NODE_OP_BIN, out, nread);
+                }
+                if (feof(cmd_fp)) {
+                    pclose(cmd_fp);
+                    cmd_fp = NULL;
+                    if (cmd_errfile[0]) unlink(cmd_errfile);
+                    in_pipe = 0;
+                    fprintf(stderr, "ws-node: pipe done\n");
+                    /* Send CLOSE frame */
+                    ws_node_send_frame(ssl, WS_NODE_OP_CLOSE, NULL, 0);
                 }
             }
         }

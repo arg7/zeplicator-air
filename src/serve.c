@@ -54,14 +54,10 @@ struct node_ws {
     pthread_mutex_t lock;
     time_t last_ping;
     time_t last_pong;
-    /* Pipe bridge fields */
-    int pipe_active;
-    int pipe_admin_sock;
-    struct MHD_UpgradeResponseHandle *pipe_admin_urh;
-    pthread_mutex_t pipe_lock;
-    /* Thread for WS loop */
+    /* Pipe coordination */
+    int pipe_starting;
+    int pipe_done;
     pthread_t thread;
-    int thread_running;
 };
 
 #define MAX_NODE_WS 64
@@ -514,6 +510,12 @@ static void ws_make_blocking(int fd) {
         fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
 }
 
+static void ws_send_close(int sock) {
+    unsigned char frame[6];
+    size_t flen = ws_build_frame(frame, sizeof(frame), WS_OP_CLOSE, NULL, 0);
+    send(sock, frame, flen, MSG_NOSIGNAL);
+}
+
 static void ws_set_keepalive(int fd) {
     int keepalive = 1;
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
@@ -547,21 +549,22 @@ static void *node_ws_thread(void *arg) {
     fflush(stderr);
 
     time_t last_ping = time(NULL);
-    FILE *cmd_fp = NULL;
-    char cmd_errfile[256] = {0};
-    int in_pipe = 0;
-    int pipe_recv_mode = 0;
-
     for (;;) {
+        /* Check if pipe is starting — exit so bridge can take over */
+        pthread_mutex_lock(&nw->lock);
+        int exiting = nw->pipe_starting;
+        pthread_mutex_unlock(&nw->lock);
+        if (exiting) {
+            fprintf(stderr, "ws: node %s exiting for pipe bridge\n", nw->cn);
+            fflush(stderr);
+            break;
+        }
+
         struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(sock, &rfds);
         int sel = select(sock + 1, &rfds, NULL, NULL, &tv);
-        if (sel > 0) {
-            fprintf(stderr, "ws: node %s select returned %d\n", nw->cn, sel);
-            fflush(stderr);
-        }
 
         time_t now = time(NULL);
         if (now - last_ping >= 60) {
@@ -571,14 +574,10 @@ static void *node_ws_thread(void *arg) {
 
         if (sel > 0 && FD_ISSET(sock, &rfds)) {
             ssize_t n = recv(sock, buf, WS_SUBCHUNK, 0);
-            if (g_verbose)
-                fprintf(stderr, "ws: node %s recv n=%zd\n", nw->cn, n);
             if (n <= 0) break;
 
             ssize_t plen = ws_parse_frame(buf, (size_t)n, out, WS_SUBCHUNK, &buf[0]);
             unsigned char opcode = buf[0] & 0x0F;
-            if (g_verbose)
-                fprintf(stderr, "ws: node %s parse plen=%zd opcode=0x%02x\n", nw->cn, plen, opcode);
             if (plen < 0) break;
 
             if (opcode == WS_OP_CLOSE) break;
@@ -590,88 +589,25 @@ static void *node_ws_thread(void *arg) {
                 nw->last_pong = time(NULL);
                 continue;
             }
-
-            /* Handle pipe task or data */
-            if (opcode == WS_OP_TEXT && !in_pipe && plen > 0) {
-                out[plen] = '\0';
-                cJSON *task = cJSON_Parse((char *)out);
-                if (task) {
-                    cJSON *action = cJSON_GetObjectItem(task, "action");
-                    cJSON *command = cJSON_GetObjectItem(task, "command");
-                    cJSON *dir = cJSON_GetObjectItem(task, "direction");
-                    if (action && command && cJSON_IsString(action) && cJSON_IsString(command)) {
-                        if (strcmp(action->valuestring, "pipe") == 0) {
-                            int recv_mode = (dir && cJSON_IsString(dir) && strcmp(dir->valuestring, "recv") == 0);
-                            char resolved[4096];
-                            snprintf(resolved, sizeof(resolved), "%s", command->valuestring);
-                            char errfile[] = "/tmp/zep-pipe-err-XXXXXX";
-                            int err_fd = mkstemp(errfile);
-                            char full_cmd[4096 + 256];
-                            if (err_fd >= 0) {
-                                snprintf(full_cmd, sizeof(full_cmd), "(%s) 2>%s", resolved, errfile);
-                                snprintf(cmd_errfile, sizeof(cmd_errfile), "%s", errfile);
-                            } else {
-                                snprintf(full_cmd, sizeof(full_cmd), "%s", resolved);
-                                cmd_errfile[0] = '\0';
-                            }
-                            if (recv_mode) {
-                                /* Admin sends data → node stdin */
-                                cmd_fp = popen(full_cmd, "w");
-                            } else {
-                                /* Node stdout → admin receives data */
-                                cmd_fp = popen(full_cmd, "r");
-                            }
-                            if (cmd_fp) {
-                                in_pipe = 1;
-                                pipe_recv_mode = recv_mode;
-                                if (g_verbose)
-                                    fprintf(stderr, "ws: node %s pipe started (%s): %s\n", nw->cn, recv_mode ? "recv" : "send", resolved);
-                            } else {
-                                fprintf(stderr, "ws: node %s popen failed: %s\n", nw->cn, resolved);
-                            }
-                        }
-                    }
-                    cJSON_Delete(task);
-                }
-            } else if (in_pipe && cmd_fp && (opcode == WS_OP_BIN || opcode == WS_OP_TEXT) && plen > 0) {
-                if (pipe_recv_mode) {
-                    /* Write to command stdin */
-                    fwrite(out, 1, (size_t)plen, cmd_fp);
-                    fflush(cmd_fp);
-                }
-            }
-
-            /* Read from command stdout and send to admin (send mode) */
-            if (in_pipe && cmd_fp && !pipe_recv_mode) {
-                size_t nread = fread(out, 1, WS_SUBCHUNK, cmd_fp);
-                if (nread > 0) {
-                    ws_send_frame(sock, WS_OP_BIN, out, nread);
-                }
-            }
         }
 
         if (time(NULL) - nw->last_pong > 180) break;
     }
 
-    if (g_verbose)
-        fprintf(stderr, "ws: node %s disconnected\n", nw->cn);
-
-    if (cmd_fp) {
-        pclose(cmd_fp);
-        if (cmd_errfile[0]) unlink(cmd_errfile);
-    }
+    fprintf(stderr, "ws: node %s disconnected\n", nw->cn);
+    fflush(stderr);
 
     free(buf); free(out);
 
-    /* Clear pipe state */
+    /* If exiting for pipe, don't close socket — bridge thread will handle it */
     pthread_mutex_lock(&nw->lock);
-    nw->pipe_active = 0;
-    nw->pipe_admin_sock = -1;
-    nw->pipe_admin_urh = NULL;
+    int for_pipe = nw->pipe_starting;
     pthread_mutex_unlock(&nw->lock);
 
-    node_ws_unregister(nw->cn);
-    MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
+    if (!for_pipe) {
+        node_ws_unregister(nw->cn);
+        MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
+    }
     return NULL;
 }
 
@@ -697,7 +633,6 @@ static void ws_node_upgrade_handler(void *cls, struct MHD_Connection *conn,
     ctx->urh = urh;
     pthread_create(&nw->thread, NULL, node_ws_thread, ctx);
     pthread_detach(nw->thread);
-    nw->thread_running = 1;
 }
 
 /* Admin pipe WS upgrade handler - bridges to node WS */
@@ -720,43 +655,113 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
         MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
         return;
     }
-    fprintf(stderr, "ws: pipe found node %s sock=%d\n", node_cn, nw->sock);
-    fflush(stderr);
+    if (g_verbose)
+        fprintf(stderr, "ws: pipe found node %s sock=%d\n", node_cn, nw->sock);
 
-    /* Signal node thread that pipe is starting */
+    /* Signal node thread to exit so we can take over the socket */
     pthread_mutex_lock(&nw->lock);
-    nw->pipe_active = 1;
-    nw->pipe_admin_sock = sock;
-    nw->pipe_admin_urh = urh;
+    nw->pipe_starting = 1;
+    int node_sock = nw->sock;
     pthread_mutex_unlock(&nw->lock);
+
+    /* Wait for node thread to exit */
+    usleep(200000);
+    if (g_verbose)
+        fprintf(stderr, "ws: pipe taking over node sock=%d\n", node_sock);
 
     /* Send task JSON to node */
     const char *direction = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "direction");
     const char *command = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "command");
+    int recv_mode = (direction && strcmp(direction, "recv") == 0);
+
     if (command) {
         char *task_json = NULL;
         if (asprintf(&task_json, "{\"action\":\"pipe\",\"command\":\"%s\",\"direction\":\"%s\"}",
                      command, direction ? direction : "send") > 0) {
             if (g_verbose)
                 fprintf(stderr, "ws: sending task to node: %s\n", task_json);
-            ws_send_frame(nw->sock, WS_OP_TEXT, (unsigned char *)task_json, strlen(task_json));
+            ws_send_frame(node_sock, WS_OP_TEXT, (unsigned char *)task_json, strlen(task_json));
             free(task_json);
         }
     }
 
-    /* Node thread will handle the pipe - this handler just waits for completion */
-    /* The node thread will close both sockets when done */
-    /* We need to wait here for the pipe to complete */
+    /* Bridge: admin socket ↔ node socket */
+    ws_make_blocking(sock);
+    ws_make_blocking(node_sock);
+    unsigned char *admin_buf = malloc(WS_SUBCHUNK);
+    unsigned char *node_buf = malloc(WS_SUBCHUNK);
+    unsigned char *admin_out = malloc(WS_SUBCHUNK);
+    unsigned char *node_out = malloc(WS_SUBCHUNK);
+    if (!admin_buf || !node_buf || !admin_out || !node_out) {
+        free(admin_buf); free(node_buf); free(admin_out); free(node_out);
+        MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
+        return;
+    }
+
+    int admin_alive = 1, node_alive = 1;
     for (;;) {
-        pthread_mutex_lock(&nw->lock);
-        int done = !nw->pipe_active;
-        pthread_mutex_unlock(&nw->lock);
-        if (done) break;
-        usleep(50000);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        int maxfd = 0;
+        if (admin_alive) { FD_SET(sock, &rfds); if (sock > maxfd) maxfd = sock; }
+        if (node_alive) { FD_SET(node_sock, &rfds); if (node_sock > maxfd) maxfd = node_sock; }
+        int sel = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+
+        if (sel > 0) {
+            /* Admin → Node */
+            if (admin_alive && FD_ISSET(sock, &rfds)) {
+                ssize_t n = recv(sock, admin_buf, WS_SUBCHUNK, 0);
+                if (n <= 0) { admin_alive = 0; }
+                else {
+                    ssize_t plen = ws_parse_frame(admin_buf, (size_t)n, admin_out, WS_SUBCHUNK, &admin_buf[0]);
+                    unsigned char opcode = admin_buf[0] & 0x0F;
+                    if (plen < 0) { admin_alive = 0; }
+                    else if (opcode == WS_OP_CLOSE) { admin_alive = 0; }
+                    else if (opcode == WS_OP_PING) {
+                        ws_send_frame(sock, WS_OP_PONG, admin_out, (size_t)plen);
+                    }
+                    else if (node_alive && (opcode == WS_OP_BIN || opcode == WS_OP_TEXT) && recv_mode) {
+                        if (ws_send_frame(node_sock, WS_OP_BIN, admin_out, (size_t)plen) < 0)
+                            node_alive = 0;
+                    }
+                }
+            }
+
+            /* Node → Admin */
+            if (node_alive && FD_ISSET(node_sock, &rfds)) {
+                ssize_t n = recv(node_sock, node_buf, WS_SUBCHUNK, 0);
+                if (n <= 0) { node_alive = 0; }
+                else {
+                    ssize_t plen = ws_parse_frame(node_buf, (size_t)n, node_out, WS_SUBCHUNK, &node_buf[0]);
+                    unsigned char opcode = node_buf[0] & 0x0F;
+                    if (plen < 0) { node_alive = 0; }
+                    else if (opcode == WS_OP_CLOSE) { node_alive = 0; }
+                    else if (opcode == WS_OP_PING) {
+                        ws_send_frame(node_sock, WS_OP_PONG, node_out, (size_t)plen);
+                    }
+                    else if (admin_alive && (opcode == WS_OP_BIN || opcode == WS_OP_TEXT) && !recv_mode) {
+                        if (ws_send_frame(sock, WS_OP_BIN, node_out, (size_t)plen) < 0)
+                            admin_alive = 0;
+                    }
+                }
+            }
+        }
+
+        if (!admin_alive || !node_alive) break;
     }
 
     if (g_verbose)
-        fprintf(stderr, "ws: pipe complete for node %s\n", node_cn);
+        fprintf(stderr, "ws: pipe bridge ended admin=%d node=%d\n", admin_alive, node_alive);
+
+    ws_send_close(sock);
+    close(node_sock);
+    MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
+
+    free(admin_buf); free(node_buf); free(admin_out); free(node_out);
+
+    /* Clean up node_ws entry */
+    node_ws_unregister(node_cn);
 }
 
 static enum MHD_Result ws_handle_node(struct MHD_Connection *conn,
