@@ -152,11 +152,19 @@ echo "$STDERR_OUT" | grep -q "bytes.*copied\|records" && \
 
 # ── recv direction test ──
 echo -e "\n${CYAN}Recv direction test${NC}"
+rm -f /tmp/zep-bench/recv-test
 dd if=/dev/zero bs=1M count=4 2>/dev/null | "$ADMIN" $ADMIN_BASE pipe --recv dd of=/tmp/zep-bench/recv-test bs=1M 2>/dev/null
+# Wait for async node receive — cron polls every 2s
+for i in 1 2 3 4 5; do
+    sz=$(stat -c%s /tmp/zep-bench/recv-test 2>/dev/null || echo 0)
+    [ "$sz" -eq 4194304 ] && break
+    sleep 1
+done
 if [ -f /tmp/zep-bench/recv-test ] && [ "$(stat -c%s /tmp/zep-bench/recv-test 2>/dev/null || echo 0)" -eq 4194304 ]; then
     echo -e "  ${GREEN}OK${NC}   recv direction: 4 MB transferred"
 else
-    echo -e "  ${RED}FAIL${NC} recv direction data mismatch"
+    sz=$(stat -c%s /tmp/zep-bench/recv-test 2>/dev/null || echo 0)
+    echo -e "  ${RED}FAIL${NC} recv direction data mismatch (got $sz bytes)"
 fi
 rm -f /tmp/zep-bench/recv-test
 

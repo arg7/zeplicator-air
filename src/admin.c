@@ -624,6 +624,7 @@ static int cmd_pipe(int argc, char *argv[]) {
             curl_easy_setopt(dc, CURLOPT_CONNECTTIMEOUT, 10L);
             if (g_key_password[0])
                 curl_easy_setopt(dc, CURLOPT_KEYPASSWD, g_key_password);
+            curl_easy_setopt(dc, CURLOPT_CUSTOMREQUEST, "POST");
             rc = curl_easy_perform(dc);
             curl_easy_getinfo(dc, CURLINFO_RESPONSE_CODE, &http_code);
             curl_easy_cleanup(dc);
