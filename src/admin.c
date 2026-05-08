@@ -99,22 +99,38 @@ static size_t ws_build_frame(unsigned char *buf, size_t buf_size,
 }
 
 static ssize_t ws_ssl_read(ws_conn_t *wc, void *buf, size_t len) {
-    int n = SSL_read(wc->ssl, buf, (int)len);
-    if (n <= 0 && g_verbose) {
-        int err = SSL_get_error(wc->ssl, n);
-        fprintf(stderr, "ws: SSL_read error=%d\n", err);
+    if (wc->ssl) {
+        int n = SSL_read(wc->ssl, buf, (int)len);
+        if (n <= 0 && g_verbose) {
+            int err = SSL_get_error(wc->ssl, n);
+            fprintf(stderr, "ws: SSL_read error=%d\n", err);
+        }
+        return n;
     }
-    return n;
+    return recv(wc->sock, buf, len, 0);
 }
 
 static ssize_t ws_ssl_write(ws_conn_t *wc, const void *buf, size_t len) {
-    ssize_t total = 0;
-    while ((size_t)total < len) {
-        int n = SSL_write(wc->ssl, (const char *)buf + total, (int)(len - (size_t)total));
-        if (n <= 0) return total > 0 ? total : -1;
-        total += n;
+    if (wc->ssl) {
+        ssize_t total = 0;
+        while ((size_t)total < len) {
+            int n = SSL_write(wc->ssl, (const char *)buf + total, (int)(len - (size_t)total));
+            if (n <= 0) return total > 0 ? total : -1;
+            total += n;
+        }
+        return total;
     }
-    return total;
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = send(wc->sock, (const char *)buf + total, len - total, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EINTR) continue;
+            return total > 0 ? (ssize_t)total : -1;
+        }
+        if (n == 0) return total > 0 ? (ssize_t)total : -1;
+        total += (size_t)n;
+    }
+    return (ssize_t)total;
 }
 
 static ssize_t ws_recv_frame(ws_conn_t *wc, unsigned char *out, size_t out_size,
@@ -175,11 +191,12 @@ static int ws_send_data_ssl(ws_conn_t *wc, unsigned char opcode,
 
 static ws_conn_t *ws_connect(const char *server_url, const char *path) {
     /* Parse URL: https://host:port */
+    int use_tls = 1;
     char host[512] = {0};
     int port = 443;
     const char *scheme = server_url;
-    if (strncmp(scheme, "https://", 8) == 0) scheme += 8;
-    else if (strncmp(scheme, "http://", 7) == 0) { port = 80; scheme += 7; }
+    if (strncmp(scheme, "https://", 8) == 0) { scheme += 8; }
+    else if (strncmp(scheme, "http://", 7) == 0) { use_tls = 0; port = 80; scheme += 7; }
 
     const char *colon = strchr(scheme, ':');
     const char *slash = strchr(scheme, '/');
@@ -196,11 +213,11 @@ static ws_conn_t *ws_connect(const char *server_url, const char *path) {
         size_t sl = strlen(scheme);
         if (sl >= sizeof(host)) sl = sizeof(host) - 1;
         memcpy(host, scheme, sl);
-        host[sl] = '\0';
     }
 
     if (g_verbose)
-        fprintf(stderr, "ws: connecting to %s:%d%s\n", host, port, path);
+        fprintf(stderr, "ws: connecting to %s:%d%s (%s)\n", host, port, path,
+                use_tls ? "TLS" : "plain");
 
     /* Resolve host */
     struct addrinfo hints = {0}, *res = NULL;
@@ -223,24 +240,28 @@ static ws_conn_t *ws_connect(const char *server_url, const char *path) {
     freeaddrinfo(res);
 
     /* TLS */
-    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) { close(sock); return NULL; }
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
-    if (SSL_CTX_use_certificate_file(ctx, g_cert_path, SSL_FILETYPE_PEM) != 1) {
-        SSL_CTX_free(ctx); close(sock); return NULL;
-    }
-    if (SSL_CTX_use_PrivateKey_file(ctx, g_key_path, SSL_FILETYPE_PEM) != 1) {
-        SSL_CTX_free(ctx); close(sock); return NULL;
-    }
-    if (g_ca_path[0]) SSL_CTX_load_verify_locations(ctx, g_ca_path, NULL);
+    SSL_CTX *ctx = NULL;
+    SSL *ssl = NULL;
+    if (use_tls) {
+        ctx = SSL_CTX_new(TLS_client_method());
+        if (!ctx) { close(sock); return NULL; }
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+        if (SSL_CTX_use_certificate_file(ctx, g_cert_path, SSL_FILETYPE_PEM) != 1) {
+            SSL_CTX_free(ctx); close(sock); return NULL;
+        }
+        if (SSL_CTX_use_PrivateKey_file(ctx, g_key_path, SSL_FILETYPE_PEM) != 1) {
+            SSL_CTX_free(ctx); close(sock); return NULL;
+        }
+        if (g_ca_path[0]) SSL_CTX_load_verify_locations(ctx, g_ca_path, NULL);
 
-    SSL *ssl = SSL_new(ctx);
-    SSL_set_fd(ssl, sock);
-    if (SSL_connect(ssl) <= 0) {
-        if (g_verbose) fprintf(stderr, "ws: SSL_connect failed\n");
-        SSL_free(ssl); SSL_CTX_free(ctx); close(sock); return NULL;
+        ssl = SSL_new(ctx);
+        SSL_set_fd(ssl, sock);
+        if (SSL_connect(ssl) <= 0) {
+            if (g_verbose) fprintf(stderr, "ws: SSL_connect failed\n");
+            SSL_free(ssl); SSL_CTX_free(ctx); close(sock); return NULL;
+        }
+        if (g_verbose) fprintf(stderr, "ws: TLS connected\n");
     }
-    if (g_verbose) fprintf(stderr, "ws: TLS connected\n");
 
     /* WebSocket handshake */
     unsigned char key_bytes[16];
@@ -267,18 +288,26 @@ static ws_conn_t *ws_connect(const char *server_url, const char *path) {
              "Sec-WebSocket-Version: 13\r\n"
              "\r\n", path, host, port, key_b64);
 
-    SSL_write(ssl, req, (int)strlen(req));
+    if (ssl)
+        SSL_write(ssl, req, (int)strlen(req));
+    else
+        send(sock, req, strlen(req), MSG_NOSIGNAL);
     if (g_verbose) fprintf(stderr, "ws: sent handshake request\n");
 
     /* Read response */
     char resp_buf[1024];
     int resp_len = 0;
     for (;;) {
-        int n = SSL_read(ssl, resp_buf + resp_len, sizeof(resp_buf) - resp_len - 1);
-        if (g_verbose) fprintf(stderr, "ws: SSL_read returned %d\n", n);
+        int n;
+        if (ssl)
+            n = SSL_read(ssl, resp_buf + resp_len, sizeof(resp_buf) - resp_len - 1);
+        else
+            n = (int)recv(sock, resp_buf + resp_len, sizeof(resp_buf) - resp_len - 1, 0);
+        if (g_verbose) fprintf(stderr, "ws: read returned %d\n", n);
         if (n <= 0) {
-            if (g_verbose) fprintf(stderr, "ws: SSL_read error\n");
-            SSL_free(ssl); SSL_CTX_free(ctx); close(sock); return NULL;
+            if (g_verbose) fprintf(stderr, "ws: read error\n");
+            if (ssl) { SSL_free(ssl); SSL_CTX_free(ctx); }
+            close(sock); return NULL;
         }
         resp_len += n;
         resp_buf[resp_len] = '\0';
@@ -289,7 +318,8 @@ static ws_conn_t *ws_connect(const char *server_url, const char *path) {
 
     if (strstr(resp_buf, "101") == NULL) {
         fprintf(stderr, "ws: handshake failed: %.*s\n", resp_len, resp_buf);
-        SSL_free(ssl); SSL_CTX_free(ctx); close(sock); return NULL;
+        if (ssl) { SSL_free(ssl); SSL_CTX_free(ctx); }
+        close(sock); return NULL;
     }
 
     ws_conn_t *wc = calloc(1, sizeof(*wc));
@@ -783,7 +813,7 @@ static int cmd_pipe(int argc, char *argv[]) {
 
         ws_close(wc);
         if (progress)
-            fprintf(stderr, "\npipe: recv complete — %llu bytes\n", (unsigned long long)sent);
+            if (g_verbose) fprintf(stderr, "\npipe: recv complete — %llu bytes\n", (unsigned long long)sent);
         return 0;
     } else {
         /* Node sends stdout/stderr → admin */

@@ -170,7 +170,7 @@ PIPE_ADM="--server https://master.zep.lan:18443 --cert $PKI/admin.crt --key $PKI
 
 # test 10
 echo -e "${CYAN}Test 10: pipe zfs list -t snapshot${NC}"
-out=$(timeout 12s "$ADMIN" $PIPE_ADM pipe zfs list -t snapshot 2>/dev/null)
+out=$(timeout 12s "$ADMIN" $PIPE_ADM pipe --node za-master zfs list -t snapshot 2>/dev/null)
 echo "$out" | grep -q '@' && ok "pipe zfs list returned snapshots" || bad "pipe zfs list failed"
 
 # test 11

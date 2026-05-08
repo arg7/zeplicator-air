@@ -3,6 +3,8 @@
 #include "auth.h"
 #include "db.h"
 #include "common.h"
+
+extern int g_verbose;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -122,7 +124,7 @@ err_t auth_verify_client(sqlite3 *db, X509 *client_cert,
             }
             BIO_free(bio);
         }
-        fprintf(stderr, "auth: registered new cert CN=%s fp=%s\n", cn, fp);
+        if (g_verbose) fprintf(stderr, "auth: registered new cert CN=%s fp=%s\n", cn, fp);
     }
 
     snprintf(node_name, len, "%s", cn);

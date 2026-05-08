@@ -39,8 +39,9 @@ static char g_key_path[ZEP_MAX_PATH] = "";
 static char g_ca_path[ZEP_MAX_PATH] = "";
 static char g_admin_cert_path[ZEP_MAX_PATH] = "";
 static char g_key_password[128] = "";
-static int  g_verbose = 0;
+int g_verbose = 0;
 static int  g_setup_mode = 0;
+static int  g_no_tls = 0;
 static struct MHD_Daemon *g_daemon = NULL;
 static sqlite3 *g_db = NULL;
 
@@ -59,6 +60,8 @@ struct node_ws {
     int pipe_cmd_ready;
     int pipe_done;
     int pipe_recv_mode;
+    int pipe_starting;
+    struct MHD_Connection *mhd_conn;
     /* Pipes for inter-thread data transfer */
     int pipe_admin_to_node[2];  /* bridge→node: admin data */
     int pipe_node_to_admin[2];  /* node→bridge: node data */
@@ -475,41 +478,122 @@ static size_t ws_build_frame(unsigned char *buf, size_t buf_size,
 
 #define WS_SUBCHUNK (128 * 1024)
 
+static ssize_t ws_send_frame_gtls(struct node_ws *nw, unsigned char opcode,
+                                   const unsigned char *payload, size_t payload_len) {
+    unsigned char *frame = malloc(payload_len + 14);
+    if (!frame) return -1;
+    size_t flen = ws_build_frame(frame, payload_len + 14, opcode, payload, payload_len);
+    if (flen == 0) {
+        free(frame);
+        return -1;
+    }
+    if (g_no_tls) {
+        ssize_t sent = send(nw ? nw->sock : -1, frame, flen, MSG_NOSIGNAL);
+        free(frame);
+        return sent == (ssize_t)flen ? (ssize_t)flen : -1;
+    }
+
+    ssize_t sent = 0;
+    if (nw && nw->mhd_conn) {
+        const union MHD_ConnectionInfo *ci = MHD_get_connection_info(nw->mhd_conn, MHD_CONNECTION_INFO_GNUTLS_SESSION);
+        if (ci && ci->tls_session) {
+            while ((size_t)sent < flen) {
+                ssize_t n = gnutls_record_send((gnutls_session_t)ci->tls_session, frame + sent, flen - (size_t)sent);
+                if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
+                    int raw_fd = (int)(intptr_t)gnutls_transport_get_ptr((gnutls_session_t)ci->tls_session);
+                    if (raw_fd < 0) { free(frame); return -1; }
+                    fd_set wfds; FD_ZERO(&wfds); FD_SET(raw_fd, &wfds);
+                    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+                    if (select(raw_fd + 1, NULL, &wfds, NULL, &tv) <= 0) { free(frame); return -1; }
+                    continue;
+                }
+                if (n <= 0) { free(frame); return -1; }
+                sent += n;
+            }
+            free(frame);
+            return (ssize_t)flen;
+        }
+    }
+    free(frame);
+    return -1;
+}
+
 static ssize_t ws_send_frame(int sock, unsigned char opcode,
                               const unsigned char *payload, size_t payload_len) {
     unsigned char *frame = malloc(payload_len + 14);
     if (!frame) return -1;
     size_t flen = ws_build_frame(frame, payload_len + 14, opcode, payload, payload_len);
-    if (flen == 0) {
-        fprintf(stderr, "ws: build_frame failed for opcode=0x%02x len=%zu\n", opcode, payload_len);
-        free(frame);
-        return -1;
-    }
+    if (flen == 0) { free(frame); return -1; }
     ssize_t sent = 0;
     while ((size_t)sent < flen) {
         ssize_t n = send(sock, frame + sent, flen - (size_t)sent, MSG_NOSIGNAL);
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            fd_set wfds;
-            FD_ZERO(&wfds);
-            FD_SET(sock, &wfds);
+            fd_set wfds; FD_ZERO(&wfds); FD_SET(sock, &wfds);
             struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-            if (select(sock + 1, NULL, &wfds, NULL, &tv) <= 0) {
-                fprintf(stderr, "ws: send timeout\n");
-                free(frame);
-                return -1;
-            }
+            if (select(sock + 1, NULL, &wfds, NULL, &tv) <= 0) { free(frame); return -1; }
             continue;
         }
-        if (n <= 0) {
-            fprintf(stderr, "ws: send failed: n=%zd errno=%d (%s)\n",
-                    n, errno, strerror(errno));
-            free(frame);
-            return -1;
-        }
+        if (n <= 0) { free(frame); return -1; }
         sent += n;
     }
     free(frame);
     return (ssize_t)flen;
+}
+
+static ssize_t ws_recv_node(struct node_ws *nw, unsigned char *buf, size_t buf_size) {
+    if (g_no_tls)
+        return recv(nw ? nw->sock : -1, buf, buf_size, 0);
+    if (nw && nw->mhd_conn) {
+        const union MHD_ConnectionInfo *ci = MHD_get_connection_info(nw->mhd_conn, MHD_CONNECTION_INFO_GNUTLS_SESSION);
+        if (ci && ci->tls_session) {
+            ssize_t n = gnutls_record_recv((gnutls_session_t)ci->tls_session, buf, buf_size);
+            if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
+                int raw_fd = (int)(intptr_t)gnutls_transport_get_ptr((gnutls_session_t)ci->tls_session);
+                if (raw_fd < 0) return -1;
+                fd_set rfds; FD_ZERO(&rfds); FD_SET(raw_fd, &rfds);
+                struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+                if (select(raw_fd + 1, &rfds, NULL, NULL, &tv) <= 0) return -1;
+                return gnutls_record_recv((gnutls_session_t)ci->tls_session, buf, buf_size);
+            }
+            return n;
+        }
+    }
+    return recv(nw ? nw->sock : -1, buf, buf_size, 0);
+}
+
+static ssize_t ws_recv_frame_full(struct node_ws *nw, unsigned char *buf, size_t buf_size,
+                                   unsigned char *out, size_t out_size,
+                                   unsigned char *opcode_out) {
+    size_t buf_used = 0;
+    for (;;) {
+        if (buf_used >= 2) {
+            uint64_t plen = buf[1] & 0x7F;
+            size_t need = 2;
+            if (plen == 126) need = 4;
+            else if (plen == 127) need = 10;
+            if (buf_used >= need) {
+                int masked = (buf[1] >> 7) & 1;
+                size_t header_len = need;
+                if (plen == 126)
+                    plen = (buf[2] << 8) | buf[3];
+                else if (plen == 127) {
+                    plen = 0;
+                    for (int i = 0; i < 8; i++)
+                        plen = (plen << 8) | buf[2 + i];
+                }
+                if (masked) header_len += 4;
+                if (plen <= (uint64_t)out_size && header_len + (size_t)plen <= buf_used) {
+                    ssize_t r = ws_parse_frame(buf, buf_used, out, out_size, opcode_out);
+                    if (r >= 0) return r;
+                    return -1;
+                }
+            }
+        }
+        if (buf_used == buf_size) return -1;
+        ssize_t n = ws_recv_node(nw, buf + buf_used, buf_size - buf_used);
+        if (n <= 0) return n;
+        buf_used += (size_t)n;
+    }
 }
 
 static void ws_make_blocking(int fd) {
@@ -539,6 +623,7 @@ static void ws_set_keepalive(int fd) {
 struct node_ws_thread_ctx {
     struct node_ws *nw;
     int sock;
+    struct MHD_Connection *mhd_conn;
     struct MHD_UpgradeResponseHandle *urh;
 };
 
@@ -549,13 +634,23 @@ static void *node_ws_thread(void *arg) {
     struct MHD_UpgradeResponseHandle *urh = ctx->urh;
     free(ctx);
 
+    int raw_sock = sock;
+    if (!g_no_tls && nw->mhd_conn) {
+        const union MHD_ConnectionInfo *ci = MHD_get_connection_info(nw->mhd_conn, MHD_CONNECTION_INFO_GNUTLS_SESSION);
+        if (ci && ci->tls_session)
+            raw_sock = (int)(intptr_t)gnutls_transport_get_ptr((gnutls_session_t)ci->tls_session);
+    }
+    if (raw_sock < 0) raw_sock = sock;
+
     ws_make_blocking(sock);
     unsigned char *buf = malloc(WS_SUBCHUNK);
     unsigned char *out = malloc(WS_SUBCHUNK);
     if (!buf || !out) { free(buf); free(out); MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return NULL; }
 
-    fprintf(stderr, "ws: node %s listening sock=%d\n", nw->cn, sock);
-    fflush(stderr);
+    if (g_verbose) {
+        fprintf(stderr, "ws: node %s listening sock=%d\n", nw->cn, sock);
+        fflush(stderr);
+    }
 
     time_t last_ping = time(NULL);
     for (;;) {
@@ -564,34 +659,33 @@ static void *node_ws_thread(void *arg) {
         int exiting = nw->pipe_starting;
         pthread_mutex_unlock(&nw->lock);
         if (exiting) {
-            fprintf(stderr, "ws: node %s exiting for pipe bridge\n", nw->cn);
-            fflush(stderr);
+            if (g_verbose) {
+                fprintf(stderr, "ws: node %s exiting for pipe bridge\n", nw->cn);
+                fflush(stderr);
+            }
             break;
         }
 
         struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(sock, &rfds);
-        int sel = select(sock + 1, &rfds, NULL, NULL, &tv);
+        FD_SET(raw_sock, &rfds);
+        int sel = select(raw_sock + 1, &rfds, NULL, NULL, &tv);
 
         time_t now = time(NULL);
         if (now - last_ping >= 60) {
-            ws_send_frame(sock, WS_OP_PING, NULL, 0);
+            ws_send_frame_gtls(nw, WS_OP_PING, NULL, 0);
             last_ping = now;
         }
 
-        if (sel > 0 && FD_ISSET(sock, &rfds)) {
-            ssize_t n = recv(sock, buf, WS_SUBCHUNK, 0);
-            if (n <= 0) break;
-
-            ssize_t plen = ws_parse_frame(buf, (size_t)n, out, WS_SUBCHUNK, &buf[0]);
+        if (sel > 0 && FD_ISSET(raw_sock, &rfds)) {
+            ssize_t plen = ws_recv_frame_full(nw, buf, WS_SUBCHUNK, out, WS_SUBCHUNK, &buf[0]);
             unsigned char opcode = buf[0] & 0x0F;
             if (plen < 0) break;
 
             if (opcode == WS_OP_CLOSE) break;
             if (opcode == WS_OP_PING) {
-                ws_send_frame(sock, WS_OP_PONG, out, (size_t)plen);
+                ws_send_frame_gtls(nw, WS_OP_PONG, out, (size_t)plen);
                 continue;
             }
             if (opcode == WS_OP_PONG) {
@@ -603,8 +697,10 @@ static void *node_ws_thread(void *arg) {
         if (time(NULL) - nw->last_pong > 180) break;
     }
 
-    fprintf(stderr, "ws: node %s disconnected\n", nw->cn);
-    fflush(stderr);
+    if (g_verbose) {
+        fprintf(stderr, "ws: node %s disconnected\n", nw->cn);
+        fflush(stderr);
+    }
 
     free(buf); free(out);
 
@@ -634,11 +730,13 @@ static void ws_node_upgrade_handler(void *cls, struct MHD_Connection *conn,
 
     struct node_ws *nw = node_ws_register(cn, sock);
     if (!nw) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
+    nw->mhd_conn = conn;
 
     /* Spawn thread for WS loop */
     struct node_ws_thread_ctx *ctx = malloc(sizeof(*ctx));
     ctx->nw = nw;
     ctx->sock = sock;
+    ctx->mhd_conn = conn;
     ctx->urh = urh;
     pthread_create(&nw->thread, NULL, node_ws_thread, ctx);
     pthread_detach(nw->thread);
@@ -670,15 +768,23 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
     /* Signal node thread to exit so we can take over the socket */
     pthread_mutex_lock(&nw->lock);
     nw->pipe_starting = 1;
-    int node_sock = nw->sock;
     pthread_mutex_unlock(&nw->lock);
 
     /* Wait for node thread to exit */
     usleep(200000);
     if (g_verbose)
-        fprintf(stderr, "ws: pipe taking over node sock=%d\n", node_sock);
+        fprintf(stderr, "ws: pipe taking over node %s\n", node_cn);
 
-    /* Send task JSON to node */
+    /* Get raw TCP fd for select */
+    int node_raw_fd = nw->sock;
+    if (!g_no_tls && nw->mhd_conn) {
+        const union MHD_ConnectionInfo *ci = MHD_get_connection_info(nw->mhd_conn, MHD_CONNECTION_INFO_GNUTLS_SESSION);
+        if (ci && ci->tls_session)
+            node_raw_fd = (int)(intptr_t)gnutls_transport_get_ptr((gnutls_session_t)ci->tls_session);
+    }
+    if (node_raw_fd < 0) node_raw_fd = nw->sock;
+
+    /* Send task JSON to node (via GnuTLS) */
     const char *direction = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "direction");
     const char *command = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "command");
     int recv_mode = (direction && strcmp(direction, "recv") == 0);
@@ -689,16 +795,13 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
                      command, direction ? direction : "send") > 0) {
             if (g_verbose)
                 fprintf(stderr, "ws: sending task to node: %s\n", task_json);
-            ssize_t sr = ws_send_frame(node_sock, WS_OP_TEXT, (unsigned char *)task_json, strlen(task_json));
-            fprintf(stderr, "ws: send_frame returned %zd\n", sr);
-            fflush(stderr);
+            ws_send_frame_gtls(nw, WS_OP_TEXT, (unsigned char *)task_json, strlen(task_json));
             free(task_json);
         }
     }
 
-    /* Bridge: admin socket ↔ node socket */
+    /* Bridge: admin socket ↔ node WS */
     ws_make_blocking(sock);
-    ws_make_blocking(node_sock);
     unsigned char *admin_buf = malloc(WS_SUBCHUNK);
     unsigned char *node_buf = malloc(WS_SUBCHUNK);
     unsigned char *admin_out = malloc(WS_SUBCHUNK);
@@ -716,7 +819,7 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
         FD_ZERO(&rfds);
         int maxfd = 0;
         if (admin_alive) { FD_SET(sock, &rfds); if (sock > maxfd) maxfd = sock; }
-        if (node_alive) { FD_SET(node_sock, &rfds); if (node_sock > maxfd) maxfd = node_sock; }
+        if (node_alive) { FD_SET(node_raw_fd, &rfds); if (node_raw_fd > maxfd) maxfd = node_raw_fd; }
         int sel = select(maxfd + 1, &rfds, NULL, NULL, &tv);
 
         if (sel > 0) {
@@ -733,23 +836,21 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
                         ws_send_frame(sock, WS_OP_PONG, admin_out, (size_t)plen);
                     }
                     else if (node_alive && (opcode == WS_OP_BIN || opcode == WS_OP_TEXT) && recv_mode) {
-                        if (ws_send_frame(node_sock, WS_OP_BIN, admin_out, (size_t)plen) < 0)
+                        if (ws_send_frame_gtls(nw, WS_OP_BIN, admin_out, (size_t)plen) < 0)
                             node_alive = 0;
                     }
                 }
             }
 
             /* Node → Admin */
-            if (node_alive && FD_ISSET(node_sock, &rfds)) {
-                ssize_t n = recv(node_sock, node_buf, WS_SUBCHUNK, 0);
-                if (n <= 0) { node_alive = 0; }
+            if (node_alive && FD_ISSET(node_raw_fd, &rfds)) {
+                ssize_t plen = ws_recv_frame_full(nw, node_buf, WS_SUBCHUNK, node_out, WS_SUBCHUNK, &node_buf[0]);
+                if (plen < 0) { node_alive = 0; }
                 else {
-                    ssize_t plen = ws_parse_frame(node_buf, (size_t)n, node_out, WS_SUBCHUNK, &node_buf[0]);
                     unsigned char opcode = node_buf[0] & 0x0F;
-                    if (plen < 0) { node_alive = 0; }
-                    else if (opcode == WS_OP_CLOSE) { node_alive = 0; }
+                    if (opcode == WS_OP_CLOSE) { node_alive = 0; }
                     else if (opcode == WS_OP_PING) {
-                        ws_send_frame(node_sock, WS_OP_PONG, node_out, (size_t)plen);
+                        ws_send_frame_gtls(nw, WS_OP_PONG, node_out, (size_t)plen);
                     }
                     else if (admin_alive && (opcode == WS_OP_BIN || opcode == WS_OP_TEXT) && !recv_mode) {
                         if (ws_send_frame(sock, WS_OP_BIN, node_out, (size_t)plen) < 0)
@@ -766,13 +867,12 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
         fprintf(stderr, "ws: pipe bridge ended admin=%d node=%d\n", admin_alive, node_alive);
 
     ws_send_close(sock);
-    close(node_sock);
+    close(sock);
     MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
 
     free(admin_buf); free(node_buf); free(admin_out); free(node_out);
 
-    /* Clean up node_ws entry */
-    node_ws_unregister(node_cn);
+    /* Don't unregister node — it reconnects on its own */
 }
 
 static enum MHD_Result ws_handle_node(struct MHD_Connection *conn,
@@ -809,8 +909,8 @@ static enum MHD_Result ws_handle_node(struct MHD_Connection *conn,
 
 static enum MHD_Result ws_handle_pipe(struct MHD_Connection *conn,
                                        const char *node_cn) {
-    fprintf(stderr, "ws: pipe upgrade request for node %s\n", node_cn);
-    fflush(stderr);
+    if (g_verbose) fprintf(stderr, "ws: pipe upgrade request for node %s\n", node_cn);
+    if (g_verbose) fflush(stderr);
 
     const char *upgrade = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Upgrade");
     const char *ws_key = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Sec-WebSocket-Key");
@@ -930,6 +1030,11 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     return send_error(conn, 403, "Admin access required");
                 }
             }
+        }
+
+        if (g_no_tls && !ctx->node[0]) {
+            const char *cn = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "cn");
+            if (cn && cn[0]) snprintf(ctx->node, sizeof(ctx->node), "%s", cn);
         }
 
         ctx->authed = 1;
@@ -1628,6 +1733,7 @@ static void usage_serve(const char *prog) {
     fprintf(stderr, "  -S, --setup           Run setup mode: store CA + server + admin certs in DB, then exit\n");
     fprintf(stderr, "  -A, --admin-cert      Admin client certificate for setup mode (PEM)\n");
     fprintf(stderr, "  -P, --password PASS   Password for encrypted private keys\n");
+    fprintf(stderr, "  -N, --no-tls          Disable TLS (plain HTTP, for WS debugging)\n");
     fprintf(stderr, "  -v, --verbose         Verbose output\n");
     fprintf(stderr, "  -h, --help            This help\n");
 }
@@ -1642,6 +1748,7 @@ int serve_main(int argc, char *argv[]) {
         {"db",         required_argument, 0, 'D'},
         {"admin-cert", required_argument, 0, 'A'},
         {"password",  required_argument, 0, 'P'},
+        {"no-tls",    no_argument,       0, 'N'},
         {"setup",      no_argument,       0, 'S'},
         {"verbose", no_argument,       0, 'v'},
         {"help",    no_argument,       0, 'h'},
@@ -1649,7 +1756,7 @@ int serve_main(int argc, char *argv[]) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:A:D:P:Svh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:A:D:P:SvNh", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'p': g_port = atoi(optarg); break;
             case 's': snprintf(g_storage_root, sizeof(g_storage_root), "%s", optarg); break;
@@ -1661,6 +1768,7 @@ int serve_main(int argc, char *argv[]) {
             case 'P': snprintf(g_key_password, sizeof(g_key_password), "%s", optarg); break;
             case 'S': g_setup_mode = 1; break;
             case 'v': g_verbose = 1; break;
+            case 'N': g_no_tls = 1; break;
             case 'h': usage_serve(argv[0]); return 0;
             default:  usage_serve(argv[0]); return 1;
         }
@@ -1756,15 +1864,17 @@ int serve_main(int argc, char *argv[]) {
         return 0;
     }
 
-    if (!g_cert_path[0] || !g_key_path[0]) {
-        fprintf(stderr, "error: --cert and --key are required\n");
-        return 1;
-    }
+    if (!g_no_tls) {
+        if (!g_cert_path[0] || !g_key_path[0]) {
+            fprintf(stderr, "error: --cert and --key are required (or use --no-tls)\n");
+            return 1;
+        }
 
-    if (load_pem(g_cert_path, &cert_pem) != 0) return 1;
-    if (load_pem(g_key_path, &key_pem) != 0) { free(cert_pem); return 1; }
-    if (g_ca_path[0] && load_pem(g_ca_path, &ca_pem) != 0) {
-        free(cert_pem); free(key_pem); return 1;
+        if (load_pem(g_cert_path, &cert_pem) != 0) return 1;
+        if (load_pem(g_key_path, &key_pem) != 0) { free(cert_pem); return 1; }
+        if (g_ca_path[0] && load_pem(g_ca_path, &ca_pem) != 0) {
+            free(cert_pem); free(key_pem); return 1;
+        }
     }
 
     signal(SIGINT, sig_handler);
@@ -1776,7 +1886,7 @@ int serve_main(int argc, char *argv[]) {
     }
     db_init_tables(g_db);
 
-    if (g_ca_path[0]) {
+    if (!g_no_tls && g_ca_path[0]) {
         X509_STORE *ca_store = NULL;
         if (auth_load_ca_cert(g_ca_path, &ca_store) == ZEP_ERR_OK) {
             char *ca_fp = NULL;
@@ -1798,15 +1908,23 @@ int serve_main(int argc, char *argv[]) {
         }
     }
 
-    unsigned int flags = MHD_USE_TLS | MHD_USE_AUTO | MHD_USE_INTERNAL_POLLING_THREAD | MHD_ALLOW_UPGRADE;
+    unsigned int flags = MHD_USE_INTERNAL_POLLING_THREAD | MHD_ALLOW_UPGRADE;
+    if (!g_no_tls) flags |= MHD_USE_TLS;
 
-    g_daemon = MHD_start_daemon(flags, (unsigned int)g_port, NULL, NULL,
-                                 &handle_request, NULL,
-                                 MHD_OPTION_NOTIFY_COMPLETED, &completed_cb, NULL,
-                                 MHD_OPTION_HTTPS_MEM_CERT, cert_pem,
-                                 MHD_OPTION_HTTPS_MEM_KEY, key_pem,
-                                 MHD_OPTION_HTTPS_MEM_TRUST, ca_pem,
-                                 MHD_OPTION_END);
+    if (g_no_tls) {
+        g_daemon = MHD_start_daemon(flags, (unsigned int)g_port, NULL, NULL,
+                                     &handle_request, NULL,
+                                     MHD_OPTION_NOTIFY_COMPLETED, &completed_cb, NULL,
+                                     MHD_OPTION_END);
+    } else {
+        g_daemon = MHD_start_daemon(flags, (unsigned int)g_port, NULL, NULL,
+                                     &handle_request, NULL,
+                                     MHD_OPTION_NOTIFY_COMPLETED, &completed_cb, NULL,
+                                     MHD_OPTION_HTTPS_MEM_CERT, cert_pem,
+                                     MHD_OPTION_HTTPS_MEM_KEY, key_pem,
+                                     MHD_OPTION_HTTPS_MEM_TRUST, ca_pem,
+                                     MHD_OPTION_END);
+    }
 
     free(cert_pem);
     free(key_pem);
@@ -1817,7 +1935,7 @@ int serve_main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("zep-air-serve listening on port %d (TLS)\n", g_port);
+    printf("zep-air-serve listening on port %d (%s)\n", g_port, g_no_tls ? "plain" : "TLS");
     printf("Storage root: %s\n", g_storage_root);
     if (g_ca_path[0]) printf("Client certificate authentication enabled\n");
 

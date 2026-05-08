@@ -26,6 +26,7 @@
 #include <pthread.h>
 
 static char g_db_path[ZEP_MAX_PATH] = "zep-air.db";
+static int  g_verbose = 0;
 
 /* === WebSocket Pipe Client (node side) === */
 
@@ -36,6 +37,32 @@ static char g_db_path[ZEP_MAX_PATH] = "zep-air.db";
 #define WS_NODE_OP_CLOSE 0x08
 #define WS_NODE_OP_PING  0x09
 #define WS_NODE_OP_PONG  0x0A
+
+struct ws_node_conn {
+    int sock;
+    SSL *ssl;
+};
+
+static int ws_node_read(struct ws_node_conn *c, void *buf, int len) {
+    if (c->ssl) return SSL_read(c->ssl, buf, len);
+    return (int)recv(c->sock, buf, (size_t)len, 0);
+}
+
+static int ws_node_write(struct ws_node_conn *c, const void *buf, int len) {
+    if (c->ssl) return SSL_write(c->ssl, buf, len);
+    ssize_t n = send(c->sock, buf, (size_t)len, MSG_NOSIGNAL);
+    return (int)n;
+}
+
+static void ws_node_disconnect(struct ws_node_conn *c) {
+    if (!c) return;
+    if (c->ssl) {
+        SSL_shutdown(c->ssl);
+        SSL_free(c->ssl);
+    }
+    if (c->sock >= 0) close(c->sock);
+    free(c);
+}
 
 static size_t ws_node_build_frame(unsigned char *buf, size_t buf_size,
                                     unsigned char opcode, const unsigned char *payload, size_t payload_len) {
@@ -58,10 +85,10 @@ static size_t ws_node_build_frame(unsigned char *buf, size_t buf_size,
     return header_len + payload_len;
 }
 
-static ssize_t ws_node_recv_frame(SSL *ssl, unsigned char *out, size_t out_size,
+static ssize_t ws_node_recv_frame(struct ws_node_conn *c, unsigned char *out, size_t out_size,
                                    unsigned char *opcode_out) {
     unsigned char hdr[14];
-    int n = SSL_read(ssl, hdr, 2);
+    int n = ws_node_read(c, hdr, 2);
     if (n < 2) return -1;
 
     uint64_t payload_len = hdr[1] & 0x7F;
@@ -70,7 +97,7 @@ static ssize_t ws_node_recv_frame(SSL *ssl, unsigned char *out, size_t out_size,
     else if (payload_len == 127) extra = 8;
 
     if (extra > 0) {
-        n = SSL_read(ssl, hdr + 2, (int)extra);
+        n = ws_node_read(c, hdr + 2, (int)extra);
         if (n < (int)extra) return -1;
         if (payload_len == 126)
             payload_len = (hdr[2] << 8) | hdr[3];
@@ -89,7 +116,7 @@ static ssize_t ws_node_recv_frame(SSL *ssl, unsigned char *out, size_t out_size,
 
     ssize_t total = 0;
     while ((size_t)total < payload_len) {
-        n = SSL_read(ssl, out + total, (int)(payload_len - (size_t)total));
+        n = ws_node_read(c, out + total, (int)(payload_len - (size_t)total));
         if (n <= 0) return -1;
         total += n;
     }
@@ -97,22 +124,29 @@ static ssize_t ws_node_recv_frame(SSL *ssl, unsigned char *out, size_t out_size,
     return (ssize_t)payload_len;
 }
 
-static int ws_node_send_frame(SSL *ssl, unsigned char opcode,
+static int ws_node_send_frame(struct ws_node_conn *c, unsigned char opcode,
                                const unsigned char *payload, size_t payload_len) {
     unsigned char frame[WS_NODE_FRAME_MAX + 14];
     size_t flen = ws_node_build_frame(frame, sizeof(frame), opcode, payload, payload_len);
-    if (flen == 0) return -1;
-    return SSL_write(ssl, frame, (int)flen) > 0 ? 0 : -1;
+    if (flen == 0) { fprintf(stderr, "ws-node: build_frame failed\n"); return -1; }
+    int ret = ws_node_write(c, frame, (int)flen);
+    if (g_verbose) fprintf(stderr, "ws-node: write opcode=0x%02x flen=%zu ret=%d\n", opcode, flen, ret);
+    if (ret <= 0) {
+        fprintf(stderr, "ws-node: write error errno=%d\n", errno);
+        return -1;
+    }
+    return 0;
 }
 
-static SSL *ws_node_connect(const char *server_url, const char *cert_path,
-                             const char *key_path, const char *ca_path,
-                             const char *key_password, const char *path) {
+static struct ws_node_conn *ws_node_connect(const char *server_url, const char *cert_path,
+                              const char *key_path, const char *ca_path,
+                              const char *key_password, const char *path) {
+    int use_tls = 0;
     char host[512] = {0};
-    int port = 443;
+    int port = 80;
     const char *scheme = server_url;
-    if (strncmp(scheme, "https://", 8) == 0) scheme += 8;
-    else if (strncmp(scheme, "http://", 7) == 0) { port = 80; scheme += 7; }
+    if (strncmp(scheme, "https://", 8) == 0) { use_tls = 1; port = 443; scheme += 8; }
+    else if (strncmp(scheme, "http://", 7) == 0) { scheme += 7; }
 
     const char *colon = strchr(scheme, ':');
     const char *slash = strchr(scheme, '/');
@@ -129,7 +163,6 @@ static SSL *ws_node_connect(const char *server_url, const char *cert_path,
         size_t sl = strlen(scheme);
         if (sl >= sizeof(host)) sl = sizeof(host) - 1;
         memcpy(host, scheme, sl);
-        host[sl] = '\0';
     }
 
     struct addrinfo hints = {0}, *res = NULL;
@@ -146,23 +179,30 @@ static SSL *ws_node_connect(const char *server_url, const char *cert_path,
     }
     freeaddrinfo(res);
 
-    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) { close(sock); return NULL; }
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
-    if (SSL_CTX_use_certificate_file(ctx, cert_path, SSL_FILETYPE_PEM) != 1) {
-        SSL_CTX_free(ctx); close(sock); return NULL;
-    }
-    if (SSL_CTX_use_PrivateKey_file(ctx, key_path, SSL_FILETYPE_PEM) != 1) {
-        SSL_CTX_free(ctx); close(sock); return NULL;
-    }
-    if (ca_path && ca_path[0]) SSL_CTX_load_verify_locations(ctx, ca_path, NULL);
-    if (key_password && key_password[0])
-        SSL_CTX_set_default_passwd_cb_userdata(ctx, (void *)key_password);
+    struct ws_node_conn *c = calloc(1, sizeof(*c));
+    if (!c) { close(sock); return NULL; }
+    c->sock = sock;
 
-    SSL *ssl = SSL_new(ctx);
-    SSL_set_fd(ssl, sock);
-    if (SSL_connect(ssl) <= 0) {
-        SSL_free(ssl); SSL_CTX_free(ctx); close(sock); return NULL;
+    SSL_CTX *ssl_ctx = NULL;
+    if (use_tls) {
+        ssl_ctx = SSL_CTX_new(TLS_client_method());
+        if (!ssl_ctx) { ws_node_disconnect(c); return NULL; }
+        SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
+        if (SSL_CTX_use_certificate_file(ssl_ctx, cert_path, SSL_FILETYPE_PEM) != 1) {
+            SSL_CTX_free(ssl_ctx); ws_node_disconnect(c); return NULL;
+        }
+        if (SSL_CTX_use_PrivateKey_file(ssl_ctx, key_path, SSL_FILETYPE_PEM) != 1) {
+            SSL_CTX_free(ssl_ctx); ws_node_disconnect(c); return NULL;
+        }
+        if (ca_path && ca_path[0]) SSL_CTX_load_verify_locations(ssl_ctx, ca_path, NULL);
+        if (key_password && key_password[0])
+            SSL_CTX_set_default_passwd_cb_userdata(ssl_ctx, (void *)key_password);
+
+        c->ssl = SSL_new(ssl_ctx);
+        SSL_set_fd(c->ssl, sock);
+        if (SSL_connect(c->ssl) <= 0) {
+            SSL_CTX_free(ssl_ctx); ws_node_disconnect(c); return NULL;
+        }
     }
 
     /* WS handshake */
@@ -189,13 +229,17 @@ static SSL *ws_node_connect(const char *server_url, const char *cert_path,
              "Sec-WebSocket-Key: %s\r\n"
              "Sec-WebSocket-Version: 13\r\n"
              "\r\n", path, host, port, nonce_b64);
-    SSL_write(ssl, req, (int)strlen(req));
+
+    if (ws_node_write(c, req, (int)strlen(req)) <= 0) {
+        if (ssl_ctx) SSL_CTX_free(ssl_ctx);
+        ws_node_disconnect(c); return NULL;
+    }
 
     char resp_buf[1024];
     int resp_len = 0;
     for (;;) {
-        int n = SSL_read(ssl, resp_buf + resp_len, sizeof(resp_buf) - resp_len - 1);
-        if (n <= 0) { SSL_free(ssl); SSL_CTX_free(ctx); close(sock); return NULL; }
+        int n = ws_node_read(c, resp_buf + resp_len, (int)(sizeof(resp_buf) - resp_len - 1));
+        if (n <= 0) { if (ssl_ctx) SSL_CTX_free(ssl_ctx); ws_node_disconnect(c); return NULL; }
         resp_len += n;
         resp_buf[resp_len] = '\0';
         if (strstr(resp_buf, "\r\n\r\n")) break;
@@ -203,11 +247,12 @@ static SSL *ws_node_connect(const char *server_url, const char *cert_path,
     }
 
     if (strstr(resp_buf, "101") == NULL) {
-        SSL_free(ssl); SSL_CTX_free(ctx); close(sock); return NULL;
+        if (ssl_ctx) SSL_CTX_free(ssl_ctx);
+        ws_node_disconnect(c); return NULL;
     }
 
-    SSL_CTX_free(ctx);
-    return ssl;
+    if (ssl_ctx) SSL_CTX_free(ssl_ctx);
+    return c;
 }
 
 static void *ws_node_pipe_thread(void *arg) {
@@ -218,11 +263,11 @@ static void *ws_node_pipe_thread(void *arg) {
         char ws_path[256];
         snprintf(ws_path, sizeof(ws_path), "/v1/ws/node?cn=%s", cfg->node_name);
 
-        fprintf(stderr, "ws-node: connecting to %s%s\n", cfg->server_url, ws_path);
+        if (g_verbose) fprintf(stderr, "ws-node: connecting to %s%s\n", cfg->server_url, ws_path);
 
-        SSL *ssl = ws_node_connect(cfg->server_url, cfg->cert_path, cfg->key_path,
+        struct ws_node_conn *conn = ws_node_connect(cfg->server_url, cfg->cert_path, cfg->key_path,
                                     cfg->ca_path, cfg->key_password, ws_path);
-        if (!ssl) {
+        if (!conn) {
             fprintf(stderr, "ws-node: connect failed, retrying in 5s\n");
             sleep(5);
             continue;
@@ -230,7 +275,7 @@ static void *ws_node_pipe_thread(void *arg) {
 
         unsigned char *buf = malloc(WS_NODE_FRAME_MAX);
         unsigned char *out = malloc(WS_NODE_FRAME_MAX);
-        if (!buf || !out) { free(buf); free(out); SSL_free(ssl); sleep(5); continue; }
+        if (!buf || !out) { free(buf); free(out); ws_node_disconnect(conn); sleep(5); continue; }
 
         FILE *cmd_fp = NULL;
         char cmd_errfile[256] = {0};
@@ -238,7 +283,7 @@ static void *ws_node_pipe_thread(void *arg) {
         int pipe_recv_mode = 0;
 
         for (;;) {
-            ssize_t n = ws_node_recv_frame(ssl, out, WS_NODE_FRAME_MAX, &buf[0]);
+            ssize_t n = ws_node_recv_frame(conn, out, WS_NODE_FRAME_MAX, &buf[0]);
             unsigned char opcode = buf[0] & 0x0F;
 
             if (n < 0) {
@@ -246,11 +291,11 @@ static void *ws_node_pipe_thread(void *arg) {
                 break;
             }
             if (opcode == WS_NODE_OP_CLOSE) {
-                fprintf(stderr, "ws-node: close received, reconnecting\n");
+                if (g_verbose) fprintf(stderr, "ws-node: close received, reconnecting\n");
                 break;
             }
             if (opcode == WS_NODE_OP_PING) {
-                ws_node_send_frame(ssl, WS_NODE_OP_PONG, out, (size_t)n);
+                ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)n);
                 continue;
             }
             if (opcode == WS_NODE_OP_PONG) continue;
@@ -282,7 +327,7 @@ static void *ws_node_pipe_thread(void *arg) {
                                 pipe_recv_mode = recv_mode;
                                 if (cmd_fp) {
                                     in_pipe = 1;
-                                    fprintf(stderr, "ws-node: pipe started (%s): %s\n", recv_mode ? "recv" : "send", resolved);
+                                    if (g_verbose) fprintf(stderr, "ws-node: pipe started (%s): %s\n", recv_mode ? "recv" : "send", resolved);
                                 } else {
                                     fprintf(stderr, "ws-node: popen failed: %s\n", resolved);
                                 }
@@ -301,17 +346,20 @@ static void *ws_node_pipe_thread(void *arg) {
             /* Send command stdout to server (send mode) */
             if (in_pipe && cmd_fp && !pipe_recv_mode) {
                 size_t nread = fread(out, 1, WS_NODE_FRAME_MAX, cmd_fp);
+                if (g_verbose) fprintf(stderr, "ws-node: pipe fread=%zu feof=%d\n", nread, feof(cmd_fp));
                 if (nread > 0) {
-                    ws_node_send_frame(ssl, WS_NODE_OP_BIN, out, nread);
+                    int ret = ws_node_send_frame(conn, WS_NODE_OP_BIN, out, nread);
+                    if (g_verbose) fprintf(stderr, "ws-node: pipe sent BIN frame len=%zu ret=%d\n", nread, ret);
                 }
                 if (feof(cmd_fp)) {
                     pclose(cmd_fp);
                     cmd_fp = NULL;
                     if (cmd_errfile[0]) unlink(cmd_errfile);
                     in_pipe = 0;
-                    fprintf(stderr, "ws-node: pipe done\n");
+                    if (g_verbose) fprintf(stderr, "ws-node: pipe done, sending CLOSE\n");
                     /* Send CLOSE frame */
-                    ws_node_send_frame(ssl, WS_NODE_OP_CLOSE, NULL, 0);
+                    int ret = ws_node_send_frame(conn, WS_NODE_OP_CLOSE, NULL, 0);
+                    if (g_verbose) fprintf(stderr, "ws-node: pipe sent CLOSE ret=%d\n", ret);
                 }
             }
         }
@@ -321,7 +369,7 @@ static void *ws_node_pipe_thread(void *arg) {
             if (cmd_errfile[0]) unlink(cmd_errfile);
         }
         free(buf); free(out);
-        SSL_free(ssl);
+        ws_node_disconnect(conn);
     }
     free(cfg);
     return NULL;
@@ -366,6 +414,12 @@ static void usage(const char *prog) {
         "  list                   List all configuration\n"
         "  --db PATH              Database path (default: %s)\n"
         "\n"
+        "Cron options:\n"
+        "  --verbose, -v    Verbose output\n"
+        "  --db PATH        Database path (default: %s)\n"
+        "  --daemon, -d     Run as daemon (for cron)\n"
+        "  --interval, -i N Poll interval in seconds (default: 60)\n"
+        "\n"
         "Common config keys:\n"
         "  storage_root     Path to storage directory or mount\n"
         "  server_url       URL of zep-air-serve (for remote)\n"
@@ -375,7 +429,7 @@ static void usage(const char *prog) {
         "  ca_path          Path to CA certificate\n"
         "  key_password     Password for encrypted key\n"
         "  chunk_size       Max blob size in bytes (default: %d)\n",
-        ZEP_VERSION, prog, g_db_path, g_db_path, g_db_path, g_db_path, ZEP_DEFAULT_CHUNK_SZ);
+        ZEP_VERSION, prog, g_db_path, g_db_path, g_db_path, g_db_path, g_db_path, ZEP_DEFAULT_CHUNK_SZ);
 }
 
 static int cmd_push(int argc, char *argv[]) {
@@ -866,7 +920,7 @@ static int cmd_cron(int argc, char *argv[]) {
             memcpy(tcfg, &cfg, sizeof(*tcfg));
             pthread_create(&ws_tid, NULL, ws_node_pipe_thread, (void *)tcfg);
             pthread_detach(ws_tid);
-            fprintf(stderr, "cron: WS pipe listener started for %s\n", cfg.node_name);
+            if (g_verbose) fprintf(stderr, "cron: WS pipe listener started for %s\n", cfg.node_name);
         }
     }
 
@@ -972,7 +1026,7 @@ static int cmd_cron(int argc, char *argv[]) {
                         db_close(db);
                         continue;
                     }
-                    fprintf(stderr, "pipe: recv session %s → %s\n",
+                    if (g_verbose) fprintf(stderr, "pipe: recv session %s → %s\n",
                             session, pipeline_cmd);
 
                     char errfile[] = "/tmp/zep-pipe-err-XXXXXX";
@@ -1037,10 +1091,10 @@ static int cmd_cron(int argc, char *argv[]) {
                         unlink(errfile);
                     }
 
-                    if (http_post_pipe_done(&http_cfg, session) == ZEP_ERR_OK)
-                        fprintf(stderr, "pipe: recv complete (%d chunks)\n",
+                    if (http_post_pipe_done(&http_cfg, session) == ZEP_ERR_OK) {
+                        if (g_verbose) fprintf(stderr, "pipe: recv complete (%d chunks)\n",
                                 chunk_count);
-                    else
+                    } else
                         fprintf(stderr, "pipe: recv done signal failed — "
                                 "aborting\n");
                     db_close(db);
@@ -1056,7 +1110,7 @@ static int cmd_cron(int argc, char *argv[]) {
                     db_close(db);
                     continue;
                 }
-                fprintf(stderr, "pipe: send: %s\n", pipeline_cmd);
+                if (g_verbose) fprintf(stderr, "pipe: send: %s\n", pipeline_cmd);
 
                 char errfile[] = "/tmp/zep-pipe-err-XXXXXX";
                 int err_fd = mkstemp(errfile);
@@ -1125,9 +1179,9 @@ static int cmd_cron(int argc, char *argv[]) {
                 pclose(send_fp);
                 if (err_fd >= 0) { close(err_fd); unlink(errfile); }
 
-                if (http_post_pipe_done(&http_cfg, session) == ZEP_ERR_OK)
-                    fprintf(stderr, "pipe: send complete (%d chunks)\n", part);
-                else {
+                if (http_post_pipe_done(&http_cfg, session) == ZEP_ERR_OK) {
+                    if (g_verbose) fprintf(stderr, "pipe: send complete (%d chunks)\n", part);
+                } else {
                     fprintf(stderr, "pipe: done signal failed, "
                             "session=%s\n", session);
                 }
@@ -1245,6 +1299,8 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
             i++;
             snprintf(g_db_path, sizeof(g_db_path), "%s", argv[i]);
+        } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
+            g_verbose = 1;
         } else {
             argv2[argc2++] = argv[i];
         }
