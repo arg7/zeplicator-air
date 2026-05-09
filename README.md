@@ -298,7 +298,7 @@ Commands:
   rollback --snap NAME      Cluster-wide rollback to snapshot
   snap create --name NAME   Manual snapshot (no rotation)
   snap destroy --name NAME  Remove manual snapshot
-  pipe --node CN [--chunk N] [--progress] <command...>  Run command on remote node via WebSocket, stream stdout+stderr
+  pipe [--compress] [--buffer] [--chunk N] --node CN [--progress] [--] <command...>  Run command on remote node via WebSocket, stream stdout+stderr
 ```
 
 ### `pipe` — Run commands on remote nodes (WebSocket)
@@ -306,14 +306,17 @@ Commands:
 Runs a command on a remote node, streaming `stdin`/`stdout`/`stderr` in real time through the server via a WebSocket bridge. The server checks the command against `pipe_allow` before forwarding. No disk storage — pure pipe-through. The remote exit code is returned as the admin's own exit code.
 
 ```
-zep-air-admin pipe --node <CN> [--chunk N] <command...>
+zep-air-admin pipe [--compress] [--buffer] [--chunk N] --node <CN> [--progress] [--] <command...>
 ```
 
 | Option | Description |
 |--------|-------------|
-| `--node CN` | Target node |
+| `--node CN` | Target node (required) |
+| `--compress` | Apply `pipe_zip_cmd`/`pipe_unzip_cmd` compression pipeline (future) |
+| `--buffer` | Apply `pipe_send_buf_cmd`/`pipe_recv_buf_cmd` buffering pipeline (future) |
 | `--chunk N` | Stdin read size in bytes (default: 16380, max one TLS record) |
 | `--progress` | Print transfer statistics on stderr |
+| `--" --"` | Optional separator between options and command |
 | `<command...>` | Command and arguments to execute on the remote node |
 
 **Send direction (admin stdin → node → admin stdout+stderr):**
@@ -334,9 +337,7 @@ zep-air-admin pipe --node za-client-1 dd if=/dev/zero bs=1M count=100 > random.b
 zep-air-admin pipe --node za-client-1 zfs recv -F -u vault/data < backup.zfs
 
 # Execute remote command, check exit code
-bash -c "exit 42"
-zep-air-admin pipe --node bench bash -c "exit 42"; echo $?
-42
+zep-air-admin pipe --node bench -- bash -c "exit 42"; echo $?  # prints 42
 ```
 
 **`pipe_allow` server config (enforced by the server before forwarding):**
