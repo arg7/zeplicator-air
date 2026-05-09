@@ -185,6 +185,18 @@ else
     bad "no snapshot found for pipe zfs send"
 fi
 
+# test 12 — pipe send pipeline: zfs list | zstd -c → admin | zstd -d
+echo -e "${CYAN}Test 12: pipe send pipeline (zfs list | zstd -c → zstd -d)${NC}"
+out=$(timeout 12s "$ADMIN" $PIPE_ADM pipe --node za-master "zfs list -H -o name -t snapshot za-master-pool/master | zstd -c" 2>/dev/null | zstd -d 2>/dev/null)
+echo "$out" | grep -q '@' && ok "pipe send pipeline returned snapshots" || bad "pipe send pipeline failed"
+
+# test 13 — pipe recv pipeline: echo | zstd -c → admin → zstd -d | head -c 5
+echo -e "${CYAN}Test 13: pipe recv pipeline (zstd -d | head -c 5)${NC}"
+pipe_allow "zfs,head"
+out=$(echo "hello world!" | zstd -c | timeout 12s "$ADMIN" $PIPE_ADM pipe --node za-master "zstd -d | head -c 5" 2>/dev/null)
+echo "$out" | grep -q "hello" && ok "pipe recv pipeline returned 'hello'" || bad "pipe recv pipeline failed: got '$out'"
+pipe_allow zfs
+
 # ---- cleanup ----
 cron_kill_all
 server_stop
