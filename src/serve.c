@@ -747,9 +747,11 @@ static int pipe_allowed_check(char *const *cmd_tokens, int cmd_n, const char *al
             entry_tokens[entry_n++] = estart;
         }
 
-        if (entry_n == 0) { entry = strtok_r(NULL, ",", &save); continue; }
+		if (entry_n == 0) { entry = strtok_r(NULL, ",", &save); continue; }
 
-        int prefix_n = (first_neg >= 0) ? first_neg : entry_n;
+		if (entry_n == 1 && strcmp(entry_tokens[0], "*") == 0) { free(al_copy); return 1; }
+
+		int prefix_n = (first_neg >= 0) ? first_neg : entry_n;
         if (prefix_n == 0 || prefix_n > cmd_n) {
             entry = strtok_r(NULL, ",", &save);
             continue;
@@ -796,7 +798,8 @@ static int tool_allowed(const char *tool, const char *tools_list) {
     char *entry = strtok_r(list_copy, ",", &save);
     while (entry) {
         while (*entry == ' ' || *entry == '\t') entry++;
-        if (strcmp(entry, tool) == 0) { free(list_copy); return 1; }
+		if (strcmp(entry, "*") == 0) { free(list_copy); return 1; }
+		if (strcmp(entry, tool) == 0) { free(list_copy); return 1; }
         entry = strtok_r(NULL, ",", &save);
     }
     free(list_copy);

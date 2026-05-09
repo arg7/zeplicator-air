@@ -123,11 +123,11 @@ snaps=$(sudo zfs list -r -t snapshot za-client-2-pool/slave 2>/dev/null | grep -
 
 # test 5
 echo -e "${CYAN}Test 5: GUID consistency${NC}"
-g_master=$(sudo zfs get -r -Hp -o value guid za-master-pool/master 2>/dev/null | grep -E '^[0-9]+$' | sort | tail -2 || true)
-g_c1=$(sudo zfs get -r -Hp -o value guid za-client-1-pool/slave 2>/dev/null | grep -E '^[0-9]+$' | sort || true)
-g_c2=$(sudo zfs get -r -Hp -o value guid za-client-2-pool/slave 2>/dev/null | grep -E '^[0-9]+$' | sort || true)
-echo "$g_c1" | grep -q "$(echo "$g_master" | tail -1)" && ok "client-1 latest GUID matches" || bad "client-1 GUID mismatch"
-echo "$g_c2" | grep -q "$(echo "$g_master" | tail -1)" && ok "client-2 latest GUID matches" || bad "client-2 GUID mismatch"
+g_master=$(sudo zfs get -t snapshot -r -Hp -o value guid za-master-pool/master 2>/dev/null | grep -E '^[0-9]+$' | sort -n || true)
+g_c1=$(sudo zfs get -t snapshot -r -Hp -o value guid za-client-1-pool/slave 2>/dev/null | grep -E '^[0-9]+$' | sort -n || true)
+g_c2=$(sudo zfs get -t snapshot -r -Hp -o value guid za-client-2-pool/slave 2>/dev/null | grep -E '^[0-9]+$' | sort -n || true)
+diff -q <(echo "$g_master") <(echo "$g_c1") && ok "client-1 GUIDs match" || bad "client-1 GUID mismatch"
+diff -q <(echo "$g_master") <(echo "$g_c2") && ok "client-2 GUIDs match" || bad "client-2 GUID mismatch"
 
 # test 6
 echo -e "${CYAN}Test 6: replica chain via HTTP (c1 -> c2)${NC}"
