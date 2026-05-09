@@ -752,32 +752,57 @@ static int pipe_allowed(const char *command, const char *allowlist) {
         if (!*entry) { entry = strtok_r(NULL, ",", &save); continue; }
 
         char *entry_tokens[32];
+        int entry_neg[32] = {0};
         int entry_n = 0;
+        int first_neg = -1;
         char *ep = entry;
         while (*ep && entry_n < 31) {
             while (*ep == ' ' || *ep == '\t') ep++;
             if (!*ep) break;
+            int neg = 0;
+            if (*ep == '!') { neg = 1; ep++; if (first_neg < 0) first_neg = entry_n; }
             char *estart = ep;
             while (*ep && *ep != ' ' && *ep != '\t') ep++;
             if (*ep) *ep++ = '\0';
+            if (!estart[0]) continue;
+            entry_neg[entry_n] = neg;
             entry_tokens[entry_n++] = estart;
         }
 
-        if (entry_n > 0 && entry_n <= cmd_n) {
-            int match = 1;
-            for (int i = 0; i < entry_n; i++) {
-                if (strcmp(entry_tokens[i], cmd_tokens[i]) != 0) {
-                    match = 0;
-                    break;
+        if (entry_n == 0) { entry = strtok_r(NULL, ",", &save); continue; }
+
+        int prefix_n = (first_neg >= 0) ? first_neg : entry_n;
+        if (prefix_n == 0 || prefix_n > cmd_n) {
+            entry = strtok_r(NULL, ",", &save);
+            continue;
+        }
+
+        for (int i = 0; i < prefix_n - 1; i++) {
+            if (strcmp(entry_tokens[i], cmd_tokens[i]) != 0)
+                goto next_entry;
+        }
+        {
+            int last = prefix_n - 1;
+            size_t elen = strlen(entry_tokens[last]);
+            if (strncmp(entry_tokens[last], cmd_tokens[last], elen) != 0)
+                goto next_entry;
+        }
+
+        if (prefix_n < cmd_n) {
+            for (int i = prefix_n; i < entry_n; i++) {
+                if (entry_neg[i] && strcmp(entry_tokens[i], cmd_tokens[prefix_n]) == 0) {
+                    free(cmd_copy);
+                    free(al_copy);
+                    return 0;
                 }
-            }
-            if (match) {
-                free(cmd_copy);
-                free(al_copy);
-                return 1;
             }
         }
 
+        free(cmd_copy);
+        free(al_copy);
+        return 1;
+
+next_entry:
         entry = strtok_r(NULL, ",", &save);
     }
 

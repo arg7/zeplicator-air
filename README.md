@@ -248,7 +248,7 @@ zep-air config list
 | `pipe_unzip_cmd` | Decompression command (default: `zstd -d`) |
 | `pipe_send_buf_cmd` | Buffer command before compression (e.g. `mbuffer -q -m 512M`) |
 | `pipe_recv_buf_cmd` | Buffer command after decompression |
-| `pipe_restrict` | Comma-separated allowed command prefixes for pipe (default: `zfs`; `*` = any) |
+| `pipe_allow` | Comma-separated allowed command prefixes (default: `zfs`). Supports negation (`zfs !destroy`) and prefix matching (`zfs snap` matches `zfs snapshot`). Empty string disables pipe entirely. |
 
 ### `zep-air-serve`
 
@@ -298,118 +298,99 @@ Commands:
   rollback --snap NAME      Cluster-wide rollback to snapshot
   snap create --name NAME   Manual snapshot (no rotation)
   snap destroy --name NAME  Remove manual snapshot
-  pipe [flags] <command...>  Run command on remote node, stream stdout+stderr via server
+  pipe --node CN [--chunk N] [--progress] <command...>  Run command on remote node via WebSocket, stream stdout+stderr
 ```
 
-### `pipe` — Run commands on remote nodes
+### `pipe` — Run commands on remote nodes (WebSocket)
 
-Runs an arbitrary command on a remote node, streaming `stdout`+`stderr` through the server in real time. The server validates the command prefix against the `pipe_restrict` config (default: only `zfs`). For `zfs` commands, logical `<pool/fs>` names from the cluster definition are automatically resolved to the node's local filesystem via its mapping. Non-`zfs` commands pass through unchanged.
-
-A 2-chunk FIFO on the server provides backpressure — no disk storage. Stderr from the remote process is embedded in chunks and separated on the receiving side. Sessions expire after 5 minutes of inactivity.
+Runs a command on a remote node, streaming `stdin`/`stdout`/`stderr` in real time through the server via a WebSocket bridge. The server checks the command against `pipe_allow` before forwarding. No disk storage — pure pipe-through. The remote exit code is returned as the admin's own exit code.
 
 ```
-zep-air-admin pipe [--recv] [--compress] [--buffer] [--node CN] [--progress] <command...>
+zep-air-admin pipe --node <CN> [--chunk N] <command...>
 ```
 
 | Option | Description |
 |--------|-------------|
-| `--recv` | Reverse direction — admin sends data, node runs command with data on stdin |
-| `--compress` | Apply `pipe_zip_cmd` / `pipe_unzip_cmd` (typically `zstd`) |
-| `--buffer` | Apply `pipe_send_buf_cmd` / `pipe_recv_buf_cmd` (e.g. `mbuffer`) |
-| `--node CN` | Target node (default: any non-suspended client, fallback to master) |
-| `--progress` | Print transfer status to stderr |
-| `<command...>` | Full command line to launch on the remote node |
+| `--node CN` | Target node |
+| `--chunk N` | Stdin read size in bytes (default: 16380, max one TLS record) |
+| `--progress` | Print transfer statistics on stderr |
+| `<command...>` | Command and arguments to execute on the remote node |
 
-**Send direction (node → admin):**
+**Send direction (admin stdin → node → admin stdout+stderr):**
 
-```sh
-# Full zfs send — pool/fs is auto-resolved via node mapping
-zep-air-admin pipe zfs send -R tank-prod/data > backup.zfs
-
-# Incremental with compression
-zep-air-admin pipe --compress --progress zfs send -i \
-  tank-prod/data@snap1 tank-prod/data@snap2
-
-# Resume interrupted send (-t token is part of the zfs command)
-zep-air-admin pipe zfs send -t '1-c22a4b65-...' tank-prod/data
-
-# Pipe directly into zfs recv on a new node
-zep-air-admin pipe zfs send -R tank-prod/data | zfs recv -F -u vault/data
-
-# Non-zfs command (requires pipe_restrict = "zfs,dd" on server)
-zep-air-admin pipe dd if=/dev/urandom bs=1M count=100 > random.bin
-```
-
-**Recv direction (admin → node):**
+Unlike the old architecture, there is no `--recv` flag — the direction is always full-duplex. Admin stdin feeds the remote process, remote stdout/stderr stream back to admin's stdout/stderr.
 
 ```sh
-# Send a backup file into a node's recv
-zep-air-admin pipe --recv --compress zfs recv -F -u tank-prod/data < backup.zfs
+# Stream zfs send output to local file
+zep-air-admin pipe --node za-master zfs send -R rpool/data > backup.zfs
 
-# Write data to a file on the node
-zep-air-admin pipe --recv dd of=/tmp/blob bs=1M < data.bin
+# Pipe stream directly into zfs recv
+zep-air-admin pipe --node za-master zfs send -R rpool/data | zfs recv -F -u vault/data
+
+# dd through pipe (requires pipe_allow update)
+zep-air-admin pipe --node za-client-1 dd if=/dev/zero bs=1M count=100 > random.bin
+
+# Feed data into remote recv
+zep-air-admin pipe --node za-client-1 zfs recv -F -u vault/data < backup.zfs
+
+# Execute remote command, check exit code
+bash -c "exit 42"
+zep-air-admin pipe --node bench bash -c "exit 42"; echo $?
+42
 ```
 
-**Chunk format:** `[4-byte LE uint32 stderr_len][stdout…][stderr…]` — both sides parse the header.
-The `--compress`/`--buffer` flags prepend/append the configured pipeline commands:
-
-| Direction | Compress on | Buffer on | Effective pipeline |
-|-----------|-------------|-----------|--------------------|
-| send | `… \| zstd -c` | `… \| mbuffer` | `cmd \| mbuffer \| zstd -c` |
-| recv | `zstd -d \| …` | `… \| mbuffer` | `zstd -d \| mbuffer \| cmd` |
-
-**`pipe_restrict` server config:**
+**`pipe_allow` server config (enforced by the server before forwarding):**
 
 ```
 # Default — only zfs commands
-zep-air-admin config set pipe_restrict zfs
+zep-air-admin config set pipe_allow zfs
 
 # Allow zfs + dd + bash
-zep-air-admin config set pipe_restrict "zfs,dd,bash"
+zep-air-admin config set pipe_allow "zfs,dd,bash"
 
-# Allow any command
-zep-air-admin config set pipe_restrict "*"
+# Allow zfs but deny dangerous subcommands
+zep-air-admin config set pipe_allow "zfs !destroy,zfs !promote,zpool !destroy"
+
+# Allow zfs snapshot subcommands (prefix match)
+zep-air-admin config set pipe_allow "zfs snap,zfs send,dd"
 
 # Disable pipe entirely
-zep-air-admin config set pipe_restrict ""
+zep-air-admin config set pipe_allow ""
 ```
 
-**Flow:**
+**`pipe_allow` syntax:**
+
+| Pattern | Description |
+|---------|-------------|
+| `zfs` | Allow any `zfs` command |
+| `zfs list` | Allow only `zfs list` (and sub-args) |
+| `zfs !destroy` | Allow `zfs` but deny `zfs destroy` |
+| `zfs !destroy !promote` | Deny multiple subcommands |
+| `zfs snap` | Prefix match: allows `zfs snapshot`, `zfs snap-anything` |
+| `zfs sna` | Prefix match: allows `zfs snapshot` (partial token) |
+
+Entries are comma-separated, evaluated left-to-right, first match wins. Negated entries deny immediately (no fallthrough to later entries).
+
+**Protocol (WebSocket frames):**
+
+| Opcode | Direction | Payload |
+|--------|-----------|---------|
+| `0x01` (TEXT) | node → admin | stderr text |
+| `0x02` (BIN) | bidirectional | stdin/stdout data |
+| `0x03` (EOF) | node → admin | stdin/stdout closed |
+| `0x04` (EXIT) | node → admin | 1-byte exit code |
+| `0x08` (CLOSE) | bidirectional | connection close |
+
+**Architecture:**
 
 ```
-Admin ──POST /v1/admin/pipe──▶ Server (checks pipe_restrict, suspends target, stores task)
-Node  ◀── cron poll ──────────▶ Server (returns pipe task with command)
-Node  ── cmd | [buf] | [zip] ─▶ PUT /v1/pipe/<s>/chunk/N (send direction)
-Admin ── poll GET /v1/admin/pipe/<s> ─▶ 200+chunk or 204(wait) or 200+0(done)
-Node  ── POST /v1/pipe/<s>/done ─▶ Server resumes node
+Admin ──WS──▶ [zep-air-serve] ◀──WS── node
+          stdin→          ←stdout+stderr+exit
 ```
 
-Reverse direction is symmetric: admin PUTs via `/v1/admin/pipe/<s>/chunk/N`, node GETs via `GET /v1/pipe/<s>`.
+The server bridges both WebSocket connections directly. No polling, no disk storage, no chunked REST API. The server validates the command against `pipe_allow` before forwarding to the node.
 
-### REST API — Pipe routes
-
-```
-POST /v1/admin/pipe                 Initiate pipe session (admin cert required)
-     Body: {"command":"zfs send -R tank/data","direction":"send|recv",
-            "compress":true,"buffer":true,"node":"optional-cn"}
-     → {"session":"abc123"}
-
-GET  /v1/admin/pipe/<session>       Poll for next chunk (admin cert, send direction)
-     → 200 + binary chunk
-     → 204 (no chunks yet, retry)
-     → 200 + empty body (pipe complete)
-
-PUT  /v1/admin/pipe/<session>/chunk/<N>  Admin uploads chunk (admin cert, recv direction)
-     → 200 ok / 503 queue full, retry
-POST /v1/admin/pipe/<session>/done      Admin signals end of data (admin cert, recv direction)
-
-PUT  /v1/pipe/<session>/chunk/<N>   Node uploads chunk (mTLS, send direction)
-     → 200 ok / 503 queue full, retry
-GET  /v1/pipe/<session>             Node downloads next chunk (mTLS, recv direction)
-     → 200 + binary chunk / 204 (wait) / 200+0 (producer done)
-POST /v1/pipe/<session>/done        Node signals completion (mTLS, both directions)
-     → resumes target node
-```
+The node executes `execvp()` directly — no shell (`/bin/sh`), no command injection risk. Arguments are tokenized with single/double quote support matching shell behavior.
 
 ## REST API
 
@@ -443,19 +424,6 @@ POST   /v1/admin/promote/<cn>          Promote client to master
 POST   /v1/admin/rollback/<snap>       Cluster rollback target
 POST   /v1/admin/snap/<name>           Manual snapshot (no rotation)
 POST   /v1/admin/unsnap/<name>         Remove manual snapshot
-# Pipe (admin scope)
-POST   /v1/admin/pipe                  Initiate pipe session
-GET    /v1/admin/pipe/<session>        Poll for pipe chunk (send direction)
-PUT    /v1/admin/pipe/<session>/chunk/<N>  Admin uploads chunk (recv direction)
-POST   /v1/admin/pipe/<session>/done   Admin signals end of data (recv direction)
-```
-
-### Pipe routes (mTLS, node scope)
-
-```
-PUT    /v1/pipe/<session>/chunk/<N>    Upload a chunk (send direction, max 2 queued)
-GET    /v1/pipe/<session>              Download next chunk (recv direction)
-POST   /v1/pipe/<session>/done         Signal completion, resumes target node
 ```
 
 ### Cron routes
@@ -470,6 +438,14 @@ GET  /v1/cron/protected?<cluster>   GUIDs unsafe to delete
 
 ```
 GET  /health                        Always 200 (no auth)
+```
+
+### WebSocket endpoints
+
+```
+GET  /v1/ws/node?cn=<CN>            Node persistent connection (upgrade to WS)
+GET  /v1/ws/pipe?node=<CN>&command=<cmd>  Admin pipe (upgrade to WS, bridges to node WS)
+GET  /v1/admin/pipe?node=<CN>       Check if node WS is connected (REST)
 ```
 
 ## Advanced Pipeline
