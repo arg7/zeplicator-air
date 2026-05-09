@@ -707,18 +707,11 @@ static int cmd_admin_snap(int argc, char *argv[]) {
 static int cmd_pipe(int argc, char *argv[]) {
     const char *node = NULL;
     int progress = 0;
-    int compress = 0;
-    int buffer = 0;
     size_t pipe_chunk = WS_CHUNK;
-    (void)compress; (void)buffer;
     int cmd_start = -1;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--compress") == 0)
-            compress = 1;
-        else if (strcmp(argv[i], "--buffer") == 0)
-            buffer = 1;
-        else if (strcmp(argv[i], "--node") == 0 && i + 1 < argc)
+        if (strcmp(argv[i], "--node") == 0 && i + 1 < argc)
             node = argv[++i];
         else if (strcmp(argv[i], "--progress") == 0)
             progress = 1;
@@ -736,23 +729,22 @@ static int cmd_pipe(int argc, char *argv[]) {
     }
 
     if (cmd_start < 0 || cmd_start >= argc) {
-        fprintf(stderr, "Usage: zep-air-admin pipe [--compress] [--buffer] [--chunk N] [--node CN] [--progress] <command...>\n"
-                        "  --compress  Apply pipe_zip_cmd / pipe_unzip_cmd compression\n"
-                        "  --buffer    Apply pipe_send_buf_cmd / pipe_recv_buf_cmd buffering\n"
+        fprintf(stderr, "Usage: zep-air-admin pipe [--chunk N] [--node CN] [--progress] <command...>\n"
                         "  --chunk N   WS frame payload size in bytes (default: %u)\n"
                         "  --node CN   Target node (default: auto-select)\n"
                         "  --progress  Print transfer progress to stderr\n"
                         "\nExamples:\n"
                         "  zep-air-admin pipe zfs send -R tank-prod/data\n"
                         "  zep-air-admin pipe --node foo bash\n"
-                        "  cat stream | zep-air-admin pipe zfs recv -F -u pool/fs | grep done\n", WS_CHUNK);
+                        "  zep-air-admin pipe \"zfs send tank/data | zstd -c | mbuffer -q -m 4G\" > backup.zfs\n"
+                        "  zfs send tank/data | zstd -c | mbuffer | zep-air-admin pipe \"mbuffer | zstd -d | zfs recv vault/data\"\n", WS_CHUNK);
         return 1;
     }
 
     char cmd_buf[4096] = {0};
     for (int i = cmd_start; i < argc; i++) {
         if (i > cmd_start) strncat(cmd_buf, " ", sizeof(cmd_buf) - strlen(cmd_buf) - 1);
-        int needs_quote = (strchr(argv[i], ' ') || strchr(argv[i], '\t'));
+        int needs_quote = (strchr(argv[i], ' ') || strchr(argv[i], '\t')) && !strchr(argv[i], '|');
         if (needs_quote) strncat(cmd_buf, "\"", sizeof(cmd_buf) - strlen(cmd_buf) - 1);
         strncat(cmd_buf, argv[i], sizeof(cmd_buf) - strlen(cmd_buf) - 1);
         if (needs_quote) strncat(cmd_buf, "\"", sizeof(cmd_buf) - strlen(cmd_buf) - 1);

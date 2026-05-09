@@ -162,6 +162,11 @@ pipe_allow() {
     "$ADMIN" $ADMIN_BASE config set pipe_allow "$1" >/dev/null
 }
 
+# ── pipe_allow_tools ──
+pipe_allow_tools() {
+    "$ADMIN" $ADMIN_BASE config set pipe_allow_tools "$1" >/dev/null
+}
+
 # ── cleanup ──
 cleanup() {
     server_stop 2>/dev/null || true

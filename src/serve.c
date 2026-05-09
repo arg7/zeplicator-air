@@ -717,34 +717,12 @@ static void ws_node_upgrade_handler(void *cls, struct MHD_Connection *conn,
     pthread_detach(nw->thread);
 }
 
-static int pipe_allowed(const char *command, const char *allowlist) {
-    if (!command || !allowlist || !allowlist[0]) return 0;
-
-    char *cmd_tokens[128];
-    int cmd_n = 0;
-    char *cmd_copy = strdup(command);
-    if (!cmd_copy) return 0;
-    char *p = cmd_copy;
-    while (*p && cmd_n < 127) {
-        while (*p == ' ' || *p == '\t') p++;
-        if (!*p) break;
-        char *start = p;
-        if (*p == '\'' || *p == '"') {
-            char q = *p++;
-            start = p;
-            while (*p && *p != q) p++;
-            if (*p) *p++ = '\0';
-        } else {
-            while (*p && *p != ' ' && *p != '\t') p++;
-            if (*p) *p++ = '\0';
-        }
-        cmd_tokens[cmd_n++] = start;
-    }
-
-    if (cmd_n == 0) { free(cmd_copy); return 0; }
+static int pipe_allowed_check(char *const *cmd_tokens, int cmd_n, const char *allowlist) {
+    if (!allowlist || !allowlist[0]) return 0;
+    if (cmd_n == 0) return 0;
 
     char *al_copy = strdup(allowlist);
-    if (!al_copy) { free(cmd_copy); return 0; }
+    if (!al_copy) return 0;
     char *save = NULL;
     char *entry = strtok_r(al_copy, ",", &save);
     while (entry) {
@@ -791,14 +769,12 @@ static int pipe_allowed(const char *command, const char *allowlist) {
         if (prefix_n < cmd_n) {
             for (int i = prefix_n; i < entry_n; i++) {
                 if (entry_neg[i] && strcmp(entry_tokens[i], cmd_tokens[prefix_n]) == 0) {
-                    free(cmd_copy);
                     free(al_copy);
                     return 0;
                 }
             }
         }
 
-        free(cmd_copy);
         free(al_copy);
         return 1;
 
@@ -806,9 +782,85 @@ next_entry:
         entry = strtok_r(NULL, ",", &save);
     }
 
-    free(cmd_copy);
     free(al_copy);
     return 0;
+}
+
+static int tool_allowed(const char *tool, const char *tools_list) {
+    if (!tool || !tools_list || !tools_list[0]) return 0;
+    if (!tool[0]) return 0;
+
+    char *list_copy = strdup(tools_list);
+    if (!list_copy) return 0;
+    char *save = NULL;
+    char *entry = strtok_r(list_copy, ",", &save);
+    while (entry) {
+        while (*entry == ' ' || *entry == '\t') entry++;
+        if (strcmp(entry, tool) == 0) { free(list_copy); return 1; }
+        entry = strtok_r(NULL, ",", &save);
+    }
+    free(list_copy);
+    return 0;
+}
+
+static int pipe_allowed(const char *command, const char *allowlist) {
+    if (!command || !allowlist || !allowlist[0]) return 0;
+
+    char *cmd_tokens[128];
+    int cmd_n = 0;
+    char *cmd_copy = strdup(command);
+    if (!cmd_copy) return 0;
+    char *p = cmd_copy;
+    while (*p && cmd_n < 127) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        char *start = p;
+        if (*p == '\'' || *p == '"') {
+            char q = *p++;
+            start = p;
+            while (*p && *p != q) p++;
+            if (*p) *p++ = '\0';
+        } else {
+            while (*p && *p != ' ' && *p != '\t') p++;
+            if (*p) *p++ = '\0';
+        }
+        cmd_tokens[cmd_n++] = start;
+    }
+
+    if (cmd_n == 0) { free(cmd_copy); return 0; }
+
+    int pipe_pos = -1;
+    for (int i = 0; i < cmd_n; i++) {
+        if (strcmp(cmd_tokens[i], "|") == 0) { pipe_pos = i; break; }
+    }
+
+    if (pipe_pos < 0) {
+        /* No pipeline — single command check */
+        int result = pipe_allowed_check(cmd_tokens, cmd_n, allowlist);
+        free(cmd_copy);
+        return result;
+    }
+
+    /* Check pipeline tools against pipe_allow_tools */
+    char tools_list[1024] = {0};
+    db_config_get(g_db, "pipe_allow_tools", tools_list, sizeof(tools_list));
+    if (!tools_list[0])
+        snprintf(tools_list, sizeof(tools_list), "buffer,mbuffer,zstd,lz4,gzip,gunzip");
+
+    for (int i = pipe_pos + 1; i < cmd_n; ) {
+        if (strcmp(cmd_tokens[i], "|") == 0) { i++; continue; }
+        if (!tool_allowed(cmd_tokens[i], tools_list)) {
+            free(cmd_copy);
+            return 0;
+        }
+        i++;
+        while (i < cmd_n && strcmp(cmd_tokens[i], "|") != 0) i++;
+    }
+
+    /* Check main command against pipe_allow */
+    int result = pipe_allowed_check(cmd_tokens, pipe_pos, allowlist);
+    free(cmd_copy);
+    return result;
 }
 
 /* Admin pipe WS upgrade handler - bridges to node WS */

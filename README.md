@@ -249,6 +249,7 @@ zep-air config list
 | `pipe_send_buf_cmd` | Buffer command before compression (e.g. `mbuffer -q -m 512M`) |
 | `pipe_recv_buf_cmd` | Buffer command after decompression |
 | `pipe_allow` | Comma-separated allowed command prefixes (default: `zfs`). Supports negation (`zfs !destroy`) and prefix matching (`zfs snap` matches `zfs snapshot`). Empty string disables pipe entirely. |
+| `pipe_allow_tools` | Comma-separated allowed pipeline tool names (default: `buffer,mbuffer,zstd,lz4,gzip,gunzip`). Checked for each `| cmd` segment in pipeline commands. |
 
 ### `zep-air-serve`
 
@@ -298,7 +299,7 @@ Commands:
   rollback --snap NAME      Cluster-wide rollback to snapshot
   snap create --name NAME   Manual snapshot (no rotation)
   snap destroy --name NAME  Remove manual snapshot
-  pipe [--compress] [--buffer] [--chunk N] --node CN [--progress] [--] <command...>  Run command on remote node via WebSocket, stream stdout+stderr
+  pipe [--chunk N] --node CN [--progress] [--] <command...>  Run command on remote node via WebSocket, stream stdout+stderr
 ```
 
 ### `pipe` — Run commands on remote nodes (WebSocket)
@@ -306,22 +307,41 @@ Commands:
 Runs a command on a remote node, streaming `stdin`/`stdout`/`stderr` in real time through the server via a WebSocket bridge. The server checks the command against `pipe_allow` before forwarding. No disk storage — pure pipe-through. The remote exit code is returned as the admin's own exit code.
 
 ```
-zep-air-admin pipe [--compress] [--buffer] [--chunk N] --node <CN> [--progress] [--] <command...>
+zep-air-admin pipe [--chunk N] --node <CN> [--progress] [--] <command...>
 ```
 
 | Option | Description |
 |--------|-------------|
 | `--node CN` | Target node (required) |
-| `--compress` | Apply `pipe_zip_cmd`/`pipe_unzip_cmd` compression pipeline (future) |
-| `--buffer` | Apply `pipe_send_buf_cmd`/`pipe_recv_buf_cmd` buffering pipeline (future) |
 | `--chunk N` | Stdin read size in bytes (default: 16380, max one TLS record) |
 | `--progress` | Print transfer statistics on stderr |
 | `--" --"` | Optional separator between options and command |
 | `<command...>` | Command and arguments to execute on the remote node |
 
+**Pipeline support with `|`:**
+
+Shell pipeline `|` is supported — quote the entire pipeline so the local shell passes `|` to the admin:
+
+```sh
+# Send with zstd compression + mbuffer
+zep-air-admin pipe --node za-master "zfs send -R rpool/data | zstd -c | mbuffer -q -m 4G" > backup.zfs
+
+# Decompress locally
+zep-air-admin pipe --node za-master "zfs send -R rpool/data | zstd -c" | zstd -d > backup.zfs
+
+# Feed data into remote recv with compression
+zfs send pool/data@snap | zstd -c | mbuffer | \
+  zep-air-admin pipe --node bench "mbuffer | zstd -d | zfs recv -F -u vault/data"
+
+# Interactive shell (no pipeline)
+zep-air-admin pipe --node bench bash
+```
+
+Pipelines are executed via `/bin/sh -c` on the node. Non-pipeline commands use `execvp()` directly (no shell). The server enforces pipeline tool allowlisting via `pipe_allow_tools`.
+
 **Send direction (admin stdin → node → admin stdout+stderr):**
 
-Unlike the old architecture, there is no `--recv` flag — the direction is always full-duplex. Admin stdin feeds the remote process, remote stdout/stderr stream back to admin's stdout/stderr.
+Full-duplex — admin stdin feeds the remote process, remote stdout/stderr stream back to admin's stdout/stderr.
 
 ```sh
 # Stream zfs send output to local file
@@ -329,9 +349,6 @@ zep-air-admin pipe --node za-master zfs send -R rpool/data > backup.zfs
 
 # Pipe stream directly into zfs recv
 zep-air-admin pipe --node za-master zfs send -R rpool/data | zfs recv -F -u vault/data
-
-# dd through pipe (requires pipe_allow update)
-zep-air-admin pipe --node za-client-1 dd if=/dev/zero bs=1M count=100 > random.bin
 
 # Feed data into remote recv
 zep-air-admin pipe --node za-client-1 zfs recv -F -u vault/data < backup.zfs
@@ -358,6 +375,20 @@ zep-air-admin config set pipe_allow "zfs snap,zfs send,dd"
 # Disable pipe entirely
 zep-air-admin config set pipe_allow ""
 ```
+
+**`pipe_allow_tools` server config — pipeline tool allowlist:**
+
+When a command contains `|` (shell pipeline), the main command is checked against `pipe_allow`, and each pipeline tool is checked against `pipe_allow_tools`.
+
+```
+# Default — common compression/buffering tools (set automatically)
+zep-air-admin config set pipe_allow_tools "buffer,mbuffer,zstd,lz4,gzip,gunzip"
+
+# Add custom tools
+zep-air-admin config set pipe_allow_tools "buffer,mbuffer,zstd,lz4,gzip,gunzip,pv,cat"
+```
+
+Only the tool name (first token after `|`) is checked — tool arguments are not validated.
 
 **`pipe_allow` syntax:**
 
@@ -389,9 +420,9 @@ Admin ──WS──▶ [zep-air-serve] ◀──WS── node
           stdin→          ←stdout+stderr+exit
 ```
 
-The server bridges both WebSocket connections directly. No polling, no disk storage, no chunked REST API. The server validates the command against `pipe_allow` before forwarding to the node.
+The server bridges both WebSocket connections directly. No polling, no disk storage. The server validates the command against `pipe_allow` (and pipeline tools against `pipe_allow_tools`) before forwarding to the node.
 
-The node executes `execvp()` directly — no shell (`/bin/sh`), no command injection risk. Arguments are tokenized with single/double quote support matching shell behavior.
+Non-pipeline commands are executed via `execvp()` — no shell, no command injection risk. Pipeline commands (containing `|`) use `/bin/sh -c` on the node, with tool allowlist enforcement on the server.
 
 ## REST API
 
