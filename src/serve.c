@@ -829,36 +829,73 @@ static int pipe_allowed(const char *command, const char *allowlist) {
 
     if (cmd_n == 0) { free(cmd_copy); return 0; }
 
-    int pipe_pos = -1;
+    /* Split into segments at pipe boundaries */
+    struct { int start; int len; } segments[65];
+    int seg_count = 0;
+    int seg_start = 0;
     for (int i = 0; i < cmd_n; i++) {
-        if (strcmp(cmd_tokens[i], "|") == 0) { pipe_pos = i; break; }
+        if (strcmp(cmd_tokens[i], "|") == 0) {
+            if (i > seg_start) {
+                segments[seg_count].start = seg_start;
+                segments[seg_count].len = i - seg_start;
+                seg_count++;
+            }
+            seg_start = i + 1;
+        }
+    }
+    if (cmd_n > seg_start) {
+        segments[seg_count].start = seg_start;
+        segments[seg_count].len = cmd_n - seg_start;
+        seg_count++;
     }
 
-    if (pipe_pos < 0) {
+    if (seg_count == 1) {
         /* No pipeline — single command check */
         int result = pipe_allowed_check(cmd_tokens, cmd_n, allowlist);
         free(cmd_copy);
         return result;
     }
 
-    /* Check pipeline tools against pipe_allow_tools */
+    /* Load pipe_allow_tools */
     char tools_list[1024] = {0};
     db_config_get(g_db, "pipe_allow_tools", tools_list, sizeof(tools_list));
     if (!tools_list[0])
         snprintf(tools_list, sizeof(tools_list), "buffer,mbuffer,zstd,lz4,gzip,gunzip");
 
-    for (int i = pipe_pos + 1; i < cmd_n; ) {
-        if (strcmp(cmd_tokens[i], "|") == 0) { i++; continue; }
-        if (!tool_allowed(cmd_tokens[i], tools_list)) {
+    /* Classify: tool segment (first token in tools list) vs main (non-tool) */
+    int main_seg = -1;
+    for (int i = 0; i < seg_count; i++) {
+        int is_tool = tool_allowed(cmd_tokens[segments[i].start], tools_list);
+        if (!is_tool) {
+            if (main_seg >= 0) {
+                /* Multiple non-tool segments — ambiguous pipeline */
+                free(cmd_copy);
+                return 0;
+            }
+            main_seg = i;
+        }
+    }
+
+    if (main_seg < 0) {
+        /* All segments are tools — no recognizable main command */
+        free(cmd_copy);
+        return 0;
+    }
+
+    /* Verify all tool segments are known tools */
+    for (int i = 0; i < seg_count; i++) {
+        if (i == main_seg) continue;
+        if (!tool_allowed(cmd_tokens[segments[i].start], tools_list)) {
             free(cmd_copy);
             return 0;
         }
-        i++;
-        while (i < cmd_n && strcmp(cmd_tokens[i], "|") != 0) i++;
     }
 
-    /* Check main command against pipe_allow */
-    int result = pipe_allowed_check(cmd_tokens, pipe_pos, allowlist);
+    /* Check main command segment against pipe_allow */
+    int result = pipe_allowed_check(
+        &cmd_tokens[segments[main_seg].start],
+        segments[main_seg].len,
+        allowlist);
     free(cmd_copy);
     return result;
 }
