@@ -868,9 +868,11 @@ static int cmd_pipe(int argc, char *argv[]) {
     free(inbuf);
     free(ws_buf); free(out);
 
-    /* Send CLOSE to server */
-    ws_send_frame_ssl(wc, WS_OP_CLOSE, NULL, 0);
-    usleep(100000);
+    /* Send CLOSE to server (only if server didn't close first) */
+    if (!ws_done) {
+        ws_send_frame_ssl(wc, WS_OP_CLOSE, NULL, 0);
+        usleep(100000);
+    }
     ws_close(wc);
 
     if (progress && g_verbose)

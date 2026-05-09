@@ -131,11 +131,9 @@ err_t db_config_load(sqlite3 *db, zep_config_t *cfg) {
     db_config_get(db, "pipe_unzip_cmd", cfg->pipe_unzip_cmd, sizeof(cfg->pipe_unzip_cmd));
     db_config_get(db, "pipe_send_buf_cmd", cfg->pipe_send_buf_cmd, sizeof(cfg->pipe_send_buf_cmd));
     db_config_get(db, "pipe_recv_buf_cmd", cfg->pipe_recv_buf_cmd, sizeof(cfg->pipe_recv_buf_cmd));
-    db_config_get(db, "pipe_restrict", cfg->pipe_restrict, sizeof(cfg->pipe_restrict));
+    db_config_get(db, "pipe_allow", cfg->pipe_allow, sizeof(cfg->pipe_allow));
 
-    if (!cfg->pipe_zip_cmd[0]) snprintf(cfg->pipe_zip_cmd, sizeof(cfg->pipe_zip_cmd), "zstd -c");
-    if (!cfg->pipe_unzip_cmd[0]) snprintf(cfg->pipe_unzip_cmd, sizeof(cfg->pipe_unzip_cmd), "zstd -d");
-    if (!cfg->pipe_restrict[0]) snprintf(cfg->pipe_restrict, sizeof(cfg->pipe_restrict), "zfs");
+    if (!cfg->pipe_allow[0]) snprintf(cfg->pipe_allow, sizeof(cfg->pipe_allow), "zfs");
 
     {
         char buf[32];

@@ -355,6 +355,7 @@ static void *ws_node_pipe_thread(void *arg) {
                                 close(stdout_pipe[1]);
                                 close(stderr_pipe[1]);
                                 execvp(argv_buf[0], argv_buf);
+                                dprintf(STDERR_FILENO, "exec: %s: %s\n", argv_buf[0], strerror(errno));
                                 _exit(1);
                             }
 

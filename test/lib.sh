@@ -157,9 +157,9 @@ cron_kill_all() {
     CRON_PIDS=()
 }
 
-# ── pipe_restrict ──
+# ── pipe_allow ──
 pipe_allow() {
-    "$ADMIN" $ADMIN_BASE config set pipe_restrict "$1" >/dev/null
+    "$ADMIN" $ADMIN_BASE config set pipe_allow "$1" >/dev/null
 }
 
 # ── cleanup ──

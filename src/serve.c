@@ -717,6 +717,75 @@ static void ws_node_upgrade_handler(void *cls, struct MHD_Connection *conn,
     pthread_detach(nw->thread);
 }
 
+static int pipe_allowed(const char *command, const char *allowlist) {
+    if (!command || !allowlist || !allowlist[0]) return 0;
+
+    char *cmd_tokens[128];
+    int cmd_n = 0;
+    char *cmd_copy = strdup(command);
+    if (!cmd_copy) return 0;
+    char *p = cmd_copy;
+    while (*p && cmd_n < 127) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        char *start = p;
+        if (*p == '\'' || *p == '"') {
+            char q = *p++;
+            start = p;
+            while (*p && *p != q) p++;
+            if (*p) *p++ = '\0';
+        } else {
+            while (*p && *p != ' ' && *p != '\t') p++;
+            if (*p) *p++ = '\0';
+        }
+        cmd_tokens[cmd_n++] = start;
+    }
+
+    if (cmd_n == 0) { free(cmd_copy); return 0; }
+
+    char *al_copy = strdup(allowlist);
+    if (!al_copy) { free(cmd_copy); return 0; }
+    char *save = NULL;
+    char *entry = strtok_r(al_copy, ",", &save);
+    while (entry) {
+        while (*entry == ' ' || *entry == '\t') entry++;
+        if (!*entry) { entry = strtok_r(NULL, ",", &save); continue; }
+
+        char *entry_tokens[32];
+        int entry_n = 0;
+        char *ep = entry;
+        while (*ep && entry_n < 31) {
+            while (*ep == ' ' || *ep == '\t') ep++;
+            if (!*ep) break;
+            char *estart = ep;
+            while (*ep && *ep != ' ' && *ep != '\t') ep++;
+            if (*ep) *ep++ = '\0';
+            entry_tokens[entry_n++] = estart;
+        }
+
+        if (entry_n > 0 && entry_n <= cmd_n) {
+            int match = 1;
+            for (int i = 0; i < entry_n; i++) {
+                if (strcmp(entry_tokens[i], cmd_tokens[i]) != 0) {
+                    match = 0;
+                    break;
+                }
+            }
+            if (match) {
+                free(cmd_copy);
+                free(al_copy);
+                return 1;
+            }
+        }
+
+        entry = strtok_r(NULL, ",", &save);
+    }
+
+    free(cmd_copy);
+    free(al_copy);
+    return 0;
+}
+
 /* Admin pipe WS upgrade handler - bridges to node WS */
 static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
                                      void *con_cls, const char *extra_in,
@@ -739,6 +808,50 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
     }
     if (g_verbose)
         fprintf(stderr, "ws: pipe found node %s sock=%d\n", node_cn, nw->sock);
+
+    /* Check pipe_allow before taking over node thread */
+    const char *command = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "command");
+    if (command) {
+        gnutls_session_t admin_tls_check = NULL;
+        int admin_raw_fd_check = sock;
+        if (!g_no_tls) {
+            const union MHD_ConnectionInfo *aci = MHD_get_connection_info(conn, MHD_CONNECTION_INFO_GNUTLS_SESSION);
+            if (aci && aci->tls_session) {
+                admin_tls_check = (gnutls_session_t)aci->tls_session;
+                admin_raw_fd_check = (int)(intptr_t)gnutls_transport_get_ptr(admin_tls_check);
+            }
+        }
+        if (admin_raw_fd_check < 0) admin_raw_fd_check = sock;
+
+        char pipe_allow[2048] = {0};
+        db_config_get(g_db, "pipe_allow", pipe_allow, sizeof(pipe_allow));
+        if (!pipe_allow[0]) snprintf(pipe_allow, sizeof(pipe_allow), "zfs");
+
+        if (!pipe_allowed(command, pipe_allow)) {
+            fprintf(stderr, "ws: pipe denied for '%s' to node %s\n", command, node_cn);
+            char errmsg[512];
+            int elen = snprintf(errmsg, sizeof(errmsg), "pipe: access denied for '%s'", command);
+            unsigned char fbuf[2048];
+            size_t flen;
+            flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_TEXT, (unsigned char *)errmsg, (size_t)elen);
+            if (flen > 0) {
+                if (g_no_tls) send(sock, fbuf, flen, MSG_NOSIGNAL);
+                else if (admin_tls_check) gnutls_record_send(admin_tls_check, fbuf, flen);
+            }
+            flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_EXIT, (unsigned char *)"\x01", 1);
+            if (flen > 0) {
+                if (g_no_tls) send(sock, fbuf, flen, MSG_NOSIGNAL);
+                else if (admin_tls_check) gnutls_record_send(admin_tls_check, fbuf, flen);
+            }
+            flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_CLOSE, NULL, 0);
+            if (flen > 0) {
+                if (g_no_tls) send(sock, fbuf, flen, MSG_NOSIGNAL);
+                else if (admin_tls_check) gnutls_record_send(admin_tls_check, fbuf, flen);
+            }
+            MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
+            return;
+        }
+    }
 
     /* Signal node thread to exit so we can take over the socket */
     pthread_mutex_lock(&nw->lock);
@@ -771,8 +884,6 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
     if (admin_raw_fd < 0) admin_raw_fd = sock;
 
     /* Send task JSON to node (via GnuTLS) */
-    const char *command = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "command");
-
     if (command) {
         cJSON *task = cJSON_CreateObject();
         cJSON_AddStringToObject(task, "action", "pipe");
