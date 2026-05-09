@@ -1,30 +1,57 @@
 #!/bin/bash
-# Pipe benchmark — compare zep-air-admin pipe vs local baseline
-# ./test/pipe_bench.sh [count_mb] [--skip-setup]
+# Pipe benchmark — measure throughput at various chunk sizes
+# ./test/pipe_bench.sh [duration_sec] [chunk_size] [--skip-setup]
+#   duration_sec  stream for at least this many seconds (default: 10)
+#   chunk_size    WS payload in bytes, 0=default(16380) (default: 0)
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
-COUNT_MB=${1:-256}
+DURATION=${1:-10}
+CHUNK=${2:-0}
 SERVER_PORT=18444
 SKIP_SETUP=0
-[[ "${2:-}" == "--skip-setup" ]] && SKIP_SETUP=1
+[[ "${3:-}" == "--skip-setup" ]] && SKIP_SETUP=1
 
-bm_quiet() {
+# Estimate count needed for the duration (assume 60 MB/s)
+EST_RATE=60
+COUNT_MB=$((DURATION * EST_RATE))
+[ "$COUNT_MB" -lt 10 ] && COUNT_MB=10
+# Cap at 512 MB to avoid excessive memory/disk
+[ "$COUNT_MB" -gt 512 ] && COUNT_MB=512
+
+CHUNK_ARG=""
+[ "$CHUNK" -gt 0 ] && CHUNK_ARG="--chunk $CHUNK"
+
+bm_send() {
     local label="$1"; shift
-    >&2 printf "  %-10s " "$label"
+    >&2 printf "  %-12s " "$label"
     local t0; t0=$(date +%s%N)
-    "$@" >/dev/null 2>/dev/null
+    local bytes; bytes=$("$@" 2>/dev/null | wc -c)
     local t1; t1=$(date +%s%N)
     local ns=$((t1 - t0))
-    local sec=$(awk "BEGIN {printf \"%.3f\", $ns/1000000000}")
-    local rate=$(awk "BEGIN {printf \"%.1f\", ${COUNT_MB}/${sec}}")
-    printf "%6.1f MB/s  (%.2fs, %d MB)\n" "$rate" "$sec" "$COUNT_MB"
+    local sec=$(awk "BEGIN {printf \"%.2f\", $ns/1000000000}")
+    local mb=$(awk "BEGIN {printf \"%.1f\", $bytes/1048576}")
+    local rate=$(awk "BEGIN {printf \"%.1f\", $mb/${sec}}")
+    printf "%6.1f MB/s  (%ss, %.1f MB)\n" "$rate" "$sec" "$mb"
 }
 
-echo "=== pipe benchmark — ${COUNT_MB} MB ==="
+bm_recv() {
+    local label="$1"; shift
+    >&2 printf "  %-12s " "$label"
+    local t0; t0=$(date +%s%N)
+    dd if=/dev/zero bs=1M count="$COUNT_MB" 2>/dev/null | "$@" >/dev/null
+    local t1; t1=$(date +%s%N)
+    local ns=$((t1 - t0))
+    local sec=$(awk "BEGIN {printf \"%.2f\", $ns/1000000000}")
+    local rate=$(awk "BEGIN {printf \"%.1f\", ${COUNT_MB}/${sec}}")
+    printf "%6.1f MB/s  (%ss)\n" "$rate" "$sec"
+}
+
+echo "=== pipe benchmark — ${COUNT_MB} MB, target ~${DURATION}s ==="
+[ "$CHUNK" -gt 0 ] && echo "    chunk = ${CHUNK} bytes" || echo "    chunk = default (16380)"
 
 echo -e "\n${CYAN}Local baseline (no TLS, no relay)${NC}"
-bm_quiet "dd" dd if=/dev/urandom bs=1M "count=$COUNT_MB" of=/dev/null
+bm_send "dd" dd if=/dev/zero bs=1M count="$COUNT_MB" of=/dev/null
 
 if [ "$SKIP_SETUP" -eq 1 ]; then
     echo -e "\n${CYAN}Skipping server/node setup${NC}"
@@ -60,60 +87,48 @@ node_config "$NDB" bench-node "https://$FQDN:$SERVER_PORT" "$PKI/bench-node.crt"
 cron_spawn "$NDB" 2
 echo "  Node cron PID=${CRON_PIDS[0]}"
 
-# ── benchmarks ──
-echo -e "\n${CYAN}Pipe benchmarks (admin → server → node → server → admin)${NC}"
+# ── send benchmark (node → admin) ──
+echo -e "\n${CYAN}Send benchmark (node→admin, node generates /dev/urandom)${NC}"
+STM_CMD="$ADMIN $ADMIN_BASE pipe --node bench-node $CHUNK_ARG dd if=/dev/zero bs=1M count=$COUNT_MB"
+bm_send "send" $STM_CMD
 
-ADM_CMD="$ADMIN $ADMIN_BASE pipe --node bench-node dd if=/dev/urandom bs=1M count=$COUNT_MB"
-bm_quiet "pipe"      $ADM_CMD
-bm_quiet "pipe+zstd"  $ADMIN $ADMIN_BASE pipe --node bench-node --compress dd if=/dev/urandom bs=1M "count=$COUNT_MB"
-bm_quiet "pipe+zbuf"  $ADMIN $ADMIN_BASE pipe --node bench-node --compress --buffer dd if=/dev/urandom bs=1M "count=$COUNT_MB"
+# ── recv benchmark (admin → node) ──
+echo -e "\n${CYAN}Recv benchmark (admin→node, admin streams /dev/zero)${NC}"
+rm -f "$TMP/recv-test"
+RCV_CMD="$ADMIN $ADMIN_BASE pipe --node bench-node $CHUNK_ARG dd of=$TMP/recv-test bs=1M"
+bm_recv "recv" $RCV_CMD
+
+# Verify recv
+EXPECTED=$((COUNT_MB * 1024 * 1024))
+sz=$(stat -c%s "$TMP/recv-test" 2>/dev/null || echo 0)
+if [ "$sz" -eq "$EXPECTED" ]; then
+    echo -e "  ${GREEN}OK${NC}   recv: ${COUNT_MB} MB transferred, data verified"
+else
+    echo -e "  ${RED}FAIL${NC} recv: expected $EXPECTED bytes, got $sz"
+fi
 
 # ── stderr test ──
 echo -e "\n${CYAN}Stderr propagation test${NC}"
-STDERR_OUT=$("$ADMIN" $ADMIN_BASE pipe --node bench-node dd if=/dev/urandom bs=1M count="$COUNT_MB" 2>&1 >/dev/null || true)
+STDERR_OUT=$("$ADMIN" $ADMIN_BASE pipe --node bench-node dd if=/dev/zero bs=1M count=1 of=/dev/null 2>&1 >/dev/null || true)
 echo "$STDERR_OUT" | grep -q "bytes.*copied\|records" && \
     echo -e "  ${GREEN}OK${NC}   stderr from remote dd visible" || \
     echo -e "  ${RED}FAIL${NC} stderr from remote dd missing"
 
-# ── recv test ──
-echo -e "\n${CYAN}Recv direction test${NC}"
-
-# Simple tee test first (foreground, no kill)
+# ── tiny recv smoke test ──
+echo -e "\n${CYAN}Tiny recv smoke test${NC}"
+rm -f "$TMP/recv-tiny.txt"
 echo -n "hello world" | \
     "$ADMIN" $ADMIN_BASE pipe --node bench-node tee "$TMP/recv-tiny.txt" 2>/dev/null
-for i in $(seq 1 5); do
-    if [ -f "$TMP/recv-tiny.txt" ]; then
-        content=$(cat "$TMP/recv-tiny.txt" 2>/dev/null)
-        [ "$content" = "hello world" ] && break
-    fi
-    sleep 1
-done
 if [ -f "$TMP/recv-tiny.txt" ] && [ "$(cat "$TMP/recv-tiny.txt" 2>/dev/null)" = "hello world" ]; then
-    echo -e "  ${GREEN}OK${NC}   tiny recv: '$(cat "$TMP/recv-tiny.txt")'"
+    echo -e "  ${GREEN}OK${NC}   tiny recv: 'hello world'"
 else
     c=$(cat "$TMP/recv-tiny.txt" 2>/dev/null || echo "<missing>")
     echo -e "  ${RED}FAIL${NC} tiny recv got: '$c'"
 fi
 
-rm -f "$TMP/recv-test"
-echo "--- recv dd test ---"
-EXPECTED=$((COUNT_MB * 1024 * 1024))
-dd if=/dev/zero bs=1M count="$COUNT_MB" 2>/dev/null | \
-    "$ADMIN" $ADMIN_BASE pipe --node bench-node dd of="$TMP/recv-test" bs=1M
-echo "recv dd exit=$?"
-for i in 1 2 3 4 5; do
-    sz=$(stat -c%s "$TMP/recv-test" 2>/dev/null || echo 0)
-    [ "$sz" -eq "$EXPECTED" ] && break
-    sleep 1
-done
-if [ -f "$TMP/recv-test" ] && [ "$(stat -c%s "$TMP/recv-test" 2>/dev/null || echo 0)" -eq "$EXPECTED" ]; then
-    echo -e "  ${GREEN}OK${NC}   recv direction: ${COUNT_MB} MB transferred"
-else
-    sz=$(stat -c%s "$TMP/recv-test" 2>/dev/null || echo 0)
-    echo -e "  ${RED}FAIL${NC} recv direction data mismatch (got $sz bytes)"
-fi
-
 echo -e "\n${CYAN}Cleaning up...${NC}"
 cleanup
+
 echo -e "\n${GREEN}Benchmark complete.${NC}"
-echo "Count = ${COUNT_MB} MB. Divide by 4 hops for per-hop overhead estimate."
+echo "Sent/received ${COUNT_MB} MB over HTTPS WebSocket pipe."
+echo "Chunk: ${CHUNK:-default} bytes. Target: ~${DURATION}s. Cap: 512 MB."

@@ -301,8 +301,30 @@ static void *ws_node_pipe_thread(void *arg) {
                     cJSON *command = cJSON_GetObjectItem(task, "command");
                     if (action && command && cJSON_IsString(action) && cJSON_IsString(command)) {
                         if (strcmp(action->valuestring, "pipe") == 0) {
-                            char resolved[4096];
-                            snprintf(resolved, sizeof(resolved), "%s", command->valuestring);
+                            const char *cmd_str = command->valuestring;
+                            char *cmd_copy = strdup(cmd_str);
+                            char *argv_buf[128];
+                            int argc2 = 0;
+                            if (cmd_copy) {
+                                char *p = cmd_copy;
+                                while (*p && argc2 < 127) {
+                                    while (*p == ' ' || *p == '\t') p++;
+                                    if (!*p) break;
+                                    char *start = p;
+                                    if (*p == '\'' || *p == '"') {
+                                        char q = *p++;
+                                        start = p;
+                                        while (*p && *p != q) p++;
+                                        if (*p) *p++ = '\0';
+                                    } else {
+                                        while (*p && *p != ' ' && *p != '\t') p++;
+                                        if (*p) *p++ = '\0';
+                                    }
+                                    argv_buf[argc2++] = start;
+                                }
+                            }
+                            argv_buf[argc2] = NULL;
+                            if (argc2 == 0) { free(cmd_copy); cJSON_Delete(task); continue; }
 
                             int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2];
                             if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
@@ -313,6 +335,7 @@ static void *ws_node_pipe_thread(void *arg) {
 
                             pid_t pid = fork();
                             if (pid < 0) {
+                                free(cmd_copy);
                                 fprintf(stderr, "ws-node: fork() failed\n");
                                 close(stdin_pipe[0]); close(stdin_pipe[1]);
                                 close(stdout_pipe[0]); close(stdout_pipe[1]);
@@ -331,10 +354,11 @@ static void *ws_node_pipe_thread(void *arg) {
                                 close(stdin_pipe[0]);
                                 close(stdout_pipe[1]);
                                 close(stderr_pipe[1]);
-                                execl("/bin/sh", "sh", "-c", resolved, NULL);
+                                execvp(argv_buf[0], argv_buf);
                                 _exit(1);
                             }
 
+                            free(cmd_copy);
                             close(stdin_pipe[0]);
                             close(stdout_pipe[1]);
                             close(stderr_pipe[1]);
@@ -350,7 +374,7 @@ static void *ws_node_pipe_thread(void *arg) {
                             unsigned char *pending_data = NULL;
                             ssize_t pending_len = 0;
 
-                            if (g_verbose) fprintf(stderr, "ws-node: pipe started: %s pid=%d\n", resolved, (int)pid);
+                            if (g_verbose) fprintf(stderr, "ws-node: pipe started: %s pid=%d\n", cmd_str, (int)pid);
 
                             int ws_fd = conn->sock;
                             int ws_flags = fcntl(ws_fd, F_GETFL, 0);

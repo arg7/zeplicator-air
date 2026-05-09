@@ -704,13 +704,12 @@ static int cmd_admin_snap(int argc, char *argv[]) {
     return do_get(path);
 }
 
-#define ZEP_ADMIN_PIPE_CHUNK WS_CHUNK
-
 static int cmd_pipe(int argc, char *argv[]) {
     const char *node = NULL;
     int progress = 0;
     int compress = 0;
     int buffer = 0;
+    size_t pipe_chunk = WS_CHUNK;
     (void)compress; (void)buffer;
     int cmd_start = -1;
 
@@ -723,6 +722,10 @@ static int cmd_pipe(int argc, char *argv[]) {
             node = argv[++i];
         else if (strcmp(argv[i], "--progress") == 0)
             progress = 1;
+        else if (strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
+            long val = atol(argv[++i]);
+            if (val > 0) pipe_chunk = (size_t)val;
+        }
         else if (strcmp(argv[i], "--") == 0) {
             cmd_start = i + 1;
             break;
@@ -733,22 +736,26 @@ static int cmd_pipe(int argc, char *argv[]) {
     }
 
     if (cmd_start < 0 || cmd_start >= argc) {
-        fprintf(stderr, "Usage: zep-air-admin pipe [--compress] [--buffer] [--node CN] [--progress] <command...>\n"
+        fprintf(stderr, "Usage: zep-air-admin pipe [--compress] [--buffer] [--chunk N] [--node CN] [--progress] <command...>\n"
                         "  --compress  Apply pipe_zip_cmd / pipe_unzip_cmd compression\n"
                         "  --buffer    Apply pipe_send_buf_cmd / pipe_recv_buf_cmd buffering\n"
+                        "  --chunk N   WS frame payload size in bytes (default: %u)\n"
                         "  --node CN   Target node (default: auto-select)\n"
                         "  --progress  Print transfer progress to stderr\n"
                         "\nExamples:\n"
                         "  zep-air-admin pipe zfs send -R tank-prod/data\n"
                         "  zep-air-admin pipe --node foo bash\n"
-                        "  cat stream | zep-air-admin pipe zfs recv -F -u pool/fs | grep done\n");
+                        "  cat stream | zep-air-admin pipe zfs recv -F -u pool/fs | grep done\n", WS_CHUNK);
         return 1;
     }
 
     char cmd_buf[4096] = {0};
     for (int i = cmd_start; i < argc; i++) {
         if (i > cmd_start) strncat(cmd_buf, " ", sizeof(cmd_buf) - strlen(cmd_buf) - 1);
+        int needs_quote = (strchr(argv[i], ' ') || strchr(argv[i], '\t'));
+        if (needs_quote) strncat(cmd_buf, "\"", sizeof(cmd_buf) - strlen(cmd_buf) - 1);
         strncat(cmd_buf, argv[i], sizeof(cmd_buf) - strlen(cmd_buf) - 1);
+        if (needs_quote) strncat(cmd_buf, "\"", sizeof(cmd_buf) - strlen(cmd_buf) - 1);
     }
 
     const char *target_node = node;
@@ -788,7 +795,11 @@ static int cmd_pipe(int argc, char *argv[]) {
     uint64_t sent = 0, rcvd_stdout = 0, rcvd_stderr = 0;
     int stdin_done = 0;
     int ws_done = 0;
+    int remote_exit = 1;
     time_t start_time = time(NULL);
+
+    unsigned char *inbuf = malloc(pipe_chunk);
+    if (!inbuf) { ws_close(wc); return 1; }
 
     for (;;) {
         fd_set rfds;
@@ -803,7 +814,6 @@ static int cmd_pipe(int argc, char *argv[]) {
 
         if (sel < 0 && errno != EINTR) break;
 
-        /* Timeout safety: if stdin done but no ws activity for 30s, exit */
         if (stdin_done && !ws_done && time(NULL) - start_time > 30) {
             if (g_verbose) fprintf(stderr, "pipe: timeout waiting for remote response\n");
             break;
@@ -812,8 +822,7 @@ static int cmd_pipe(int argc, char *argv[]) {
 
         if (sel > 0 || ssl_pending) {
             if (!stdin_done && FD_ISSET(STDIN_FILENO, &rfds)) {
-                unsigned char inbuf[WS_CHUNK];
-                ssize_t nr = read(STDIN_FILENO, inbuf, sizeof(inbuf));
+                ssize_t nr = read(STDIN_FILENO, inbuf, pipe_chunk);
                 if (nr > 0) {
                     if (ws_send_frame_ssl(wc, WS_OP_BIN, inbuf, (size_t)nr) < 0) { ws_done = 1; break; }
                     sent += (uint64_t)nr;
@@ -845,11 +854,10 @@ static int cmd_pipe(int argc, char *argv[]) {
                     rcvd_stderr += (uint64_t)n;
                 }
                 if (op == WS_OP_EOF) {
-                    /* stdout or stderr stream closed by remote */
                 }
                 if (op == WS_OP_EXIT && n == 1) {
-                    int exit_code = (int)out[0];
-                    if (g_verbose) fprintf(stderr, "pipe: remote exit=%d\n", exit_code);
+                    remote_exit = (int)out[0];
+                    if (g_verbose) fprintf(stderr, "pipe: remote exit=%d\n", remote_exit);
                 }
             }
         }
@@ -857,6 +865,7 @@ static int cmd_pipe(int argc, char *argv[]) {
         if (stdin_done && ws_done) break;
     }
 
+    free(inbuf);
     free(ws_buf); free(out);
 
     /* Send CLOSE to server */
@@ -865,9 +874,9 @@ static int cmd_pipe(int argc, char *argv[]) {
     ws_close(wc);
 
     if (progress && g_verbose)
-        fprintf(stderr, "\npipe: done — sent=%llu recv_stdout=%llu recv_stderr=%llu\n",
-                (unsigned long long)sent, (unsigned long long)rcvd_stdout, (unsigned long long)rcvd_stderr);
-    return 0;
+        fprintf(stderr, "\npipe: done — sent=%llu recv_stdout=%llu recv_stderr=%llu exit=%d\n",
+                (unsigned long long)sent, (unsigned long long)rcvd_stdout, (unsigned long long)rcvd_stderr, remote_exit);
+    return remote_exit;
 }
 
 static int cmd_list_nodes(int argc, char *argv[]) {

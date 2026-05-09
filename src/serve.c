@@ -774,13 +774,17 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
     const char *command = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "command");
 
     if (command) {
-        char *task_json = NULL;
-        if (asprintf(&task_json, "{\"action\":\"pipe\",\"command\":\"%s\"}", command) > 0) {
+        cJSON *task = cJSON_CreateObject();
+        cJSON_AddStringToObject(task, "action", "pipe");
+        cJSON_AddStringToObject(task, "command", command);
+        char *task_json = cJSON_PrintUnformatted(task);
+        if (task_json) {
             if (g_verbose)
                 fprintf(stderr, "ws: sending task to node: %s\n", task_json);
             ws_send_frame_gtls(nw, WS_OP_TEXT, (unsigned char *)task_json, strlen(task_json));
             free(task_json);
         }
+        cJSON_Delete(task);
     }
 
     /* Bridge: admin socket ↔ node WS */
