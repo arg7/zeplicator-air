@@ -19,6 +19,7 @@
 #include <netdb.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/wait.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/sha.h>
@@ -34,6 +35,8 @@ static int  g_verbose = 0;
 #define WS_NODE_FRAME_MAX (128 * 1024)
 #define WS_NODE_OP_TEXT  0x01
 #define WS_NODE_OP_BIN   0x02
+#define WS_NODE_OP_EOF   0x03
+#define WS_NODE_OP_EXIT  0x04
 #define WS_NODE_OP_CLOSE 0x08
 #define WS_NODE_OP_PING  0x09
 #define WS_NODE_OP_PONG  0x0A
@@ -277,97 +280,202 @@ static void *ws_node_pipe_thread(void *arg) {
         unsigned char *out = malloc(WS_NODE_FRAME_MAX);
         if (!buf || !out) { free(buf); free(out); ws_node_disconnect(conn); sleep(5); continue; }
 
-        FILE *cmd_fp = NULL;
-        char cmd_errfile[256] = {0};
-        int in_pipe = 0;
-        int pipe_recv_mode = 0;
+        /* Wait for pipe task */
 
         for (;;) {
             ssize_t n = ws_node_recv_frame(conn, out, WS_NODE_FRAME_MAX, &buf[0]);
             unsigned char opcode = buf[0] & 0x0F;
 
-            if (n < 0) {
-                fprintf(stderr, "ws-node: recv error, reconnecting\n");
-                break;
-            }
-            if (opcode == WS_NODE_OP_CLOSE) {
-                if (g_verbose) fprintf(stderr, "ws-node: close received, reconnecting\n");
-                break;
-            }
-            if (opcode == WS_NODE_OP_PING) {
-                ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)n);
-                continue;
-            }
+            if (n < 0) { fprintf(stderr, "ws-node: recv error, reconnecting\n"); break; }
+            if (opcode == WS_NODE_OP_CLOSE) { if (g_verbose) fprintf(stderr, "ws-node: close\n"); break; }
+            if (opcode == WS_NODE_OP_PING) { ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)n); continue; }
             if (opcode == WS_NODE_OP_PONG) continue;
+            if (opcode == WS_NODE_OP_EOF) continue;
+            if (opcode == WS_NODE_OP_EXIT) continue;
 
-            if (opcode == WS_NODE_OP_TEXT || opcode == WS_NODE_OP_BIN) {
-                if (!in_pipe && n > 0) {
-                    out[n] = '\0';
-                    cJSON *task = cJSON_Parse((char *)out);
-                    if (task) {
-                        cJSON *action = cJSON_GetObjectItem(task, "action");
-                        cJSON *command = cJSON_GetObjectItem(task, "command");
-                        cJSON *dir = cJSON_GetObjectItem(task, "direction");
-                        if (action && command && cJSON_IsString(action) && cJSON_IsString(command)) {
-                            if (strcmp(action->valuestring, "pipe") == 0) {
-                                int recv_mode = (dir && cJSON_IsString(dir) && strcmp(dir->valuestring, "recv") == 0);
-                                char resolved[4096];
-                                snprintf(resolved, sizeof(resolved), "%s", command->valuestring);
-                                char errfile[] = "/tmp/zep-pipe-err-XXXXXX";
-                                int err_fd = mkstemp(errfile);
-                                char full_cmd[4096 + 256];
-                                if (err_fd >= 0) {
-                                    snprintf(full_cmd, sizeof(full_cmd), "(%s) 2>%s", resolved, errfile);
-                                    snprintf(cmd_errfile, sizeof(cmd_errfile), "%s", errfile);
-                                } else {
-                                    snprintf(full_cmd, sizeof(full_cmd), "%s", resolved);
-                                    cmd_errfile[0] = '\0';
+            if ((opcode == WS_NODE_OP_TEXT || opcode == WS_NODE_OP_BIN) && n > 0) {
+                out[n] = '\0';
+                cJSON *task = cJSON_Parse((char *)out);
+                if (task) {
+                    cJSON *action = cJSON_GetObjectItem(task, "action");
+                    cJSON *command = cJSON_GetObjectItem(task, "command");
+                    if (action && command && cJSON_IsString(action) && cJSON_IsString(command)) {
+                        if (strcmp(action->valuestring, "pipe") == 0) {
+                            char resolved[4096];
+                            snprintf(resolved, sizeof(resolved), "%s", command->valuestring);
+
+                            int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2];
+                            if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
+                                fprintf(stderr, "ws-node: pipe() failed\n");
+                                cJSON_Delete(task);
+                                continue;
+                            }
+
+                            pid_t pid = fork();
+                            if (pid < 0) {
+                                fprintf(stderr, "ws-node: fork() failed\n");
+                                close(stdin_pipe[0]); close(stdin_pipe[1]);
+                                close(stdout_pipe[0]); close(stdout_pipe[1]);
+                                close(stderr_pipe[0]); close(stderr_pipe[1]);
+                                cJSON_Delete(task);
+                                continue;
+                            }
+
+                            if (pid == 0) {
+                                close(stdin_pipe[1]);
+                                close(stdout_pipe[0]);
+                                close(stderr_pipe[0]);
+                                dup2(stdin_pipe[0], STDIN_FILENO);
+                                dup2(stdout_pipe[1], STDOUT_FILENO);
+                                dup2(stderr_pipe[1], STDERR_FILENO);
+                                close(stdin_pipe[0]);
+                                close(stdout_pipe[1]);
+                                close(stderr_pipe[1]);
+                                execl("/bin/sh", "sh", "-c", resolved, NULL);
+                                _exit(1);
+                            }
+
+                            close(stdin_pipe[0]);
+                            close(stdout_pipe[1]);
+                            close(stderr_pipe[1]);
+                            int child_stdin = stdin_pipe[1];
+                            int child_stdout = stdout_pipe[0];
+                            int child_stderr = stderr_pipe[0];
+                            fcntl(child_stdin, F_SETFL, fcntl(child_stdin, F_GETFL) | O_NONBLOCK);
+
+                            int child_stdin_open = 1;
+                            int child_stdout_open = 1;
+                            int child_stderr_open = 1;
+                            int ws_alive = 1;
+                            unsigned char *pending_data = NULL;
+                            ssize_t pending_len = 0;
+
+                            if (g_verbose) fprintf(stderr, "ws-node: pipe started: %s pid=%d\n", resolved, (int)pid);
+
+                            int ws_fd = conn->sock;
+                            int ws_flags = fcntl(ws_fd, F_GETFL, 0);
+                            fcntl(ws_fd, F_SETFL, ws_flags | O_NONBLOCK);
+
+                            while (ws_alive && (child_stdout_open || child_stderr_open || pending_len > 0)) {
+                                fd_set rfds, wfds;
+                                FD_ZERO(&rfds);
+                                FD_ZERO(&wfds);
+                                int maxfd = -1;
+                                if (child_stdout_open) { FD_SET(child_stdout, &rfds); if (child_stdout > maxfd) maxfd = child_stdout; }
+                                if (child_stderr_open) { FD_SET(child_stderr, &rfds); if (child_stderr > maxfd) maxfd = child_stderr; }
+                                if (pending_len == 0) { FD_SET(ws_fd, &rfds); if (ws_fd > maxfd) maxfd = ws_fd; }
+                                if (child_stdin_open && pending_len > 0) {
+                                    FD_SET(child_stdin, &wfds);
+                                    if (child_stdin > maxfd) maxfd = child_stdin;
                                 }
-                                cmd_fp = popen(full_cmd, recv_mode ? "w" : "r");
-                                pipe_recv_mode = recv_mode;
-                                if (cmd_fp) {
-                                    in_pipe = 1;
-                                    if (g_verbose) fprintf(stderr, "ws-node: pipe started (%s): %s\n", recv_mode ? "recv" : "send", resolved);
-                                } else {
-                                    fprintf(stderr, "ws-node: popen failed: %s\n", resolved);
+
+                                struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
+                                int sel = select(maxfd + 1, &rfds, &wfds, NULL, &tv);
+                                int ssl_pending = (conn->ssl && SSL_pending(conn->ssl) > 0);
+
+                                if (sel < 0 && errno != EINTR) break;
+
+                                if (sel > 0 || ssl_pending) {
+                                    if (pending_len > 0 && FD_ISSET(child_stdin, &wfds)) {
+                                        ssize_t w = write(child_stdin, pending_data, (size_t)pending_len);
+                                        if (w > 0) {
+                                            memmove(pending_data, pending_data + w, (size_t)(pending_len - w));
+                                            pending_len -= w;
+                                            if (pending_len == 0) { free(pending_data); pending_data = NULL; }
+                                        } else if (w < 0 && errno != EAGAIN) {
+                                            free(pending_data); pending_data = NULL; pending_len = 0;
+                                            close(child_stdin); child_stdin_open = 0;
+                                        }
+                                    }
+
+                                    if (pending_len == 0 && (FD_ISSET(ws_fd, &rfds) || ssl_pending)) {
+                                        unsigned char peek[1];
+                                        int r = (int)recv(ws_fd, peek, 1, MSG_PEEK | MSG_DONTWAIT);
+                                        if (r == 0) { ws_alive = 0; break; }
+                                        if (r > 0 || ssl_pending) {
+                                            ssize_t rn = ws_node_recv_frame(conn, out, WS_NODE_FRAME_MAX, &buf[0]);
+                                            if (rn < 0) { ws_alive = 0; break; }
+                                            unsigned char op = buf[0] & 0x0F;
+                                            if (op == WS_NODE_OP_CLOSE) { ws_alive = 0; break; }
+                                            if (op == WS_NODE_OP_EOF) {
+                                                if (child_stdin_open) { close(child_stdin); child_stdin_open = 0; }
+                                                continue;
+                                            }
+                                            if (op == WS_NODE_OP_EXIT) continue;
+                                            if (op == WS_NODE_OP_PING) { ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)rn); continue; }
+                                            if (op == WS_NODE_OP_PONG) continue;
+                                            if (op == WS_NODE_OP_BIN && child_stdin_open) {
+                                                ssize_t w = write(child_stdin, out, (size_t)rn);
+                                                if (w > 0) {
+                                                    if (w < rn) {
+                                                        pending_data = malloc((size_t)(rn - w));
+                                                        if (pending_data) {
+                                                            memcpy(pending_data, out + w, (size_t)(rn - w));
+                                                            pending_len = rn - w;
+                                                        }
+                                                    }
+                                                } else if (errno == EAGAIN) {
+                                                    pending_data = malloc((size_t)rn);
+                                                    if (pending_data) {
+                                                        memcpy(pending_data, out, (size_t)rn);
+                                                        pending_len = rn;
+                                                    }
+                                                } else {
+                                                    close(child_stdin); child_stdin_open = 0;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if (child_stdout_open && FD_ISSET(child_stdout, &rfds)) {
+                                        ssize_t nr = read(child_stdout, out, WS_NODE_FRAME_MAX);
+                                        if (nr > 0) {
+                                            if (ws_node_send_frame(conn, WS_NODE_OP_BIN, out, (size_t)nr) < 0)
+                                                ws_alive = 0;
+                                        } else if (nr <= 0) {
+                                            ws_node_send_frame(conn, WS_NODE_OP_EOF, NULL, 0);
+                                            close(child_stdout);
+                                            child_stdout_open = 0;
+                                        }
+                                    }
+
+                                    if (child_stderr_open && FD_ISSET(child_stderr, &rfds)) {
+                                        ssize_t nr = read(child_stderr, out, WS_NODE_FRAME_MAX);
+                                        if (nr > 0) {
+                                            if (ws_node_send_frame(conn, WS_NODE_OP_TEXT, out, (size_t)nr) < 0)
+                                                ws_alive = 0;
+                                        } else if (nr <= 0) {
+                                            ws_node_send_frame(conn, WS_NODE_OP_EOF, NULL, 0);
+                                            close(child_stderr);
+                                            child_stderr_open = 0;
+                                        }
+                                    }
                                 }
                             }
+
+                            fcntl(ws_fd, F_SETFL, ws_flags);
+
+                            free(pending_data);
+                            if (child_stdin_open) { close(child_stdin); child_stdin_open = 0; }
+                            if (child_stdout_open) { close(child_stdout); child_stdout_open = 0; }
+                            if (child_stderr_open) { close(child_stderr); child_stderr_open = 0; }
+
+                            int status = 0;
+                            waitpid(pid, &status, 0);
+                            if (g_verbose) fprintf(stderr, "ws-node: pipe done, child exit=%d\n", WEXITSTATUS(status));
+                            {
+                                unsigned char exit_byte = (unsigned char)WEXITSTATUS(status);
+                                ws_node_send_frame(conn, WS_NODE_OP_EXIT, &exit_byte, 1);
+                            }
+                            ws_node_send_frame(conn, WS_NODE_OP_CLOSE, NULL, 0);
+                            break;
                         }
-                        cJSON_Delete(task);
                     }
-                } else if (in_pipe && cmd_fp && n > 0) {
-                    if (pipe_recv_mode) {
-                        fwrite(out, 1, (size_t)n, cmd_fp);
-                        fflush(cmd_fp);
-                    }
-                }
-            }
-
-            /* Send command stdout to server (send mode) */
-            if (in_pipe && cmd_fp && !pipe_recv_mode) {
-                size_t nread = fread(out, 1, WS_NODE_FRAME_MAX, cmd_fp);
-                if (g_verbose) fprintf(stderr, "ws-node: pipe fread=%zu feof=%d\n", nread, feof(cmd_fp));
-                if (nread > 0) {
-                    int ret = ws_node_send_frame(conn, WS_NODE_OP_BIN, out, nread);
-                    if (g_verbose) fprintf(stderr, "ws-node: pipe sent BIN frame len=%zu ret=%d\n", nread, ret);
-                }
-                if (feof(cmd_fp)) {
-                    pclose(cmd_fp);
-                    cmd_fp = NULL;
-                    if (cmd_errfile[0]) unlink(cmd_errfile);
-                    in_pipe = 0;
-                    if (g_verbose) fprintf(stderr, "ws-node: pipe done, sending CLOSE\n");
-                    /* Send CLOSE frame */
-                    int ret = ws_node_send_frame(conn, WS_NODE_OP_CLOSE, NULL, 0);
-                    if (g_verbose) fprintf(stderr, "ws-node: pipe sent CLOSE ret=%d\n", ret);
+                    cJSON_Delete(task);
                 }
             }
         }
 
-        if (cmd_fp) {
-            pclose(cmd_fp);
-            if (cmd_errfile[0]) unlink(cmd_errfile);
-        }
         free(buf); free(out);
         ws_node_disconnect(conn);
     }

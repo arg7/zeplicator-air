@@ -6,6 +6,9 @@
 #include <string.h>
 #include <getopt.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/select.h>
 #include <curl/curl.h>
 #include <cjson/cJSON.h>
 #include <openssl/ssl.h>
@@ -63,10 +66,13 @@ static CURL *curl_init(struct curl_buf *resp) {
 /* === WebSocket Client === */
 
 #define WS_MAGIC "258EAFA5-E914-47DA-95CA-5AB5AC88212E"
-#define WS_FRAME_MAX (32 * 1024 * 1024)
+#define WS_CHUNK (16380)
 #define WS_SUBCHUNK (128 * 1024)
+#define WS_FRAME_MAX (WS_SUBCHUNK + 14)
 #define WS_OP_TEXT  0x01
 #define WS_OP_BIN   0x02
+#define WS_OP_EOF   0x03
+#define WS_OP_EXIT  0x04
 #define WS_OP_CLOSE 0x08
 #define WS_OP_PING  0x09
 #define WS_OP_PONG  0x0A
@@ -182,11 +188,6 @@ static int ws_send_frame_ssl(ws_conn_t *wc, unsigned char opcode,
     size_t flen = ws_build_frame(frame, sizeof(frame), opcode, payload, payload_len);
     if (flen == 0) return -1;
     return ws_ssl_write(wc, frame, flen) > 0 ? 0 : -1;
-}
-
-static int ws_send_data_ssl(ws_conn_t *wc, unsigned char opcode,
-                             const unsigned char *payload, size_t payload_len) {
-    return ws_send_frame_ssl(wc, opcode, payload, payload_len);
 }
 
 static ws_conn_t *ws_connect(const char *server_url, const char *path) {
@@ -703,21 +704,18 @@ static int cmd_admin_snap(int argc, char *argv[]) {
     return do_get(path);
 }
 
-#define ZEP_ADMIN_PIPE_CHUNK (1024 * 1024)
+#define ZEP_ADMIN_PIPE_CHUNK WS_CHUNK
 
 static int cmd_pipe(int argc, char *argv[]) {
     const char *node = NULL;
     int progress = 0;
-    int recv_mode = 0;
     int compress = 0;
     int buffer = 0;
     (void)compress; (void)buffer;
     int cmd_start = -1;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--recv") == 0)
-            recv_mode = 1;
-        else if (strcmp(argv[i], "--compress") == 0)
+        if (strcmp(argv[i], "--compress") == 0)
             compress = 1;
         else if (strcmp(argv[i], "--buffer") == 0)
             buffer = 1;
@@ -735,16 +733,15 @@ static int cmd_pipe(int argc, char *argv[]) {
     }
 
     if (cmd_start < 0 || cmd_start >= argc) {
-        fprintf(stderr, "Usage: zep-air-admin pipe [--recv] [--compress] [--buffer] [--node CN] [--progress] <command...>\n"
-                        "  --recv      Admin→node direction (zfs recv on remote node)\n"
+        fprintf(stderr, "Usage: zep-air-admin pipe [--compress] [--buffer] [--node CN] [--progress] <command...>\n"
                         "  --compress  Apply pipe_zip_cmd / pipe_unzip_cmd compression\n"
                         "  --buffer    Apply pipe_send_buf_cmd / pipe_recv_buf_cmd buffering\n"
                         "  --node CN   Target node (default: auto-select)\n"
                         "  --progress  Print transfer progress to stderr\n"
                         "\nExamples:\n"
                         "  zep-air-admin pipe zfs send -R tank-prod/data\n"
-                        "  zep-air-admin pipe --recv --compress dd if=/dev/urandom bs=1M count=10\n"
-                        "  zep-air-admin pipe --compress --buffer --recv zfs recv -F -u tank-prod/data\n");
+                        "  zep-air-admin pipe --node foo bash\n"
+                        "  cat stream | zep-air-admin pipe zfs recv -F -u pool/fs | grep done\n");
         return 1;
     }
 
@@ -756,16 +753,11 @@ static int cmd_pipe(int argc, char *argv[]) {
 
     const char *target_node = node;
     if (!target_node) {
-        /* Auto-select: check which nodes are connected via WS */
         fprintf(stderr, "pipe: --node required for WS pipe\n");
         return 1;
     }
 
-    /* Build WS path: /v1/ws/pipe?node=<cn>&direction=<dir>&command=<cmd> */
     char ws_path[1024];
-    const char *dir = recv_mode ? "recv" : "send";
-
-    /* URL-encode command (limit to 800 chars encoded to fit in ws_path) */
     char cmd_encoded[800] = {0};
     int ei = 0;
     for (int ci = 0; cmd_buf[ci] && ei < (int)sizeof(cmd_encoded) - 4; ci++) {
@@ -776,12 +768,11 @@ static int cmd_pipe(int argc, char *argv[]) {
     }
 
     snprintf(ws_path, sizeof(ws_path),
-             "/v1/ws/pipe?node=%s&direction=%s&command=%s",
-             target_node, dir, cmd_encoded);
+             "/v1/ws/pipe?node=%s&command=%s",
+             target_node, cmd_encoded);
 
     if (g_verbose || progress)
-        fprintf(stderr, "pipe: opening WebSocket to %s (dir=%s)\n",
-                target_node, dir);
+        fprintf(stderr, "pipe: opening WebSocket to %s\n", target_node);
 
     ws_conn_t *wc = ws_connect(g_server, ws_path);
     if (!wc) {
@@ -789,58 +780,94 @@ static int cmd_pipe(int argc, char *argv[]) {
         return 1;
     }
 
-    if (recv_mode) {
-        /* Admin sends stdin → node */
-        unsigned char *buf = malloc(WS_SUBCHUNK);
-        if (!buf) { fprintf(stderr, "pipe: OOM\n"); ws_close(wc); return 1; }
-        uint64_t sent = 0;
+    /* Full-duplex pipe: stdin→WS, WS→stdout/stderr */
+    unsigned char *ws_buf = malloc(WS_FRAME_MAX);
+    unsigned char *out = malloc(WS_SUBCHUNK);
+    if (!ws_buf || !out) { free(ws_buf); free(out); ws_close(wc); return 1; }
 
-        for (;;) {
-            size_t nread = fread(buf, 1, WS_SUBCHUNK, stdin);
-            if (nread == 0) break;
+    uint64_t sent = 0, rcvd_stdout = 0, rcvd_stderr = 0;
+    int stdin_done = 0;
+    int ws_done = 0;
+    time_t start_time = time(NULL);
 
-            if (ws_send_data_ssl(wc, WS_OP_BIN, buf, nread) < 0) {
-                fprintf(stderr, "pipe: WebSocket send failed\n");
-                ws_close(wc);
-                free(buf);
-                return 1;
-            }
-            sent += nread;
-            if (progress)
-                fprintf(stderr, "\rpipe: %llu bytes sent", (unsigned long long)sent);
+    for (;;) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        int maxfd = -1;
+        FD_SET(wc->sock, &rfds); if (wc->sock > maxfd) maxfd = wc->sock;
+        if (!stdin_done) { FD_SET(STDIN_FILENO, &rfds); if (STDIN_FILENO > maxfd) maxfd = STDIN_FILENO; }
+
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        int sel = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        int ssl_pending = (wc->ssl && SSL_pending(wc->ssl) > 0);
+
+        if (sel < 0 && errno != EINTR) break;
+
+        /* Timeout safety: if stdin done but no ws activity for 30s, exit */
+        if (stdin_done && !ws_done && time(NULL) - start_time > 30) {
+            if (g_verbose) fprintf(stderr, "pipe: timeout waiting for remote response\n");
+            break;
         }
-        free(buf);
+        if (!stdin_done) start_time = time(NULL);
 
-        ws_close(wc);
-        if (progress)
-            if (g_verbose) fprintf(stderr, "\npipe: recv complete — %llu bytes\n", (unsigned long long)sent);
-        return 0;
-    } else {
-        /* Node sends stdout/stderr → admin */
-        unsigned char *buf = malloc(WS_SUBCHUNK);
-        unsigned char *out = malloc(WS_SUBCHUNK);
-        if (!buf || !out) { fprintf(stderr, "pipe: OOM\n"); free(buf); free(out); ws_close(wc); return 1; }
-
-        for (;;) {
-            ssize_t n = ws_recv_frame(wc, out, WS_SUBCHUNK, &buf[0]);
-            unsigned char opcode = buf[0] & 0x0F;
-            if (n < 0) break;
-            if (opcode == WS_OP_CLOSE) break;
-            if (opcode == WS_OP_PING) {
-                ws_send_frame_ssl(wc, WS_OP_PONG, out, (size_t)n);
-                continue;
+        if (sel > 0 || ssl_pending) {
+            if (!stdin_done && FD_ISSET(STDIN_FILENO, &rfds)) {
+                unsigned char inbuf[WS_CHUNK];
+                ssize_t nr = read(STDIN_FILENO, inbuf, sizeof(inbuf));
+                if (nr > 0) {
+                    if (ws_send_frame_ssl(wc, WS_OP_BIN, inbuf, (size_t)nr) < 0) { ws_done = 1; break; }
+                    sent += (uint64_t)nr;
+                } else if (nr == 0) {
+                    ws_send_frame_ssl(wc, WS_OP_EOF, NULL, 0);
+                    stdin_done = 1;
+                } else if (errno != EAGAIN) {
+                    ws_send_frame_ssl(wc, WS_OP_EOF, NULL, 0);
+                    stdin_done = 1;
+                }
             }
-            if (opcode == WS_OP_PONG) continue;
-            if (opcode == WS_OP_BIN || opcode == WS_OP_TEXT) {
-                fwrite(out, 1, (size_t)n, stdout);
+
+            if (FD_ISSET(wc->sock, &rfds) || ssl_pending) {
+                ssize_t n = ws_recv_frame(wc, out, WS_SUBCHUNK, &ws_buf[0]);
+                if (n < 0) { ws_done = 1; break; }
+                unsigned char op = ws_buf[0] & 0x0F;
+                if (op == WS_OP_CLOSE) { ws_done = 1; break; }
+                if (op == WS_OP_PING) {
+                    ws_send_frame_ssl(wc, WS_OP_PONG, out, (size_t)n);
+                    continue;
+                }
+                if (op == WS_OP_PONG) continue;
+                if (op == WS_OP_BIN) {
+                    fwrite(out, 1, (size_t)n, stdout); fflush(stdout);
+                    rcvd_stdout += (uint64_t)n;
+                }
+                if (op == WS_OP_TEXT) {
+                    fwrite(out, 1, (size_t)n, stderr); fflush(stderr);
+                    rcvd_stderr += (uint64_t)n;
+                }
+                if (op == WS_OP_EOF) {
+                    /* stdout or stderr stream closed by remote */
+                }
+                if (op == WS_OP_EXIT && n == 1) {
+                    int exit_code = (int)out[0];
+                    if (g_verbose) fprintf(stderr, "pipe: remote exit=%d\n", exit_code);
+                }
             }
         }
-        fflush(stdout);
-        free(buf);
-        free(out);
-        ws_close(wc);
-        return 0;
+
+        if (stdin_done && ws_done) break;
     }
+
+    free(ws_buf); free(out);
+
+    /* Send CLOSE to server */
+    ws_send_frame_ssl(wc, WS_OP_CLOSE, NULL, 0);
+    usleep(100000);
+    ws_close(wc);
+
+    if (progress && g_verbose)
+        fprintf(stderr, "\npipe: done — sent=%llu recv_stdout=%llu recv_stderr=%llu\n",
+                (unsigned long long)sent, (unsigned long long)rcvd_stdout, (unsigned long long)rcvd_stderr);
+    return 0;
 }
 
 static int cmd_list_nodes(int argc, char *argv[]) {
@@ -873,7 +900,7 @@ static void usage(const char *prog) {
         "  resume       Resume replication\n"
         "  promote      Promote client to master (--node CN)\n"
         "  rollback     Cluster rollback to snapshot (--snap NAME)\n"
-        "  pipe         Send/recv ZFS stream through the server (--recv for stdin→node)\n"
+        "  pipe         Full-duplex pipe through the server (stdin/stdout/stderr → node)\n"
         "  snap         Manual snapshot create/destroy (--name NAME)\n"
         "  config       Server config get/set/list/rm\n"
         "\n"

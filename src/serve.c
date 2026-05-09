@@ -400,6 +400,8 @@ static void node_ws_unregister(const char *cn) {
 #define WS_FRAME_MAX (32 * 1024 * 1024)
 #define WS_OP_TEXT  0x01
 #define WS_OP_BIN   0x02
+#define WS_OP_EOF   0x03
+#define WS_OP_EXIT  0x04
 #define WS_OP_CLOSE 0x08
 #define WS_OP_PING  0x09
 #define WS_OP_PONG  0x0A
@@ -477,6 +479,7 @@ static size_t ws_build_frame(unsigned char *buf, size_t buf_size,
 }
 
 #define WS_SUBCHUNK (128 * 1024)
+#define WS_ADMIN_BUF (WS_SUBCHUNK + 256)
 
 static ssize_t ws_send_frame_gtls(struct node_ws *nw, unsigned char opcode,
                                    const unsigned char *payload, size_t payload_len) {
@@ -503,7 +506,7 @@ static ssize_t ws_send_frame_gtls(struct node_ws *nw, unsigned char opcode,
                     int raw_fd = (int)(intptr_t)gnutls_transport_get_ptr((gnutls_session_t)ci->tls_session);
                     if (raw_fd < 0) { free(frame); return -1; }
                     fd_set wfds; FD_ZERO(&wfds); FD_SET(raw_fd, &wfds);
-                    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+                    struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
                     if (select(raw_fd + 1, NULL, &wfds, NULL, &tv) <= 0) { free(frame); return -1; }
                     continue;
                 }
@@ -518,28 +521,6 @@ static ssize_t ws_send_frame_gtls(struct node_ws *nw, unsigned char opcode,
     return -1;
 }
 
-static ssize_t ws_send_frame(int sock, unsigned char opcode,
-                              const unsigned char *payload, size_t payload_len) {
-    unsigned char *frame = malloc(payload_len + 14);
-    if (!frame) return -1;
-    size_t flen = ws_build_frame(frame, payload_len + 14, opcode, payload, payload_len);
-    if (flen == 0) { free(frame); return -1; }
-    ssize_t sent = 0;
-    while ((size_t)sent < flen) {
-        ssize_t n = send(sock, frame + sent, flen - (size_t)sent, MSG_NOSIGNAL);
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            fd_set wfds; FD_ZERO(&wfds); FD_SET(sock, &wfds);
-            struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-            if (select(sock + 1, NULL, &wfds, NULL, &tv) <= 0) { free(frame); return -1; }
-            continue;
-        }
-        if (n <= 0) { free(frame); return -1; }
-        sent += n;
-    }
-    free(frame);
-    return (ssize_t)flen;
-}
-
 static ssize_t ws_recv_node(struct node_ws *nw, unsigned char *buf, size_t buf_size) {
     if (g_no_tls)
         return recv(nw ? nw->sock : -1, buf, buf_size, 0);
@@ -551,7 +532,7 @@ static ssize_t ws_recv_node(struct node_ws *nw, unsigned char *buf, size_t buf_s
                 int raw_fd = (int)(intptr_t)gnutls_transport_get_ptr((gnutls_session_t)ci->tls_session);
                 if (raw_fd < 0) return -1;
                 fd_set rfds; FD_ZERO(&rfds); FD_SET(raw_fd, &rfds);
-                struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+                struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
                 if (select(raw_fd + 1, &rfds, NULL, NULL, &tv) <= 0) return -1;
                 return gnutls_record_recv((gnutls_session_t)ci->tls_session, buf, buf_size);
             }
@@ -601,12 +582,6 @@ static void ws_make_blocking(int fd) {
     if (flags == -1) return;
     if (flags & O_NONBLOCK)
         fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-}
-
-static void ws_send_close(int sock) {
-    unsigned char frame[6];
-    size_t flen = ws_build_frame(frame, sizeof(frame), WS_OP_CLOSE, NULL, 0);
-    send(sock, frame, flen, MSG_NOSIGNAL);
 }
 
 static void ws_set_keepalive(int fd) {
@@ -784,15 +759,23 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
     }
     if (node_raw_fd < 0) node_raw_fd = nw->sock;
 
+    gnutls_session_t admin_tls = NULL;
+    int admin_raw_fd = sock;
+    if (!g_no_tls) {
+        const union MHD_ConnectionInfo *aci = MHD_get_connection_info(conn, MHD_CONNECTION_INFO_GNUTLS_SESSION);
+        if (aci && aci->tls_session) {
+            admin_tls = (gnutls_session_t)aci->tls_session;
+            admin_raw_fd = (int)(intptr_t)gnutls_transport_get_ptr(admin_tls);
+        }
+    }
+    if (admin_raw_fd < 0) admin_raw_fd = sock;
+
     /* Send task JSON to node (via GnuTLS) */
-    const char *direction = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "direction");
     const char *command = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "command");
-    int recv_mode = (direction && strcmp(direction, "recv") == 0);
 
     if (command) {
         char *task_json = NULL;
-        if (asprintf(&task_json, "{\"action\":\"pipe\",\"command\":\"%s\",\"direction\":\"%s\"}",
-                     command, direction ? direction : "send") > 0) {
+        if (asprintf(&task_json, "{\"action\":\"pipe\",\"command\":\"%s\"}", command) > 0) {
             if (g_verbose)
                 fprintf(stderr, "ws: sending task to node: %s\n", task_json);
             ws_send_frame_gtls(nw, WS_OP_TEXT, (unsigned char *)task_json, strlen(task_json));
@@ -802,7 +785,9 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
 
     /* Bridge: admin socket ↔ node WS */
     ws_make_blocking(sock);
-    unsigned char *admin_buf = malloc(WS_SUBCHUNK);
+    ws_make_blocking(node_raw_fd);
+    unsigned char *admin_buf = malloc(WS_ADMIN_BUF);
+    size_t admin_acc_len = 0;
     unsigned char *node_buf = malloc(WS_SUBCHUNK);
     unsigned char *admin_out = malloc(WS_SUBCHUNK);
     unsigned char *node_out = malloc(WS_SUBCHUNK);
@@ -818,46 +803,111 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
         fd_set rfds;
         FD_ZERO(&rfds);
         int maxfd = 0;
-        if (admin_alive) { FD_SET(sock, &rfds); if (sock > maxfd) maxfd = sock; }
+        if (admin_alive) { FD_SET(admin_raw_fd, &rfds); if (admin_raw_fd > maxfd) maxfd = admin_raw_fd; }
         if (node_alive) { FD_SET(node_raw_fd, &rfds); if (node_raw_fd > maxfd) maxfd = node_raw_fd; }
         int sel = select(maxfd + 1, &rfds, NULL, NULL, &tv);
 
         if (sel > 0) {
-            /* Admin → Node */
-            if (admin_alive && FD_ISSET(sock, &rfds)) {
-                ssize_t n = recv(sock, admin_buf, WS_SUBCHUNK, 0);
-                if (n <= 0) { admin_alive = 0; }
-                else {
-                    ssize_t plen = ws_parse_frame(admin_buf, (size_t)n, admin_out, WS_SUBCHUNK, &admin_buf[0]);
-                    unsigned char opcode = admin_buf[0] & 0x0F;
-                    if (plen < 0) { admin_alive = 0; }
-                    else if (opcode == WS_OP_CLOSE) { admin_alive = 0; }
-                    else if (opcode == WS_OP_PING) {
-                        ws_send_frame(sock, WS_OP_PONG, admin_out, (size_t)plen);
-                    }
-                    else if (node_alive && (opcode == WS_OP_BIN || opcode == WS_OP_TEXT) && recv_mode) {
-                        if (ws_send_frame_gtls(nw, WS_OP_BIN, admin_out, (size_t)plen) < 0)
-                            node_alive = 0;
-                    }
+            /* Admin → Node: read raw bytes into accumulator */
+            if (admin_alive && FD_ISSET(admin_raw_fd, &rfds)) {
+                unsigned char tmp[16384];
+                ssize_t n;
+                if (g_no_tls)
+                    n = recv(sock, tmp, sizeof(tmp), 0);
+                else
+                    n = gnutls_record_recv(admin_tls, tmp, sizeof(tmp));
+                if (g_no_tls ? (n <= 0) : (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED))
+                    { /* retry */ }
+                else if (n <= 0) {
+                    admin_alive = 0;
+                } else if (admin_acc_len + (size_t)n > WS_ADMIN_BUF) {
+                    admin_alive = 0;
+                } else {
+                    memcpy(admin_buf + admin_acc_len, tmp, (size_t)n);
+                    admin_acc_len += (size_t)n;
                 }
             }
 
-            /* Node → Admin */
+            /* Node → Admin: forward all BIN and TEXT frames */
             if (node_alive && FD_ISSET(node_raw_fd, &rfds)) {
                 ssize_t plen = ws_recv_frame_full(nw, node_buf, WS_SUBCHUNK, node_out, WS_SUBCHUNK, &node_buf[0]);
                 if (plen < 0) { node_alive = 0; }
                 else {
                     unsigned char opcode = node_buf[0] & 0x0F;
-                    if (opcode == WS_OP_CLOSE) { node_alive = 0; }
+                    if (opcode == WS_OP_CLOSE) {
+                        node_alive = 0;
+                    }
                     else if (opcode == WS_OP_PING) {
                         ws_send_frame_gtls(nw, WS_OP_PONG, node_out, (size_t)plen);
                     }
-                    else if (admin_alive && (opcode == WS_OP_BIN || opcode == WS_OP_TEXT) && !recv_mode) {
-                        if (ws_send_frame(sock, WS_OP_BIN, node_out, (size_t)plen) < 0)
-                            admin_alive = 0;
+                    else if (admin_alive && (opcode == WS_OP_BIN || opcode == WS_OP_TEXT || opcode == WS_OP_EOF || opcode == WS_OP_EXIT)) {
+                        unsigned char fbuf[WS_SUBCHUNK + 14];
+                        size_t flen = ws_build_frame(fbuf, sizeof(fbuf), opcode, node_out, (size_t)plen);
+                        if (flen > 0) {
+                            ssize_t sent = 0;
+                            while ((size_t)sent < flen) {
+                                ssize_t n;
+                                if (g_no_tls)
+                                    n = send(sock, fbuf + sent, flen - (size_t)sent, MSG_NOSIGNAL);
+                                else
+                                    n = gnutls_record_send(admin_tls, fbuf + sent, flen - (size_t)sent);
+                                if (g_no_tls ? (n <= 0) : (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED))
+                                    { usleep(1000); continue; }
+                                if (n <= 0) break;
+                                sent += n;
+                            }
+                        }
                     }
                 }
             }
+        }
+
+        /* Consume complete frames from admin accumulator */
+        while (admin_alive && admin_acc_len >= 2) {
+            unsigned char aop = admin_buf[0] & 0x0F;
+            uint64_t plf = admin_buf[1] & 0x7F;
+            size_t hlen = 2;
+            uint64_t plen_val;
+
+            if (plf < 126) {
+                plen_val = plf;
+            } else if (plf == 126) {
+                if (admin_acc_len < 4) break;
+                plen_val = ((uint64_t)admin_buf[2] << 8) | admin_buf[3];
+                hlen = 4;
+            } else {
+                if (admin_acc_len < 10) break;
+                plen_val = 0;
+                for (int i = 0; i < 8; i++)
+                    plen_val = (plen_val << 8) | admin_buf[2 + i];
+                hlen = 10;
+            }
+
+            size_t ftot = hlen + (size_t)plen_val;
+            if (admin_acc_len < ftot) break;
+
+            if (aop == WS_OP_CLOSE) {
+                if (node_alive)
+                    ws_send_frame_gtls(nw, WS_OP_CLOSE, NULL, 0);
+                admin_alive = 0;
+            } else if (aop == WS_OP_PING) {
+                unsigned char fbuf[WS_SUBCHUNK + 14];
+                size_t flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_PONG, admin_buf + hlen, (size_t)plen_val);
+                if (flen > 0) {
+                    if (g_no_tls) send(sock, fbuf, flen, MSG_NOSIGNAL);
+                    else gnutls_record_send(admin_tls, fbuf, flen);
+                }
+            } else if (node_alive && (aop == WS_OP_BIN || aop == WS_OP_TEXT || aop == WS_OP_EOF || aop == WS_OP_EXIT)) {
+                if (ws_send_frame_gtls(nw, aop, admin_buf + hlen, (size_t)plen_val) < 0)
+                    node_alive = 0;
+            }
+
+            memmove(admin_buf, admin_buf + ftot, admin_acc_len - ftot);
+            admin_acc_len -= ftot;
+        }
+
+        if (!admin_alive && node_alive) {
+            ws_send_frame_gtls(nw, WS_OP_CLOSE, NULL, 0);
         }
 
         if (!admin_alive || !node_alive) break;
@@ -866,7 +916,14 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
     if (g_verbose)
         fprintf(stderr, "ws: pipe bridge ended admin=%d node=%d\n", admin_alive, node_alive);
 
-    ws_send_close(sock);
+    {
+        unsigned char cbuf[14];
+        size_t clen = ws_build_frame(cbuf, sizeof(cbuf), WS_OP_CLOSE, NULL, 0);
+        if (g_no_tls)
+            send(sock, cbuf, clen, MSG_NOSIGNAL);
+        else if (admin_tls)
+            gnutls_record_send(admin_tls, cbuf, clen);
+    }
     MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
 
     free(admin_buf); free(node_buf); free(admin_out); free(node_out);

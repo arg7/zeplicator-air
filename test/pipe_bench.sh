@@ -51,7 +51,7 @@ echo "  Server PID=$SERV_PID"
 
 admin_base "https://$FQDN:$SERVER_PORT"
 node_join client bench-node
-pipe_allow "zfs,dd"
+pipe_allow "zfs,dd,tee"
 
 NDB="$TMP/node/zep-air.db"
 mkdir -p "$TMP/node"
@@ -63,30 +63,51 @@ echo "  Node cron PID=${CRON_PIDS[0]}"
 # ── benchmarks ──
 echo -e "\n${CYAN}Pipe benchmarks (admin → server → node → server → admin)${NC}"
 
-ADM_CMD="$ADMIN $ADMIN_BASE pipe dd if=/dev/urandom bs=1M count=$COUNT_MB"
+ADM_CMD="$ADMIN $ADMIN_BASE pipe --node bench-node dd if=/dev/urandom bs=1M count=$COUNT_MB"
 bm_quiet "pipe"      $ADM_CMD
-bm_quiet "pipe+zstd"  $ADMIN $ADMIN_BASE pipe --compress dd if=/dev/urandom bs=1M "count=$COUNT_MB"
-bm_quiet "pipe+zbuf"  $ADMIN $ADMIN_BASE pipe --compress --buffer dd if=/dev/urandom bs=1M "count=$COUNT_MB"
+bm_quiet "pipe+zstd"  $ADMIN $ADMIN_BASE pipe --node bench-node --compress dd if=/dev/urandom bs=1M "count=$COUNT_MB"
+bm_quiet "pipe+zbuf"  $ADMIN $ADMIN_BASE pipe --node bench-node --compress --buffer dd if=/dev/urandom bs=1M "count=$COUNT_MB"
 
 # ── stderr test ──
 echo -e "\n${CYAN}Stderr propagation test${NC}"
-STDERR_OUT=$("$ADMIN" $ADMIN_BASE pipe dd if=/dev/urandom bs=1M count=4 2>&1 >/dev/null || true)
+STDERR_OUT=$("$ADMIN" $ADMIN_BASE pipe --node bench-node dd if=/dev/urandom bs=1M count="$COUNT_MB" 2>&1 >/dev/null || true)
 echo "$STDERR_OUT" | grep -q "bytes.*copied\|records" && \
     echo -e "  ${GREEN}OK${NC}   stderr from remote dd visible" || \
     echo -e "  ${RED}FAIL${NC} stderr from remote dd missing"
 
 # ── recv test ──
 echo -e "\n${CYAN}Recv direction test${NC}"
-rm -f "$TMP/recv-test"
-dd if=/dev/zero bs=1M count=4 2>/dev/null | \
-    "$ADMIN" $ADMIN_BASE pipe --recv dd of="$TMP/recv-test" bs=1M 2>/dev/null
-for i in 1 2 3 4 5; do
-    sz=$(stat -c%s "$TMP/recv-test" 2>/dev/null || echo 0)
-    [ "$sz" -eq 4194304 ] && break
+
+# Simple tee test first (foreground, no kill)
+echo -n "hello world" | \
+    "$ADMIN" $ADMIN_BASE pipe --node bench-node tee "$TMP/recv-tiny.txt" 2>/dev/null
+for i in $(seq 1 5); do
+    if [ -f "$TMP/recv-tiny.txt" ]; then
+        content=$(cat "$TMP/recv-tiny.txt" 2>/dev/null)
+        [ "$content" = "hello world" ] && break
+    fi
     sleep 1
 done
-if [ -f "$TMP/recv-test" ] && [ "$(stat -c%s "$TMP/recv-test" 2>/dev/null || echo 0)" -eq 4194304 ]; then
-    echo -e "  ${GREEN}OK${NC}   recv direction: 4 MB transferred"
+if [ -f "$TMP/recv-tiny.txt" ] && [ "$(cat "$TMP/recv-tiny.txt" 2>/dev/null)" = "hello world" ]; then
+    echo -e "  ${GREEN}OK${NC}   tiny recv: '$(cat "$TMP/recv-tiny.txt")'"
+else
+    c=$(cat "$TMP/recv-tiny.txt" 2>/dev/null || echo "<missing>")
+    echo -e "  ${RED}FAIL${NC} tiny recv got: '$c'"
+fi
+
+rm -f "$TMP/recv-test"
+echo "--- recv dd test ---"
+EXPECTED=$((COUNT_MB * 1024 * 1024))
+dd if=/dev/zero bs=1M count="$COUNT_MB" 2>/dev/null | \
+    "$ADMIN" $ADMIN_BASE pipe --node bench-node dd of="$TMP/recv-test" bs=1M
+echo "recv dd exit=$?"
+for i in 1 2 3 4 5; do
+    sz=$(stat -c%s "$TMP/recv-test" 2>/dev/null || echo 0)
+    [ "$sz" -eq "$EXPECTED" ] && break
+    sleep 1
+done
+if [ -f "$TMP/recv-test" ] && [ "$(stat -c%s "$TMP/recv-test" 2>/dev/null || echo 0)" -eq "$EXPECTED" ]; then
+    echo -e "  ${GREEN}OK${NC}   recv direction: ${COUNT_MB} MB transferred"
 else
     sz=$(stat -c%s "$TMP/recv-test" 2>/dev/null || echo 0)
     echo -e "  ${RED}FAIL${NC} recv direction data mismatch (got $sz bytes)"
