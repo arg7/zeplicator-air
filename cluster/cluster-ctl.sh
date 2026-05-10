@@ -63,6 +63,7 @@ SERV="${SERV:-${PROJ_DIR}/zep-air-serve}"
 ADMIN="${ADMIN:-${PROJ_DIR}/zep-air-admin}"
 CRON_INTERVAL="${CRON_INTERVAL:-60}"
 SUDO_NODES="${SUDO_NODES:-0}"
+VERB="${VERB:-}"
 
 run_as() {
     local user="$1"; shift
@@ -145,10 +146,10 @@ do_start() {
         echo -e "${YELLOW}Server already running (PID $spid)${NC}"
     else
         say "Starting server on port $SERVER_PORT ..."
-        "$SERV" --port "$SERVER_PORT" \
+        "$SERV" ${VERB:+-v} --port "$SERVER_PORT" \
             --cert "${PKI_DIR}/server.crt" --key "${PKI_DIR}/server.key" \
             --ca "${PKI_DIR}/ca.crt" --db "$SERVER_DB" \
-            --storage "$SERVER_STORAGE" >/dev/null 2>&1 >/dev/null 2>&1 &
+            --storage "$SERVER_STORAGE" >/tmp/zep-server.log 2>&1 &
         local new_pid=$!
         sleep 2
         if is_running "$new_pid"; then
@@ -170,9 +171,9 @@ do_start() {
             continue
         fi
         if [[ "$SUDO_NODES" == "1" ]]; then
-            sudo -u "$cn" "$ZEP" --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" >/dev/null 2>&1 &
+            sudo -u "$cn" "$ZEP" ${VERB:+-v} --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" >/tmp/zep-${cn}.log 2>&1 &
         else
-            "$ZEP" --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" >/dev/null 2>&1 &
+            "$ZEP" ${VERB:+-v} --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" >/tmp/zep-${cn}.log 2>&1 &
         fi
         local cpid=$!
         disown $cpid 2>/dev/null || true
