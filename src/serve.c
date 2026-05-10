@@ -1930,6 +1930,45 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                           ctx->prefix, "meta.json", ctx->body_len,
                                           (int)ctx->body_len, (const char *)ctx->body);
                     free(path);
+
+                    /* Update cron_last directly from the meta body */
+                    {
+                        cJSON *mj = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
+                        if (mj) {
+                            cJSON *lbl = cJSON_GetObjectItem(mj, "label");
+                            cJSON *cfs = cJSON_GetObjectItem(mj, "cluster_fs");
+                            if (lbl && cJSON_IsString(lbl) && cfs && cJSON_IsString(cfs)
+                                && lbl->valuestring[0] && cfs->valuestring[0]) {
+                                char cl_buf[64] = {0};
+                                sqlite3_stmt *cs = NULL;
+                                sqlite3_prepare_v2(g_db, "SELECT cluster FROM auth WHERE cn = ?1", -1, &cs, NULL);
+                                if (cs) {
+                                    sqlite3_bind_text(cs, 1, ctx->node, -1, SQLITE_STATIC);
+                                    if (sqlite3_step(cs) == SQLITE_ROW) {
+                                        const char *cl = (const char *)sqlite3_column_text(cs, 0);
+                                        if (cl && cl[0]) snprintf(cl_buf, sizeof(cl_buf), "%s", cl);
+                                    }
+                                    sqlite3_finalize(cs);
+                                }
+                                if (cl_buf[0]) {
+                                    char cron_key[1024];
+                                    snprintf(cron_key, sizeof(cron_key),
+                                             "cron_last_%s_%s_%s", cl_buf, cfs->valuestring, lbl->valuestring);
+                                    char now_str[32];
+                                    time_t tnow = time(NULL);
+                                    struct tm tm;
+                                    gmtime_r(&tnow, &tm);
+                                    strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
+                                    if (g_verbose) printf("PUT meta: set %s = %s\n", cron_key, now_str);
+                                    db_config_set(g_db, cron_key, now_str);
+                                } else if (g_verbose) {
+                                    printf("PUT meta: no cluster for node '%s'\n", ctx->node);
+                                }
+                            }
+                            cJSON_Delete(mj);
+                        }
+                    }
+
                     if (g_verbose) printf("PUT meta: calling verify_snapshot(%s, %s)\n",
                                           ctx->node, ctx->prefix);
                     verify_snapshot(ctx->node, ctx->prefix);
