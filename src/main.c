@@ -1194,6 +1194,7 @@ static int cmd_cron(int argc, char *argv[]) {
             memcpy(tcfg, &cfg, sizeof(*tcfg));
             signal(SIGTERM, daemon_signal_handler);
             signal(SIGINT, daemon_signal_handler);
+            signal(SIGHUP, daemon_signal_handler);
             pthread_create(&g_ws_tid, NULL, ws_node_pipe_thread, (void *)tcfg);
             pthread_detach(g_ws_tid);
             if (g_verbose) fprintf(stderr, "cron: WS pipe listener started for %s\n", cfg.node_name);

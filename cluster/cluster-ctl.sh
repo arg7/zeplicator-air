@@ -5,8 +5,8 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJ_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)"
+PROJ_DIR="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
 
 ###############################################################################
 # 1. Load environment
@@ -106,7 +106,7 @@ do_status() {
 
     local spid
     spid=$(server_pid)
-    if [[ -n "$spid" ]] && is_running "$spid"; then
+    if [[ -n "$spid" ]] >/dev/null 2>&1 && is_running "$spid"; then
         echo -e "  Server: ${GREEN}running${NC} (PID $spid)"
     else
         echo -e "  Server: ${RED}stopped${NC}"
@@ -138,7 +138,7 @@ do_start() {
         "$SERV" --port "$SERVER_PORT" \
             --cert "${PKI_DIR}/server.crt" --key "${PKI_DIR}/server.key" \
             --ca "${PKI_DIR}/ca.crt" --db "$SERVER_DB" \
-            --storage "$SERVER_STORAGE" 2>/dev/null &
+            --storage "$SERVER_STORAGE" >/dev/null 2>&1 >/dev/null 2>&1 &
         local new_pid=$!
         sleep 2
         if is_running "$new_pid"; then
@@ -159,8 +159,9 @@ do_start() {
             echo -e "  ${YELLOW}No DB for $cn ($node_db) — skipping${NC}"
             continue
         fi
-        "$ZEP" --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" 2>/dev/null &
+        "$ZEP" --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" >/dev/null 2>&1 &
         local cpid=$!
+        disown $cpid 2>/dev/null || true
         sleep 1
         cron_pids_file_content="${cron_pids_file_content}${cpid}\n"
         echo -e "  $cn started (PID $cpid)"
@@ -184,8 +185,8 @@ do_stop() {
     # Wait for them to exit
     for i in $(seq 1 10); do
         local alive=0
-        for pid in $(cron_pids); do is_running "$pid" 2>/dev/null && alive=$((alive + 1)); done
-        [[ "$alive" -eq 0 ]] && break
+        for pid in $(cron_pids); do is_running "$pid" 2>/dev/null >/dev/null 2>&1 && alive=$((alive + 1)); done
+        [[ "$alive" -eq 0 ]] >/dev/null 2>&1 && break
         sleep 1
     done
     # Force kill stragglers
