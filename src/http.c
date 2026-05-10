@@ -123,6 +123,8 @@ err_t http_put_meta(const http_config_t *cfg, const char *node,
     }
     char *js_str = cJSON_PrintUnformatted(json);
     cJSON_Delete(json);
+    fprintf(stderr, "http_put_meta: cluster_fs='%s' url=%s/%s body=%s\n",
+            meta->cluster_fs, node, prefix, js_str);
 
     struct resp_buf rb = {0};
     CURL *curl = http_init(cfg, url, &rb);

@@ -308,6 +308,8 @@ static void verify_snapshot(const char *cluster_key, const char *prefix) {
             }
             sqlite3_finalize(cs);
         }
+        if (g_verbose) printf("verify: label=%s cluster_fs=%s cluster=%s node=%s\n",
+                              meta.label, meta.cluster_fs, cluster_buf, cluster_key);
         if (cluster_buf[0]) {
             char cron_key[1024];
             snprintf(cron_key, sizeof(cron_key),
@@ -317,8 +319,14 @@ static void verify_snapshot(const char *cluster_key, const char *prefix) {
             struct tm tm;
             gmtime_r(&tnow, &tm);
             strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
+            if (g_verbose) printf("verify: set %s = %s\n", cron_key, now_str);
             db_config_set(db, cron_key, now_str);
+        } else if (g_verbose) {
+            printf("verify: no cluster found for node '%s'\n", cluster_key);
         }
+    } else if (g_verbose) {
+        printf("verify: skipping cron_last (label='%s' cluster_fs='%s')\n",
+               meta.label, meta.cluster_fs);
     }
 
     if (g_verbose) {
@@ -1739,6 +1747,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                         char last_str[32] = {0};
                                         db_config_get(g_db, cron_key, last_str,
                                                       sizeof(last_str));
+                                        if (g_verbose) printf("cron/sync: %s = '%s'\n", cron_key, last_str);
                                         time_t last = 0;
                                         if (last_str[0]) {
                                             struct tm tm = {0};
@@ -1878,8 +1887,9 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 if (f) {
                     fwrite(ctx->body, 1, ctx->body_len, f);
                     fclose(f);
-                    if (g_verbose) printf("PUT meta: %s/%s (%zu bytes)\n",
-                                          ctx->prefix, "meta.json", ctx->body_len);
+                    if (g_verbose) printf("PUT meta: %s/%s (%zu bytes) body=%.*s\n",
+                                          ctx->prefix, "meta.json", ctx->body_len,
+                                          (int)ctx->body_len, (const char *)ctx->body);
                     free(path);
                     verify_snapshot(ctx->node, ctx->prefix);
                     return send_json(conn, 200, "{\"ok\":true}");

@@ -254,6 +254,8 @@ err_t pipeline_push(const zep_config_t *cfg,
     snprintf(meta.cluster_fs, sizeof(meta.cluster_fs), "%s", cluster_fs ? cluster_fs : "");
     snprintf(meta.created, sizeof(meta.created), "%s", created);
     snprintf(meta.host, sizeof(meta.host), "%s", cfg->node_name);
+    fprintf(stderr, "push: cluster_fs='%s' label='%s' host='%s'\n",
+            meta.cluster_fs, meta.label, meta.host);
     meta.stream_size = stream_size;
     meta.blob_count = blob_count;
     meta.blobs = blobs;
