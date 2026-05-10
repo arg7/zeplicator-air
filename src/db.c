@@ -127,10 +127,10 @@ err_t db_config_load(sqlite3 *db, zep_config_t *cfg) {
     db_config_get(db, "key_password", cfg->key_password, sizeof(cfg->key_password));
     db_config_get(db, "send_options", cfg->send_options, sizeof(cfg->send_options));
     db_config_get(db, "recv_options", cfg->recv_options, sizeof(cfg->recv_options));
-    db_config_get(db, "pipe_zip_cmd", cfg->pipe_zip_cmd, sizeof(cfg->pipe_zip_cmd));
-    db_config_get(db, "pipe_unzip_cmd", cfg->pipe_unzip_cmd, sizeof(cfg->pipe_unzip_cmd));
-    db_config_get(db, "pipe_send_buf_cmd", cfg->pipe_send_buf_cmd, sizeof(cfg->pipe_send_buf_cmd));
-    db_config_get(db, "pipe_recv_buf_cmd", cfg->pipe_recv_buf_cmd, sizeof(cfg->pipe_recv_buf_cmd));
+    db_config_get(db, "push_zip_cmd", cfg->push_zip_cmd, sizeof(cfg->push_zip_cmd));
+    db_config_get(db, "pull_unzip_cmd", cfg->pull_unzip_cmd, sizeof(cfg->pull_unzip_cmd));
+    db_config_get(db, "push_buf_cmd", cfg->push_buf_cmd, sizeof(cfg->push_buf_cmd));
+    db_config_get(db, "pull_buf_cmd", cfg->pull_buf_cmd, sizeof(cfg->pull_buf_cmd));
     db_config_get(db, "pipe_allow", cfg->pipe_allow, sizeof(cfg->pipe_allow));
 
     if (!cfg->pipe_allow[0]) snprintf(cfg->pipe_allow, sizeof(cfg->pipe_allow), "zfs");

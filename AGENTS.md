@@ -81,8 +81,8 @@ The server DB (`zep-air.db`) is authoritative. Tables:
 | `cluster_<name>` | Cluster JSON definition |
 | `cron_last_<cluster>_<fs>_<label>` | Last push timestamp |
 | `send_options` / `recv_options` | Extra ZFS flags per node |
-| `pipe_zip_cmd` / `pipe_unzip_cmd` | Compression pipeline |
-| `pipe_send_buf_cmd` / `pipe_recv_buf_cmd` | Buffer command (mbuffer) |
+| `push_zip_cmd` / `pull_unzip_cmd` | Compression pipeline |
+| `push_buf_cmd` / `pull_buf_cmd` | Buffer command (mbuffer) |
 
 ### Key config keys (node-side, local SQLite)
 | Key | Example |

@@ -183,7 +183,7 @@ err_t pipeline_push(const zep_config_t *cfg,
     ret = zfs_send_open(fs, base_snap[0] ? base_snap : NULL, snap_name,
                         cfg->send_all_snap,
                         cfg->send_options[0] ? cfg->send_options : NULL,
-                        cfg->pipe_zip_cmd, cfg->pipe_send_buf_cmd,
+                        cfg->push_zip_cmd, cfg->push_buf_cmd,
                         &send_fp);
     if (ret != ZEP_ERR_OK) {
         zfs_destroy_snapshot(snap_name);
@@ -329,7 +329,7 @@ err_t pipeline_pull(const zep_config_t *cfg,
         FILE *recv_fp = NULL;
         ret = zfs_recv_open(fs, meta.snapshot,
                             cfg->recv_options[0] ? cfg->recv_options : NULL,
-                            cfg->pipe_unzip_cmd, cfg->pipe_recv_buf_cmd,
+                            cfg->pull_unzip_cmd, cfg->pull_buf_cmd,
                             &recv_fp);
         if (ret != ZEP_ERR_OK) {
             fprintf(stderr, "pull: failed to open zfs recv\n");
@@ -464,15 +464,15 @@ err_t pipeline_build_pipe_send(const char *command, int compress, int buffer,
     if (n < 0) return ZEP_ERR_SYS;
     off = (size_t)n;
 
-    if (buffer && cfg->pipe_send_buf_cmd[0]) {
+    if (buffer && cfg->push_buf_cmd[0]) {
         n = snprintf(out + off, out_len - off, " | %s",
-                     cfg->pipe_send_buf_cmd);
+                     cfg->push_buf_cmd);
         if (n < 0 || (size_t)n >= out_len - off) return ZEP_ERR_SYS;
         off += (size_t)n;
     }
-    if (compress && cfg->pipe_zip_cmd[0]) {
+    if (compress && cfg->push_zip_cmd[0]) {
         n = snprintf(out + off, out_len - off, " | %s",
-                     cfg->pipe_zip_cmd);
+                     cfg->push_zip_cmd);
         if (n < 0 || (size_t)n >= out_len - off) return ZEP_ERR_SYS;
         off += (size_t)n;
     }
@@ -485,15 +485,15 @@ err_t pipeline_build_pipe_recv(const char *command, int compress, int buffer,
     if (!command || !cfg || !out || out_len == 0) return ZEP_ERR_SYS;
     size_t off = 0;
 
-    if (compress && cfg->pipe_unzip_cmd[0]) {
-        int n = snprintf(out, out_len, "%s", cfg->pipe_unzip_cmd);
+    if (compress && cfg->pull_unzip_cmd[0]) {
+        int n = snprintf(out, out_len, "%s", cfg->pull_unzip_cmd);
         if (n < 0) return ZEP_ERR_SYS;
         off = (size_t)n;
     }
-    if (buffer && cfg->pipe_recv_buf_cmd[0]) {
+    if (buffer && cfg->pull_buf_cmd[0]) {
         int n = snprintf(out + off, out_len - off, "%s%s",
                          off > 0 ? " | " : "",
-                         cfg->pipe_recv_buf_cmd);
+                         cfg->pull_buf_cmd);
         if (n < 0 || (size_t)n >= out_len - off) return ZEP_ERR_SYS;
         off += (size_t)n;
     }

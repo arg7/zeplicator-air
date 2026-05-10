@@ -20,6 +20,9 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <ctype.h>
+#include <termios.h>
+#include <sys/ioctl.h>
+#include <signal.h>
 
 static char g_server[512] = "https://master.zep.lan:8443";
 static char g_cert_path[ZEP_MAX_PATH];
@@ -704,9 +707,18 @@ static int cmd_admin_snap(int argc, char *argv[]) {
     return do_get(path);
 }
 
+static ws_conn_t *g_pipe_wc;
+static volatile sig_atomic_t g_winch_flag;
+
+static void pipe_winch_handler(int sig) {
+    (void)sig;
+    g_winch_flag = 1;
+}
+
 static int cmd_pipe(int argc, char *argv[]) {
     const char *node = NULL;
     int progress = 0;
+    int interactive = 0;
     size_t pipe_chunk = WS_CHUNK;
     int cmd_start = -1;
 
@@ -715,6 +727,8 @@ static int cmd_pipe(int argc, char *argv[]) {
             node = argv[++i];
         else if (strcmp(argv[i], "--progress") == 0)
             progress = 1;
+        else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0)
+            interactive = 1;
         else if (strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
             long val = atol(argv[++i]);
             if (val > 0) pipe_chunk = (size_t)val;
@@ -729,13 +743,14 @@ static int cmd_pipe(int argc, char *argv[]) {
     }
 
     if (cmd_start < 0 || cmd_start >= argc) {
-        fprintf(stderr, "Usage: zep-air-admin pipe [--chunk N] [--node CN] [--progress] <command...>\n"
-                        "  --chunk N   WS frame payload size in bytes (default: %u)\n"
-                        "  --node CN   Target node (default: auto-select)\n"
-                        "  --progress  Print transfer progress to stderr\n"
+        fprintf(stderr, "Usage: zep-air-admin pipe [--chunk N] [--node CN] [--progress] [-i] <command...>\n"
+                        "  --chunk N    WS frame payload size in bytes (default: %u)\n"
+                        "  --node CN    Target node (default: auto-select)\n"
+                        "  --progress   Print transfer progress to stderr\n"
+                        "  -i, --interactive  Allocate PTY, raw terminal (for shells)\n"
                         "\nExamples:\n"
                         "  zep-air-admin pipe zfs send -R tank-prod/data\n"
-                        "  zep-air-admin pipe --node foo bash\n"
+                        "  zep-air-admin pipe -i --node foo bash\n"
                         "  zep-air-admin pipe \"zfs send tank/data | zstd -c | mbuffer -q -m 4G\" > backup.zfs\n"
                         "  zfs send tank/data | zstd -c | mbuffer | zep-air-admin pipe \"mbuffer | zstd -d | zfs recv vault/data\"\n", WS_CHUNK);
         return 1;
@@ -767,8 +782,9 @@ static int cmd_pipe(int argc, char *argv[]) {
     }
 
     snprintf(ws_path, sizeof(ws_path),
-             "/v1/ws/pipe?node=%s&command=%s",
-             target_node, cmd_encoded);
+             "/v1/ws/pipe?node=%s&command=%s%s",
+             target_node, cmd_encoded,
+             interactive ? "&interactive=1" : "");
 
     if (g_verbose || progress)
         fprintf(stderr, "pipe: opening WebSocket to %s\n", target_node);
@@ -779,19 +795,48 @@ static int cmd_pipe(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Full-duplex pipe: stdin→WS, WS→stdout/stderr */
-    unsigned char *ws_buf = malloc(WS_FRAME_MAX);
-    unsigned char *out = malloc(WS_SUBCHUNK);
-    if (!ws_buf || !out) { free(ws_buf); free(out); ws_close(wc); return 1; }
+    /* Interactive terminal setup */
+    struct termios orig_term;
+    int interactive_tty = 0;
+    if (interactive && isatty(STDIN_FILENO)) {
+        if (tcgetattr(STDIN_FILENO, &orig_term) == 0) {
+            struct termios raw = orig_term;
+            cfmakeraw(&raw);
+            raw.c_cc[VMIN] = 1;
+            raw.c_cc[VTIME] = 0;
+            tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+            interactive_tty = 1;
 
+            struct sigaction sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sa_handler = pipe_winch_handler;
+            sigaction(SIGWINCH, &sa, NULL);
+
+            g_pipe_wc = wc;
+
+            struct winsize ws;
+            if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0) {
+                char rmsg[128];
+                int rlen = snprintf(rmsg, sizeof(rmsg),
+                    "{\"action\":\"resize\",\"rows\":%d,\"cols\":%d}", ws.ws_row, ws.ws_col);
+                ws_send_frame_ssl(wc, WS_OP_TEXT, (unsigned char *)rmsg, (size_t)rlen);
+            }
+        }
+    }
+
+    /* Full-duplex pipe: stdin→WS, WS→stdout/stderr */
     uint64_t sent = 0, rcvd_stdout = 0, rcvd_stderr = 0;
     int stdin_done = 0;
     int ws_done = 0;
     int remote_exit = 1;
     time_t start_time = time(NULL);
 
+    unsigned char *ws_buf = malloc(WS_FRAME_MAX);
+    unsigned char *out = malloc(WS_SUBCHUNK);
+    if (!ws_buf || !out) { free(ws_buf); free(out); ws_close(wc); goto pipe_cleanup; }
+
     unsigned char *inbuf = malloc(pipe_chunk);
-    if (!inbuf) { ws_close(wc); return 1; }
+    if (!inbuf) { free(ws_buf); free(out); ws_close(wc); goto pipe_cleanup; }
 
     for (;;) {
         fd_set rfds;
@@ -805,6 +850,17 @@ static int cmd_pipe(int argc, char *argv[]) {
         int ssl_pending = (wc->ssl && SSL_pending(wc->ssl) > 0);
 
         if (sel < 0 && errno != EINTR) break;
+
+        if (g_winch_flag && g_pipe_wc) {
+            g_winch_flag = 0;
+            struct winsize ws;
+            if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0) {
+                char rmsg[128];
+                int rlen = snprintf(rmsg, sizeof(rmsg),
+                    "{\"action\":\"resize\",\"rows\":%d,\"cols\":%d}", ws.ws_row, ws.ws_col);
+                ws_send_frame_ssl(g_pipe_wc, WS_OP_TEXT, (unsigned char *)rmsg, (size_t)rlen);
+            }
+        }
 
         if (stdin_done && !ws_done && time(NULL) - start_time > 30) {
             if (g_verbose) fprintf(stderr, "pipe: timeout waiting for remote response\n");
@@ -854,7 +910,7 @@ static int cmd_pipe(int argc, char *argv[]) {
             }
         }
 
-        if (stdin_done && ws_done) break;
+        if (ws_done) break;
     }
 
     free(inbuf);
@@ -870,6 +926,12 @@ static int cmd_pipe(int argc, char *argv[]) {
     if (progress && g_verbose)
         fprintf(stderr, "\npipe: done — sent=%llu recv_stdout=%llu recv_stderr=%llu exit=%d\n",
                 (unsigned long long)sent, (unsigned long long)rcvd_stdout, (unsigned long long)rcvd_stderr, remote_exit);
+
+pipe_cleanup:
+    if (interactive_tty) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &orig_term);
+        g_pipe_wc = NULL;
+    }
     return remote_exit;
 }
 

@@ -61,10 +61,10 @@ typedef struct {
     char key_password[128];
     char send_options[128];
     char recv_options[128];
-    char pipe_zip_cmd[128];
-    char pipe_unzip_cmd[128];
-    char pipe_send_buf_cmd[128];
-    char pipe_recv_buf_cmd[128];
+    char push_zip_cmd[128];
+    char pull_unzip_cmd[128];
+    char push_buf_cmd[128];
+    char pull_buf_cmd[128];
     char pipe_allow[2048];
     int  send_all_snap;
     size_t chunk_size;

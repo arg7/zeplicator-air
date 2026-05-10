@@ -20,6 +20,9 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/wait.h>
+#include <pty.h>
+#include <sys/ioctl.h>
+#include <termios.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/sha.h>
@@ -327,6 +330,126 @@ static void *ws_node_pipe_thread(void *arg) {
                             }
                             argv_buf[argc2] = NULL;
                             if (argc2 == 0) { free(cmd_copy); cJSON_Delete(task); continue; }
+
+                            cJSON *interactive = cJSON_GetObjectItem(task, "interactive");
+                            int is_interactive = (interactive && cJSON_IsTrue(interactive));
+
+                            if (is_interactive) {
+                                int pty_master;
+                                pid_t pid = forkpty(&pty_master, NULL, NULL, NULL);
+                                if (pid < 0) {
+                                    free(cmd_copy);
+                                    fprintf(stderr, "ws-node: forkpty() failed\n");
+                                    cJSON_Delete(task);
+                                    continue;
+                                }
+
+                                if (pid == 0) {
+                                    if (has_pipe)
+                                        execl("/bin/sh", "sh", "-c", cmd_str, (char *)NULL);
+                                    else
+                                        execvp(argv_buf[0], argv_buf);
+                                    dprintf(STDERR_FILENO, "exec: %s\n", strerror(errno));
+                                    _exit(1);
+                                }
+
+                                free(cmd_copy);
+                                fcntl(pty_master, F_SETFL, fcntl(pty_master, F_GETFL) | O_NONBLOCK);
+
+                                int pty_alive = 1;
+                                int ws_alive = 1;
+
+                                if (g_verbose) fprintf(stderr, "ws-node: interactive pipe started: %s pid=%d\n", cmd_str, (int)pid);
+
+                                int ws_fd = conn->sock;
+                                int ws_flags = fcntl(ws_fd, F_GETFL, 0);
+                                fcntl(ws_fd, F_SETFL, ws_flags | O_NONBLOCK);
+
+                                while (ws_alive && pty_alive) {
+                                    fd_set rfds;
+                                    FD_ZERO(&rfds);
+                                    int maxfd = -1;
+                                    FD_SET(pty_master, &rfds);
+                                    if (pty_master > maxfd) maxfd = pty_master;
+                                    FD_SET(ws_fd, &rfds);
+                                    if (ws_fd > maxfd) maxfd = ws_fd;
+
+                                    struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
+                                    int sel = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+                                    int ssl_pending = (conn->ssl && SSL_pending(conn->ssl) > 0);
+
+                                    if (sel < 0 && errno != EINTR) break;
+
+                                    if (sel > 0 || ssl_pending) {
+                                        if (pty_alive && FD_ISSET(pty_master, &rfds)) {
+                                            ssize_t nr = read(pty_master, out, WS_NODE_FRAME_MAX);
+                                            if (nr > 0) {
+                                                if (ws_node_send_frame(conn, WS_NODE_OP_BIN, out, (size_t)nr) < 0)
+                                                    ws_alive = 0;
+                                            } else if (nr <= 0) {
+                                                pty_alive = 0;
+                                            }
+                                        }
+
+                                        if (ws_alive && (FD_ISSET(ws_fd, &rfds) || ssl_pending)) {
+                                            unsigned char peek[1];
+                                            int r = (int)recv(ws_fd, peek, 1, MSG_PEEK | MSG_DONTWAIT);
+                                            if (r == 0) { ws_alive = 0; break; }
+                                            if (r > 0 || ssl_pending) {
+                                                ssize_t rn = ws_node_recv_frame(conn, out, WS_NODE_FRAME_MAX, &buf[0]);
+                                                if (rn < 0) { ws_alive = 0; break; }
+                                                unsigned char op = buf[0] & 0x0F;
+
+                                                if (op == WS_NODE_OP_CLOSE) { ws_alive = 0; break; }
+                                                if (op == WS_NODE_OP_PING) { ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)rn); continue; }
+                                                if (op == WS_NODE_OP_PONG) continue;
+                                                if (op == WS_NODE_OP_EOF) continue;
+
+                                                if (op == WS_NODE_OP_TEXT) {
+                                                    out[rn] = '\0';
+                                                    cJSON *msg = cJSON_Parse((char *)out);
+                                                    if (msg) {
+                                                        cJSON *act = cJSON_GetObjectItem(msg, "action");
+                                                        if (act && cJSON_IsString(act) && strcmp(act->valuestring, "resize") == 0) {
+                                                            cJSON *rows = cJSON_GetObjectItem(msg, "rows");
+                                                            cJSON *cols = cJSON_GetObjectItem(msg, "cols");
+                                                            if (cJSON_IsNumber(rows) && cJSON_IsNumber(cols)) {
+                                                                struct winsize ws;
+                                                                ws.ws_row = (unsigned short)rows->valueint;
+                                                                ws.ws_col = (unsigned short)cols->valueint;
+                                                                ws.ws_xpixel = 0;
+                                                                ws.ws_ypixel = 0;
+                                                                ioctl(pty_master, TIOCSWINSZ, &ws);
+                                                                kill(pid, SIGWINCH);
+                                                            }
+                                                        }
+                                                        cJSON_Delete(msg);
+                                                    }
+                                                    continue;
+                                                }
+
+                                                if (op == WS_NODE_OP_BIN && pty_alive) {
+                                                    ssize_t w = write(pty_master, out, (size_t)rn);
+                                                    if (w < 0 && errno != EAGAIN)
+                                                        pty_alive = 0;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                fcntl(ws_fd, F_SETFL, ws_flags);
+                                close(pty_master);
+                                int status = 0;
+                                waitpid(pid, &status, 0);
+                                if (g_verbose) fprintf(stderr, "ws-node: interactive pipe done, child exit=%d\n", WEXITSTATUS(status));
+                                {
+                                    unsigned char exit_byte = (unsigned char)WEXITSTATUS(status);
+                                    ws_node_send_frame(conn, WS_NODE_OP_EXIT, &exit_byte, 1);
+                                }
+                                ws_node_send_frame(conn, WS_NODE_OP_CLOSE, NULL, 0);
+                                break;
+                            }
 
                             int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2];
                             if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {

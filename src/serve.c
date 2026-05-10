@@ -928,6 +928,8 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
 
     /* Check pipe_allow before taking over node thread */
     const char *command = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "command");
+    const char *interactive = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "interactive");
+    int is_interactive = (interactive && strcmp(interactive, "1") == 0);
     if (command) {
         gnutls_session_t admin_tls_check = NULL;
         int admin_raw_fd_check = sock;
@@ -1005,6 +1007,7 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
         cJSON *task = cJSON_CreateObject();
         cJSON_AddStringToObject(task, "action", "pipe");
         cJSON_AddStringToObject(task, "command", command);
+        if (is_interactive) cJSON_AddBoolToObject(task, "interactive", 1);
         char *task_json = cJSON_PrintUnformatted(task);
         if (task_json) {
             if (g_verbose)

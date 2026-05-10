@@ -244,10 +244,10 @@ zep-air config list
 | `send_options` | Extra `zfs send` flags (`-w`, `-p`, `-R`) |
 | `recv_options` | Extra `zfs recv` flags |
 | `send_all_snap` | `1` = use `-I` (all snapshots), `0` = `-i` (single incremental) |
-| `pipe_zip_cmd` | Compression command (default: `zstd -c`, set `""` to disable) |
-| `pipe_unzip_cmd` | Decompression command (default: `zstd -d`) |
-| `pipe_send_buf_cmd` | Buffer command before compression (e.g. `mbuffer -q -m 512M`) |
-| `pipe_recv_buf_cmd` | Buffer command after decompression |
+| `push_zip_cmd` | Compression command (default: `zstd -c`, set `""` to disable) |
+| `pull_unzip_cmd` | Decompression command (default: `zstd -d`) |
+| `push_buf_cmd` | Buffer command before compression (e.g. `mbuffer -q -m 512M`) |
+| `pull_buf_cmd` | Buffer command after decompression |
 | `pipe_allow` | Comma-separated allowed command prefixes (default: `zfs`). Supports negation (`zfs !destroy`) and prefix matching (`zfs snap` matches `zfs snapshot`). Empty string disables pipe entirely. |
 | `pipe_allow_tools` | Comma-separated allowed pipeline tool names (default: `buffer,mbuffer,zstd,lz4,gzip,gunzip`). Checked for each `| cmd` segment in pipeline commands. |
 
@@ -299,7 +299,7 @@ Commands:
   rollback --snap NAME      Cluster-wide rollback to snapshot
   snap create --name NAME   Manual snapshot (no rotation)
   snap destroy --name NAME  Remove manual snapshot
-  pipe [--chunk N] --node CN [--progress] [--] <command...>  Run command on remote node via WebSocket, stream stdout+stderr
+  pipe [-i] [--chunk N] --node CN [--progress] [--] <command...>  Run command on remote node via WebSocket, stream stdout+stderr
 ```
 
 ### `pipe` — Run commands on remote nodes (WebSocket)
@@ -307,12 +307,13 @@ Commands:
 Runs a command on a remote node, streaming `stdin`/`stdout`/`stderr` in real time through the server via a WebSocket bridge. The server checks the command against `pipe_allow` before forwarding. No disk storage — pure pipe-through. The remote exit code is returned as the admin's own exit code.
 
 ```
-zep-air-admin pipe [--chunk N] --node <CN> [--progress] [--] <command...>
+zep-air-admin pipe [-i] [--chunk N] --node <CN> [--progress] [--] <command...>
 ```
 
 | Option | Description |
 |--------|-------------|
 | `--node CN` | Target node (required) |
+| `-i`, `--interactive` | Allocate PTY, raw terminal mode for interactive shells |
 | `--chunk N` | Stdin read size in bytes (default: 16380, max one TLS record) |
 | `--progress` | Print transfer statistics on stderr |
 | `--" --"` | Optional separator between options and command |
@@ -333,8 +334,8 @@ zep-air-admin pipe --node za-master "zfs send -R rpool/data | zstd -c" | zstd -d
 zfs send pool/data@snap | zstd -c | mbuffer | \
   zep-air-admin pipe --node bench "mbuffer | zstd -d | zfs recv -F -u vault/data"
 
-# Interactive shell (no pipeline)
-zep-air-admin pipe --node bench bash
+# Interactive shell with PTY and raw terminal
+zep-air-admin pipe -i --node bench bash
 ```
 
 Pipelines are executed via `/bin/sh -c` on the node. Non-pipeline commands use `execvp()` directly (no shell). The server enforces pipeline tool allowlisting via `pipe_allow_tools`.
@@ -356,6 +357,26 @@ zep-air-admin pipe --node za-client-1 zfs recv -F -u vault/data < backup.zfs
 # Execute remote command, check exit code
 zep-air-admin pipe --node bench -- bash -c "exit 42"; echo $?  # prints 42
 ```
+
+**Interactive console with `-i`:**
+
+Passing `-i` allocates a pseudo-terminal (PTY) on the remote node and puts the
+local terminal in raw mode. This gives you a real interactive shell — prompts,
+line editing (readline), Ctrl+C, and TUI programs like `vim` or `top` all work:
+
+```sh
+zep-air-admin pipe -i --node bench bash
+```
+
+Without `-i`, commands execute against plain pipes — stdin/stdout/stderr are
+file descriptors, not a TTY. The remote process sees no TTY, so shells won't
+show prompts and interactive programs won't start.
+
+Terminal window resizes are detected via `SIGWINCH` and forwarded to the remote
+PTY automatically (`TIOCSWINSZ`). The local terminal attributes are restored on
+exit (even on Ctrl+C).
+
+The remote exit code is returned as the admin's own exit code (Ctrl+D / `exit` → 0).
 
 **`pipe_allow` server config (enforced by the server before forwarding):**
 
@@ -495,23 +516,23 @@ Recv: blob → chunk → [unzip_cmd |] [buf_cmd |] zfs recv [opts]
 ```sh
 # Raw encrypted send with no local compression (fast LAN)
 zep-air config set send_options "-w"
-zep-air config set pipe_zip_cmd ""
+zep-air config set push_zip_cmd ""
 
 # All properties, all intermediate snapshots
 zep-air config set send_options "-p"
 zep-air config set send_all_snap 1
 
 # mbuffer for rate-limited WAN links
-zep-air config set pipe_send_buf_cmd "mbuffer -q -s 128k -m 512M"
-zep-air config set pipe_recv_buf_cmd "mbuffer -q -s 128k -m 512M"
+zep-air config set push_buf_cmd "mbuffer -q -s 128k -m 512M"
+zep-air config set pull_buf_cmd "mbuffer -q -s 128k -m 512M"
 
 # lz4 instead of zstd
-zep-air config set pipe_zip_cmd "lz4 -c"
-zep-air config set pipe_unzip_cmd "lz4 -d"
+zep-air config set push_zip_cmd "lz4 -c"
+zep-air config set pull_unzip_cmd "lz4 -d"
 
 # No compression (raw stream, fast CPU)
-zep-air config set pipe_zip_cmd ""
-zep-air config set pipe_unzip_cmd ""
+zep-air config set push_zip_cmd ""
+zep-air config set pull_unzip_cmd ""
 ```
 
 ## Architecture

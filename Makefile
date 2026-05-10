@@ -9,7 +9,7 @@ COMMON   = src/db.c src/zfs.c src/storage.c src/pipeline.c src/http.c
 all: zep-air zep-air-serve zep-air-admin
 
 zep-air: src/main.c $(COMMON)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lutil
 
 zep-air-serve: src/serve.c src/storage.c src/db.c src/zstream.c src/auth.c
 	$(CC) $(CFLAGS) -o $@ $^ $(SERV_LDFLAGS)
