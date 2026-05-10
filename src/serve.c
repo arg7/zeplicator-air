@@ -1833,6 +1833,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
     if (strcmp(ctx->method, "POST") == 0 &&
         strcmp(ctx->target_url, "/v1/cron/ack") == 0) {
+        if (g_verbose) printf("cron/ack: body=%.*s\n", (int)ctx->body_len, (const char *)ctx->body);
         cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
         if (json) {
             cJSON *guid = cJSON_GetObjectItem(json, "guid");
