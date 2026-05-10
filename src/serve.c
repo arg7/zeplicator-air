@@ -62,6 +62,7 @@ struct node_ws {
     int pipe_recv_mode;
     int pipe_starting;
     struct MHD_Connection *mhd_conn;
+    gnutls_session_t gnutls_session;
     /* Pipes for inter-thread data transfer */
     int pipe_admin_to_node[2];  /* bridge→node: admin data */
     int pipe_node_to_admin[2];  /* node→bridge: node data */
@@ -370,7 +371,6 @@ static struct node_ws *node_ws_register(const char *cn, int sock) {
         if (strcmp(nw->cn, cn) == 0) {
             pthread_mutex_lock(&nw->lock);
             nw->ws_closed = 1;
-            if (nw->sock >= 0) { shutdown(nw->sock, SHUT_RDWR); close(nw->sock); nw->sock = -1; }
             pthread_mutex_unlock(&nw->lock);
             break;
         }
@@ -519,13 +519,11 @@ static ssize_t ws_send_frame_gtls(struct node_ws *nw, unsigned char opcode,
     }
 
     ssize_t sent = 0;
-    if (nw && nw->mhd_conn) {
-        const union MHD_ConnectionInfo *ci = MHD_get_connection_info(nw->mhd_conn, MHD_CONNECTION_INFO_GNUTLS_SESSION);
-        if (ci && ci->tls_session) {
-            while ((size_t)sent < flen) {
-                ssize_t n = gnutls_record_send((gnutls_session_t)ci->tls_session, frame + sent, flen - (size_t)sent);
-                if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
-                    int raw_fd = (int)(intptr_t)gnutls_transport_get_ptr((gnutls_session_t)ci->tls_session);
+    if (nw && nw->gnutls_session) {
+        while ((size_t)sent < flen) {
+            ssize_t n = gnutls_record_send(nw->gnutls_session, frame + sent, flen - (size_t)sent);
+            if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
+                int raw_fd = (int)(intptr_t)gnutls_transport_get_ptr(nw->gnutls_session);
                     if (raw_fd < 0) { free(frame); return -1; }
                     fd_set wfds; FD_ZERO(&wfds); FD_SET(raw_fd, &wfds);
                     struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
@@ -537,7 +535,6 @@ static ssize_t ws_send_frame_gtls(struct node_ws *nw, unsigned char opcode,
             }
             free(frame);
             return (ssize_t)flen;
-        }
     }
     free(frame);
     return -1;
@@ -546,20 +543,17 @@ static ssize_t ws_send_frame_gtls(struct node_ws *nw, unsigned char opcode,
 static ssize_t ws_recv_node(struct node_ws *nw, unsigned char *buf, size_t buf_size) {
     if (g_no_tls)
         return recv(nw ? nw->sock : -1, buf, buf_size, 0);
-    if (nw && nw->mhd_conn) {
-        const union MHD_ConnectionInfo *ci = MHD_get_connection_info(nw->mhd_conn, MHD_CONNECTION_INFO_GNUTLS_SESSION);
-        if (ci && ci->tls_session) {
-            ssize_t n = gnutls_record_recv((gnutls_session_t)ci->tls_session, buf, buf_size);
-            if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
-                int raw_fd = (int)(intptr_t)gnutls_transport_get_ptr((gnutls_session_t)ci->tls_session);
-                if (raw_fd < 0) return -1;
-                fd_set rfds; FD_ZERO(&rfds); FD_SET(raw_fd, &rfds);
-                struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
-                if (select(raw_fd + 1, &rfds, NULL, NULL, &tv) <= 0) return -1;
-                return gnutls_record_recv((gnutls_session_t)ci->tls_session, buf, buf_size);
-            }
-            return n;
+    if (nw && nw->gnutls_session) {
+        ssize_t n = gnutls_record_recv(nw->gnutls_session, buf, buf_size);
+        if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
+            int raw_fd = (int)(intptr_t)gnutls_transport_get_ptr(nw->gnutls_session);
+            if (raw_fd < 0) return -1;
+            fd_set rfds; FD_ZERO(&rfds); FD_SET(raw_fd, &rfds);
+            struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
+            if (select(raw_fd + 1, &rfds, NULL, NULL, &tv) <= 0) return -1;
+            return gnutls_record_recv(nw->gnutls_session, buf, buf_size);
         }
+        return n;
     }
     return recv(nw ? nw->sock : -1, buf, buf_size, 0);
 }
@@ -632,11 +626,8 @@ static void *node_ws_thread(void *arg) {
     free(ctx);
 
     int raw_sock = sock;
-    if (!g_no_tls && nw->mhd_conn) {
-        const union MHD_ConnectionInfo *ci = MHD_get_connection_info(nw->mhd_conn, MHD_CONNECTION_INFO_GNUTLS_SESSION);
-        if (ci && ci->tls_session)
-            raw_sock = (int)(intptr_t)gnutls_transport_get_ptr((gnutls_session_t)ci->tls_session);
-    }
+    if (!g_no_tls && nw->gnutls_session)
+        raw_sock = (int)(intptr_t)gnutls_transport_get_ptr(nw->gnutls_session);
     if (raw_sock < 0) raw_sock = sock;
 
     ws_make_blocking(sock);
@@ -736,6 +727,10 @@ static void ws_node_upgrade_handler(void *cls, struct MHD_Connection *conn,
     struct node_ws *nw = node_ws_register(cn, sock);
     if (!nw) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
     nw->mhd_conn = conn;
+    {
+        const union MHD_ConnectionInfo *ci = MHD_get_connection_info(conn, MHD_CONNECTION_INFO_GNUTLS_SESSION);
+        nw->gnutls_session = (ci && ci->tls_session) ? (gnutls_session_t)ci->tls_session : NULL;
+    }
 
     /* Spawn thread for WS loop */
     struct node_ws_thread_ctx *ctx = malloc(sizeof(*ctx));
