@@ -301,6 +301,8 @@ static void verify_snapshot(const char *cluster_key, const char *prefix) {
 
     const char *pusher = meta.host[0] ? meta.host : cluster_key;
     db_chain_insert(db, cluster_key, toguid, fromguid, meta.snapshot, pusher);
+    if (g_verbose) printf("verify: chain inserted, checking cron_last label=%s, cluster_fs=%s\n",
+                          meta.label, meta.cluster_fs);
 
     if (meta.label[0] && meta.cluster_fs[0]) {
         char cluster_buf[64] = {0};
