@@ -24,12 +24,13 @@
 #include <sys/ioctl.h>
 #include <signal.h>
 
-static char g_server[512] = "https://master.zep.lan:8443";
+static char g_server[512];
 static char g_cert_path[ZEP_MAX_PATH];
 static char g_key_path[ZEP_MAX_PATH];
 static char g_ca_path[ZEP_MAX_PATH];
 static char g_key_password[128];
 static char g_db_path[ZEP_MAX_PATH];
+static int  g_has_server = 0;
 static int  g_verbose = 0;
 
 struct curl_buf {
@@ -1057,8 +1058,10 @@ int main(int argc, char *argv[]) {
         }
         if (strcmp(argv[i], "--server") == 0 && i + 1 < argc) {
             snprintf(g_server, sizeof(g_server), "%s", argv[++i]);
+            g_has_server = 1;
         } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
             snprintf(g_server, sizeof(g_server), "%s", argv[++i]);
+            g_has_server = 1;
         } else if (strcmp(argv[i], "--cert") == 0 && i + 1 < argc) {
             snprintf(g_cert_path, sizeof(g_cert_path), "%s", argv[++i]);
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
@@ -1091,7 +1094,7 @@ int main(int argc, char *argv[]) {
         sqlite3 *db = NULL;
         if (sqlite3_open(g_db_path, &db) == SQLITE_OK && db) {
             char buf[ZEP_MAX_PATH] = {0};
-            if (!g_server[0]) { if (db_config_get(db, "server_url",  buf, sizeof(buf)) == ZEP_ERR_OK) snprintf(g_server,   sizeof(g_server),   "%s", buf); }
+            if (!g_has_server){if (db_config_get(db, "server_url", buf, sizeof(buf)) == ZEP_ERR_OK) snprintf(g_server,   sizeof(g_server),   "%s", buf); }
             if (!g_cert_path[0]){if (db_config_get(db, "cert_path",  buf, sizeof(buf)) == ZEP_ERR_OK) snprintf(g_cert_path, sizeof(g_cert_path), "%s", buf); }
             if (!g_key_path[0]){if (db_config_get(db, "key_path",   buf, sizeof(buf)) == ZEP_ERR_OK) snprintf(g_key_path,  sizeof(g_key_path),  "%s", buf); }
             if (!g_ca_path[0]){if (db_config_get(db, "ca_path",    buf, sizeof(buf)) == ZEP_ERR_OK) snprintf(g_ca_path,   sizeof(g_ca_path),   "%s", buf); }
@@ -1099,6 +1102,8 @@ int main(int argc, char *argv[]) {
             sqlite3_close(db);
         }
     }
+    if (!g_server[0])
+        snprintf(g_server, sizeof(g_server), "https://master.zep.lan:8443");
 
     if (argc2 < 2) { usage(argv2[0]); return 1; }
 
