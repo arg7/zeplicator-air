@@ -189,11 +189,11 @@ static void verify_snapshot(const char *cluster_key, const char *prefix) {
 
     err_t ret = storage_read_meta(g_storage_root, cluster_key, prefix, &meta);
     if (ret != ZEP_ERR_OK) {
-        if (g_verbose) printf("verify: read_meta failed (%d) node=%s prefix=%s\n",
+        if (g_verbose) fprintf(stderr, "verify: read_meta failed (%d) node=%s prefix=%s\n",
                               ret, cluster_key, prefix);
         return;
     }
-    if (g_verbose) printf("verify: meta loaded snapshot=%s label='%s' cluster_fs='%s'\n",
+    if (g_verbose) fprintf(stderr, "verify: meta loaded snapshot=%s label='%s' cluster_fs='%s'\n",
                           meta.snapshot, meta.label, meta.cluster_fs);
 
     char *dir_path = NULL;
@@ -304,7 +304,7 @@ static void verify_snapshot(const char *cluster_key, const char *prefix) {
 
     const char *pusher = meta.host[0] ? meta.host : cluster_key;
     db_chain_insert(db, cluster_key, toguid, fromguid, meta.snapshot, pusher);
-    if (g_verbose) printf("verify: chain inserted, checking cron_last label=%s, cluster_fs=%s\n",
+    if (g_verbose) fprintf(stderr, "verify: chain inserted, checking cron_last label=%s, cluster_fs=%s\n",
                           meta.label, meta.cluster_fs);
 
     if (meta.label[0] && meta.cluster_fs[0]) {
@@ -319,7 +319,7 @@ static void verify_snapshot(const char *cluster_key, const char *prefix) {
             }
             sqlite3_finalize(cs);
         }
-        if (g_verbose) printf("verify: label=%s cluster_fs=%s cluster=%s node=%s\n",
+        if (g_verbose) fprintf(stderr, "verify: label=%s cluster_fs=%s cluster=%s node=%s\n",
                               meta.label, meta.cluster_fs, cluster_buf, cluster_key);
         if (cluster_buf[0]) {
             char cron_key[1024];
@@ -330,7 +330,7 @@ static void verify_snapshot(const char *cluster_key, const char *prefix) {
             struct tm tm;
             gmtime_r(&tnow, &tm);
             strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
-            if (g_verbose) printf("verify: set %s = %s\n", cron_key, now_str);
+            if (g_verbose) fprintf(stderr, "verify: set %s = %s\n", cron_key, now_str);
             db_config_set(db, cron_key, now_str);
         } else if (g_verbose) {
             printf("verify: no cluster found for node '%s'\n", cluster_key);
@@ -737,7 +737,11 @@ static void ws_node_upgrade_handler(void *cls, struct MHD_Connection *conn,
     ctx->sock = sock;
     ctx->mhd_conn = conn;
     ctx->urh = urh;
-    pthread_create(&nw->thread, NULL, node_ws_thread, ctx);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED);
+    pthread_create(&nw->thread, &attr, node_ws_thread, ctx);
+    pthread_attr_destroy(&attr);
     pthread_detach(nw->thread);
 }
 
@@ -1758,7 +1762,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                         char last_str[32] = {0};
                                         db_config_get(g_db, cron_key, last_str,
                                                       sizeof(last_str));
-                                        if (g_verbose) printf("cron/sync: %s = '%s'\n", cron_key, last_str);
+                                        if (g_verbose) fprintf(stderr, "cron/sync: %s = '%s'\n", cron_key, last_str);
                                         time_t last = 0;
                                         if (last_str[0]) {
                                             struct tm tm = {0};
@@ -1833,7 +1837,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
     if (strcmp(ctx->method, "POST") == 0 &&
         strcmp(ctx->target_url, "/v1/cron/ack") == 0) {
-        if (g_verbose) printf("cron/ack: body=%.*s\n", (int)ctx->body_len, (const char *)ctx->body);
+        if (g_verbose) fprintf(stderr, "cron/ack: body=%.*s\n", (int)ctx->body_len, (const char *)ctx->body);
         cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
         if (json) {
             cJSON *guid = cJSON_GetObjectItem(json, "guid");
@@ -1862,7 +1866,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     struct tm tm;
                     gmtime_r(&tnow, &tm);
                     strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
-                    if (g_verbose) printf("cron/ack: set %s = %s\n", cron_key, now_str);
+                    if (g_verbose) fprintf(stderr, "cron/ack: set %s = %s\n", cron_key, now_str);
                     db_config_set(g_db, cron_key, now_str);
                 }
             }
@@ -1926,7 +1930,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 if (f) {
                     fwrite(ctx->body, 1, ctx->body_len, f);
                     fclose(f);
-                    if (g_verbose) printf("PUT meta: %s/%s (%zu bytes) body=%.*s\n",
+                    if (g_verbose) fprintf(stderr, "PUT meta: %s/%s (%zu bytes) body=%.*s\n",
                                           ctx->prefix, "meta.json", ctx->body_len,
                                           (int)ctx->body_len, (const char *)ctx->body);
                     free(path);
@@ -1959,7 +1963,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                     struct tm tm;
                                     gmtime_r(&tnow, &tm);
                                     strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
-                                    if (g_verbose) printf("PUT meta: set %s = %s\n", cron_key, now_str);
+                                    if (g_verbose) fprintf(stderr, "PUT meta: set %s = %s\n", cron_key, now_str);
                                     db_config_set(g_db, cron_key, now_str);
                                 } else if (g_verbose) {
                                     printf("PUT meta: no cluster for node '%s'\n", ctx->node);
@@ -1969,7 +1973,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                         }
                     }
 
-                    if (g_verbose) printf("PUT meta: calling verify_snapshot(%s, %s)\n",
+                    if (g_verbose) fprintf(stderr, "PUT meta: calling verify_snapshot(%s, %s)\n",
                                           ctx->node, ctx->prefix);
                     verify_snapshot(ctx->node, ctx->prefix);
                     return send_json(conn, 200, "{\"ok\":true}");
@@ -1987,7 +1991,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             if (f) {
                 fwrite(ctx->body, 1, ctx->body_len, f);
                 fclose(f);
-                if (g_verbose) printf("PUT blob: %s/%04d (%zu bytes)\n",
+                if (g_verbose) fprintf(stderr, "PUT blob: %s/%04d (%zu bytes)\n",
                                        ctx->prefix, part, ctx->body_len);
                 free(path);
                 verify_snapshot(ctx->node, ctx->prefix);
