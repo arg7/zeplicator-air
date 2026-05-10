@@ -188,7 +188,13 @@ static void verify_snapshot(const char *cluster_key, const char *prefix) {
     memset(&meta, 0, sizeof(meta));
 
     err_t ret = storage_read_meta(g_storage_root, cluster_key, prefix, &meta);
-    if (ret != ZEP_ERR_OK) return;
+    if (ret != ZEP_ERR_OK) {
+        if (g_verbose) printf("verify: read_meta failed (%d) node=%s prefix=%s\n",
+                              ret, cluster_key, prefix);
+        return;
+    }
+    if (g_verbose) printf("verify: meta loaded snapshot=%s label='%s' cluster_fs='%s'\n",
+                          meta.snapshot, meta.label, meta.cluster_fs);
 
     char *dir_path = NULL;
     if (asprintf(&dir_path, "%s/%s/%s", g_storage_root, cluster_key, prefix) < 0) {
@@ -1891,6 +1897,8 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                           ctx->prefix, "meta.json", ctx->body_len,
                                           (int)ctx->body_len, (const char *)ctx->body);
                     free(path);
+                    if (g_verbose) printf("PUT meta: calling verify_snapshot(%s, %s)\n",
+                                          ctx->node, ctx->prefix);
                     verify_snapshot(ctx->node, ctx->prefix);
                     return send_json(conn, 200, "{\"ok\":true}");
                 }
