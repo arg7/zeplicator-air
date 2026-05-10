@@ -58,7 +58,11 @@ SERV="${SERV:-${PROJ_DIR}/zep-air-serve}"
 ADMIN="${ADMIN:-${PROJ_DIR}/zep-air-admin}"
 CRON_INTERVAL="${CRON_INTERVAL:-60}"
 
-mkdir -p "$PID_DIR"
+mkdir -p "$PID_DIR" 2>/dev/null || {
+    OWNER="${SUDO_USER:-$(whoami)}"
+    sudo chown "${OWNER}:${OWNER}" "$PID_DIR" 2>/dev/null || true
+    mkdir -p "$PID_DIR"
+}
 
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; NC='\033[0m'
 say() { echo -e "${GREEN}==>${NC} $1"; }

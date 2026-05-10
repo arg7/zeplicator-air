@@ -72,10 +72,13 @@ say() { echo -e "${GREEN}==>${NC} $1"; }
 ###############################################################################
 # 2. Create directories
 ###############################################################################
+OWNER="${SUDO_USER:-$(whoami)}"
 say "Creating directories under ${ZEP_BASE} ..."
 sudo mkdir -p "$PKI_DIR" "$SERVER_STORAGE" "$PID_DIR"
-sudo chown -R "$(whoami):$(whoami)" "$ZEP_BASE" 2>/dev/null || true
-mkdir -p "$PKI_DIR" "$SERVER_STORAGE" "$PID_DIR"
+sudo chown -R "${OWNER}:${OWNER}" "$ZEP_BASE"
+for d in "$PKI_DIR" "$SERVER_STORAGE" "$PID_DIR"; do
+    mkdir -p "$d"
+done
 
 ###############################################################################
 # 3. PKI — CA + server + admin + nodes
@@ -184,7 +187,7 @@ sudo "$SERV" --setup \
     --cert "${PKI_DIR}/server.crt" --key "${PKI_DIR}/server.key" \
     --ca "${PKI_DIR}/ca.crt" --admin-cert "${PKI_DIR}/admin.crt" \
     --db "$SERVER_DB" 2>/dev/null
-sudo chown "$(whoami):$(whoami)" "$SERVER_DB" 2>/dev/null || true
+sudo chown "${OWNER}:${OWNER}" "$SERVER_DB"
 
 ###############################################################################
 # 6. Server-side config (start temporarily, configure, then stop)
