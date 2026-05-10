@@ -33,8 +33,13 @@ if [[ -z "$ENV_FILE" ]]; then
 fi
 
 if [[ ! -f "$ENV_FILE" ]]; then
-    echo "Error: env file not found: $ENV_FILE"
-    exit 1
+    if [[ -f "${PROJ_DIR}/cluster/cluster.env" ]]; then
+        echo "  (no ${ENV_FILE}, using cluster/cluster.env)"
+        ENV_FILE="${PROJ_DIR}/cluster/cluster.env"
+    else
+        echo "Error: env file not found: $ENV_FILE"
+        exit 1
+    fi
 fi
 
 ACTION="${1:-status}"
