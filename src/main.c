@@ -1238,6 +1238,13 @@ static int cmd_cron(int argc, char *argv[]) {
                         pipeline_push(&cfg2, &http_cfg, local_fs, label->valuestring,
                                       cfs->valuestring);
                         tasks_done++;
+                        {
+                            char body[512];
+                            snprintf(body, sizeof(body),
+                                     "{\"label\":\"%s\",\"cluster_fs\":\"%s\"}",
+                                     label->valuestring, cfs->valuestring);
+                            http_post_json(&http_cfg, "/v1/cron/ack", body);
+                        }
                     }
                     db_close(db);
                 }
