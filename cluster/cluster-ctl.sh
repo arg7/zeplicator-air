@@ -166,7 +166,7 @@ do_start() {
     local cron_pids_file_content=""
     for entry in ${NODES:-}; do
         IFS=':' read -r cn role poolfs <<< "$entry"
-        local node_db="${ZEP_BASE}/${cn}.db"
+        local node_db="${ZEP_BASE}/home/${cn}/${cn}.db"
         if [[ ! -f "$node_db" ]]; then
             echo -e "  ${YELLOW}No DB for $cn ($node_db) — skipping${NC}"
             continue

@@ -281,7 +281,7 @@ fi
 say "Configuring node databases ..."
 for entry in ${NODES:-}; do
     IFS=':' read -r cn role poolfs <<< "$entry"
-    node_db="${ZEP_BASE}/${cn}.db"
+    node_db="${ZEP_BASE}/home/${cn}/${cn}.db"
     rm -f "$node_db"
 
     "$ZEP" --db "$node_db" config set node_name  "$cn"
@@ -292,8 +292,6 @@ for entry in ${NODES:-}; do
     "$ZEP" --db "$node_db" config set cluster    "$CLUSTER_NAME"
     "$ZEP" --db "$node_db" config set mapping    "${CLUSTER_POOL:-za-pool-1}/${CLUSTER_FS:-za-data-1}:${poolfs}"
     [[ -z "${KEY_PASSWORD:-}" ]] || "$ZEP" --db "$node_db" config set key_password "$KEY_PASSWORD"
-
-    [[ "$SUDO_NODES" == "1" ]] && sudo chown "${cn}:${cn}" "$node_db" 2>/dev/null || true
 done
 
 say "Configuring admin database ..."
@@ -320,7 +318,7 @@ echo "  Configuration: $ENV_FILE"
 echo "  PKI:           ${PKI_DIR}/"
 echo "  Server DB:     ${SERVER_DB}"
 echo "  Storage:       ${SERVER_STORAGE}"
-echo "  Node DBs:      ${ZEP_BASE}/<node>.db"
+echo "  Node DBs:      ${ZEP_BASE}/home/<cn>/<cn>.db"
 echo "  Admin DB:      ${admin_db}"
 echo ""
 echo "Next steps:"
