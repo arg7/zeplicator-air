@@ -364,18 +364,16 @@ static struct node_ws *node_ws_find(const char *cn) {
 
 static struct node_ws *node_ws_register(const char *cn, int sock) {
     pthread_mutex_lock(&g_node_ws_lock);
-    /* Remove existing connection for this node */
-    struct node_ws *prev = NULL, *nw = g_node_ws;
+    /* Signal existing connection to close gracefully */
+    struct node_ws *nw = g_node_ws;
     while (nw) {
         if (strcmp(nw->cn, cn) == 0) {
-            if (prev) prev->next = nw->next;
-            else g_node_ws = nw->next;
+            pthread_mutex_lock(&nw->lock);
+            nw->ws_closed = 1;
+            if (nw->sock >= 0) { shutdown(nw->sock, SHUT_RDWR); close(nw->sock); nw->sock = -1; }
             pthread_mutex_unlock(&nw->lock);
-            pthread_mutex_destroy(&nw->lock);
-            free(nw);
             break;
         }
-        prev = nw;
         nw = nw->next;
     }
     nw = calloc(1, sizeof(*nw));
@@ -399,15 +397,15 @@ static struct node_ws *node_ws_register(const char *cn, int sock) {
     return nw;
 }
 
-static void node_ws_unregister(const char *cn) {
+static void node_ws_unregister(struct node_ws *target) {
     pthread_mutex_lock(&g_node_ws_lock);
     struct node_ws *prev = NULL, *nw = g_node_ws;
     while (nw) {
-        if (strcmp(nw->cn, cn) == 0) {
+        if (nw == target) {
             if (prev) prev->next = nw->next;
             else g_node_ws = nw->next;
             if (g_verbose)
-                fprintf(stderr, "ws: node %s unregistered\n", cn);
+                fprintf(stderr, "ws: node %s unregistered\n", nw->cn);
             pthread_mutex_destroy(&nw->lock);
             free(nw);
             break;
@@ -656,7 +654,15 @@ static void *node_ws_thread(void *arg) {
         /* Check if pipe is starting — exit so bridge can take over */
         pthread_mutex_lock(&nw->lock);
         int exiting = nw->pipe_starting;
+        int closed = nw->ws_closed;
         pthread_mutex_unlock(&nw->lock);
+        if (closed) {
+            if (g_verbose) {
+                fprintf(stderr, "ws: node %s closed by new connection\n", nw->cn);
+                fflush(stderr);
+            }
+            break;
+        }
         if (exiting) {
             if (g_verbose) {
                 fprintf(stderr, "ws: node %s exiting for pipe bridge\n", nw->cn);
@@ -709,7 +715,7 @@ static void *node_ws_thread(void *arg) {
     pthread_mutex_unlock(&nw->lock);
 
     if (!for_pipe) {
-        node_ws_unregister(nw->cn);
+        node_ws_unregister(nw);
         MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
     }
     return NULL;
