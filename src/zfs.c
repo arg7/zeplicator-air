@@ -193,37 +193,6 @@ err_t zfs_snapshot_exists(const char *fs, const char *snap) {
     return rc == 0 ? ZEP_ERR_OK : ZEP_ERR_NOT_FOUND;
 }
 
-uint64_t zfs_send_estimate(const char *fs, const char *from_snap,
-                            const char *to_snap, int send_all,
-                            const char *extra_opts) {
-    char cmd[4096];
-    if (from_snap && from_snap[0]) {
-        snprintf(cmd, sizeof(cmd),
-            "zfs send -nvP %s %s '%s' '%s' 2>&1",
-            extra_opts ? extra_opts : "",
-            send_all ? "-I" : "-i",
-            from_snap, to_snap);
-    } else {
-        snprintf(cmd, sizeof(cmd),
-            "zfs send -nvP %s '%s' 2>&1",
-            extra_opts ? extra_opts : "", to_snap);
-    }
-    (void)fs;
-    FILE *p = popen(cmd, "r");
-    if (!p) return 0;
-    char line[512];
-    uint64_t size = 0;
-    while (fgets(line, sizeof(line), p)) {
-        if (strstr(line, "size") || strstr(line, "Size")) {
-            char *num = line;
-            while (*num && !('0' <= *num && *num <= '9')) num++;
-            if (*num) size = (uint64_t)strtoull(num, NULL, 10);
-        }
-    }
-    pclose(p);
-    return size;
-}
-
 err_t zfs_destroy_snapshot(const char *snapshot) {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd), "zfs destroy '%s' 2>&1", snapshot);

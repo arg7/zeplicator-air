@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/wait.h>
+#include <sys/prctl.h>
 #include <pty.h>
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -31,6 +32,14 @@
 
 static char g_db_path[ZEP_MAX_PATH] = "zep-air.db";
 static int  g_verbose = 0;
+static pthread_t g_ws_tid;
+static volatile int g_daemon_running = 1;
+
+static void daemon_signal_handler(int sig) {
+    (void)sig;
+    g_daemon_running = 0;
+    pthread_cancel(g_ws_tid);
+}
 
 /* === WebSocket Pipe Client (node side) === */
 
@@ -184,6 +193,7 @@ static struct ws_node_conn *ws_node_connect(const char *server_url, const char *
         close(sock); freeaddrinfo(res); return NULL;
     }
     freeaddrinfo(res);
+    { struct timeval tv = { .tv_sec = 30, .tv_usec = 0 }; setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
 
     struct ws_node_conn *c = calloc(1, sizeof(*c));
     if (!c) { close(sock); return NULL; }
@@ -264,6 +274,8 @@ static struct ws_node_conn *ws_node_connect(const char *server_url, const char *
 static void *ws_node_pipe_thread(void *arg) {
     zep_config_t *cfg = (zep_config_t *)arg;
     if (!cfg) return NULL;
+
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
 
     for (;;) {
         char ws_path[256];
@@ -1177,12 +1189,13 @@ static int cmd_cron(int argc, char *argv[]) {
 
     /* Start WS pipe listener in daemon mode */
     if (daemon_mode && cfg.node_name[0]) {
-        pthread_t ws_tid;
         zep_config_t *tcfg = malloc(sizeof(*tcfg));
         if (tcfg) {
             memcpy(tcfg, &cfg, sizeof(*tcfg));
-            pthread_create(&ws_tid, NULL, ws_node_pipe_thread, (void *)tcfg);
-            pthread_detach(ws_tid);
+            signal(SIGTERM, daemon_signal_handler);
+            signal(SIGINT, daemon_signal_handler);
+            pthread_create(&g_ws_tid, NULL, ws_node_pipe_thread, (void *)tcfg);
+            pthread_detach(g_ws_tid);
             if (g_verbose) fprintf(stderr, "cron: WS pipe listener started for %s\n", cfg.node_name);
         }
     }
@@ -1255,8 +1268,11 @@ static int cmd_cron(int argc, char *argv[]) {
         }
         cJSON_Delete(tasks);
 
-        if (daemon_mode) sleep((unsigned int)interval);
-    } while (daemon_mode);
+        if (daemon_mode) {
+            for (int s = 0; s < interval && g_daemon_running; s++)
+                sleep(1);
+        }
+    } while (daemon_mode && g_daemon_running);
 
     return 0;
 }

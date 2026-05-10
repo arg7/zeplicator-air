@@ -715,9 +715,23 @@ static void pipe_winch_handler(int sig) {
     g_winch_flag = 1;
 }
 
+static void format_size(char *buf, size_t bufsz, uint64_t bytes) {
+    const char *units[] = {"B", "K", "M", "G", "T"};
+    int ui = 0;
+    double v = (double)bytes;
+    while (v >= 1024.0 && ui < 4) { v /= 1024.0; ui++; }
+    if (ui == 0) snprintf(buf, bufsz, "%lluB", (unsigned long long)bytes);
+    else snprintf(buf, bufsz, "%.1f%s", v, units[ui]);
+}
+
+static void format_elapsed(char *buf, size_t bufsz, double secs) {
+    int m = (int)(secs / 60.0);
+    int s = (int)secs % 60;
+    snprintf(buf, bufsz, "%02d:%02d", m, s);
+}
+
 static int cmd_pipe(int argc, char *argv[]) {
     const char *node = NULL;
-    int progress = 0;
     int interactive = 0;
     size_t pipe_chunk = WS_CHUNK;
     int cmd_start = -1;
@@ -725,8 +739,6 @@ static int cmd_pipe(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--node") == 0 && i + 1 < argc)
             node = argv[++i];
-        else if (strcmp(argv[i], "--progress") == 0)
-            progress = 1;
         else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0)
             interactive = 1;
         else if (strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
@@ -743,10 +755,10 @@ static int cmd_pipe(int argc, char *argv[]) {
     }
 
     if (cmd_start < 0 || cmd_start >= argc) {
-        fprintf(stderr, "Usage: zep-air-admin pipe [--chunk N] [--node CN] [--progress] [-i] <command...>\n"
+        fprintf(stderr, "Usage: zep-air-admin pipe [--chunk N] [--node CN] [-i] <command...>\n"
                         "  --chunk N    WS frame payload size in bytes (default: %u)\n"
                         "  --node CN    Target node (default: auto-select)\n"
-                        "  --progress   Print transfer progress to stderr\n"
+                        "  -v           Show bandwidth tick and final summary on stderr\n"
                         "  -i, --interactive  Allocate PTY, raw terminal (for shells)\n"
                         "\nExamples:\n"
                         "  zep-air-admin pipe zfs send -R tank-prod/data\n"
@@ -786,7 +798,7 @@ static int cmd_pipe(int argc, char *argv[]) {
              target_node, cmd_encoded,
              interactive ? "&interactive=1" : "");
 
-    if (g_verbose || progress)
+    if (g_verbose)
         fprintf(stderr, "pipe: opening WebSocket to %s\n", target_node);
 
     ws_conn_t *wc = ws_connect(g_server, ws_path);
@@ -837,6 +849,10 @@ static int cmd_pipe(int argc, char *argv[]) {
 
     unsigned char *inbuf = malloc(pipe_chunk);
     if (!inbuf) { free(ws_buf); free(out); ws_close(wc); goto pipe_cleanup; }
+
+    time_t pipe_start = time(NULL);
+    time_t tick_prev = pipe_start;
+    uint64_t tick_in_prev = 0, tick_out_prev = 0;
 
     for (;;) {
         fd_set rfds;
@@ -905,8 +921,29 @@ static int cmd_pipe(int argc, char *argv[]) {
                 }
                 if (op == WS_OP_EXIT && n == 1) {
                     remote_exit = (int)out[0];
-                    if (g_verbose) fprintf(stderr, "pipe: remote exit=%d\n", remote_exit);
                 }
+            }
+        }
+
+        if (g_verbose && !interactive_tty && isatty(STDERR_FILENO)) {
+            time_t now = time(NULL);
+            if (now > tick_prev) {
+                double dt = difftime(now, tick_prev);
+                if (dt < 0.1) dt = 0.1;
+                uint64_t cur_in = sent + rcvd_stderr;
+                uint64_t cur_out = rcvd_stdout;
+                char i_sz[32], i_bw[32], o_sz[32], o_bw[32], tel[16];
+                format_size(i_sz, sizeof(i_sz), cur_in);
+                format_size(i_bw, sizeof(i_bw), (uint64_t)((double)(cur_in - tick_in_prev) / dt));
+                format_size(o_sz, sizeof(o_sz), cur_out);
+                format_size(o_bw, sizeof(o_bw), (uint64_t)((double)(cur_out - tick_out_prev) / dt));
+                format_elapsed(tel, sizeof(tel), difftime(now, pipe_start));
+                fprintf(stderr, "\rpipe(%s) [in: %s (%s/s) | out: %s (%s/s)]    ",
+                        tel, i_sz, i_bw, o_sz, o_bw);
+                fflush(stderr);
+                tick_in_prev = cur_in;
+                tick_out_prev = cur_out;
+                tick_prev = now;
             }
         }
 
@@ -923,9 +960,20 @@ static int cmd_pipe(int argc, char *argv[]) {
     }
     ws_close(wc);
 
-    if (progress && g_verbose)
-        fprintf(stderr, "\npipe: done — sent=%llu recv_stdout=%llu recv_stderr=%llu exit=%d\n",
-                (unsigned long long)sent, (unsigned long long)rcvd_stdout, (unsigned long long)rcvd_stderr, remote_exit);
+    if (g_verbose) {
+        double elapsed = difftime(time(NULL), pipe_start);
+        if (elapsed < 0.1) elapsed = 0.1;
+        uint64_t cur_in = sent + rcvd_stderr;
+        uint64_t cur_out = rcvd_stdout;
+        char i_sz[32], i_bw[32], o_sz[32], o_bw[32], tel[16];
+        format_size(i_sz, sizeof(i_sz), cur_in);
+        format_size(i_bw, sizeof(i_bw), (uint64_t)((double)cur_in / elapsed));
+        format_size(o_sz, sizeof(o_sz), cur_out);
+        format_size(o_bw, sizeof(o_bw), (uint64_t)((double)cur_out / elapsed));
+        format_elapsed(tel, sizeof(tel), elapsed);
+        fprintf(stderr, "\rpipe(%s) [in: %s (%s/s) | out: %s (%s/s)] exit: %d\n",
+                tel, i_sz, i_bw, o_sz, o_bw, remote_exit);
+    }
 
 pipe_cleanup:
     if (interactive_tty) {

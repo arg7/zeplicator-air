@@ -21,8 +21,5 @@ err_t zfs_get_snapshot_guid(const char *snapshot, char *guid, size_t len);
 err_t zfs_get_latest_guid(const char *fs, char *guid, size_t len);
 err_t zfs_snapshot_exists(const char *fs, const char *snap);
 err_t zfs_destroy_snapshot(const char *snapshot);
-uint64_t zfs_send_estimate(const char *fs, const char *from_snap,
-                            const char *to_snap, int send_all,
-                            const char *extra_opts);
 
 #endif

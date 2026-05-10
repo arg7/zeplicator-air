@@ -299,7 +299,7 @@ Commands:
   rollback --snap NAME      Cluster-wide rollback to snapshot
   snap create --name NAME   Manual snapshot (no rotation)
   snap destroy --name NAME  Remove manual snapshot
-  pipe [-i] [--chunk N] --node CN [--progress] [--] <command...>  Run command on remote node via WebSocket, stream stdout+stderr
+  pipe [-i] [--chunk N] --node CN [--] <command...>  Run command on remote node via WebSocket, stream stdout+stderr
 ```
 
 ### `pipe` — Run commands on remote nodes (WebSocket)
@@ -307,7 +307,7 @@ Commands:
 Runs a command on a remote node, streaming `stdin`/`stdout`/`stderr` in real time through the server via a WebSocket bridge. The server checks the command against `pipe_allow` before forwarding. No disk storage — pure pipe-through. The remote exit code is returned as the admin's own exit code.
 
 ```
-zep-air-admin pipe [-i] [--chunk N] --node <CN> [--progress] [--] <command...>
+zep-air-admin pipe [-i] [--chunk N] --node <CN> [--] <command...>
 ```
 
 | Option | Description |
@@ -315,9 +315,18 @@ zep-air-admin pipe [-i] [--chunk N] --node <CN> [--progress] [--] <command...>
 | `--node CN` | Target node (required) |
 | `-i`, `--interactive` | Allocate PTY, raw terminal mode for interactive shells |
 | `--chunk N` | Stdin read size in bytes (default: 16380, max one TLS record) |
-| `--progress` | Print transfer statistics on stderr |
 | `--" --"` | Optional separator between options and command |
 | `<command...>` | Command and arguments to execute on the remote node |
+
+Pass `-v` to see a live bandwidth tick and final summary on stderr:
+
+```
+pipe(00:15) [in: 1.2G (45M/s) | out: 4.1K (1.2K/s)]    ← refreshes every second (\r)
+pipe(00:27) [in: 1.3G (49.3M/s) | out: 4.1K (155B/s)] exit: 0  ← final line
+```
+
+`in` = stdin bytes sent to remote + remote stderr bytes. `out` = remote stdout bytes.
+Final line shows average bandwidth over total elapsed time.
 
 **Pipeline support with `|`:**
 
