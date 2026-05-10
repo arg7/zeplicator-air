@@ -62,6 +62,16 @@ ZEP="${ZEP:-${PROJ_DIR}/zep-air}"
 SERV="${SERV:-${PROJ_DIR}/zep-air-serve}"
 ADMIN="${ADMIN:-${PROJ_DIR}/zep-air-admin}"
 CRON_INTERVAL="${CRON_INTERVAL:-60}"
+SUDO_NODES="${SUDO_NODES:-0}"
+
+run_as() {
+    local user="$1"; shift
+    if [[ "$SUDO_NODES" == "1" ]]; then
+        sudo -u "$user" "$@"
+    else
+        "$@"
+    fi
+}
 
 mkdir -p "$PID_DIR" 2>/dev/null || {
     OWNER="${SUDO_USER:-$(whoami)}"
@@ -159,7 +169,11 @@ do_start() {
             echo -e "  ${YELLOW}No DB for $cn ($node_db) — skipping${NC}"
             continue
         fi
-        "$ZEP" --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" >/dev/null 2>&1 &
+        if [[ "$SUDO_NODES" == "1" ]]; then
+            sudo -u "$cn" "$ZEP" --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" >/dev/null 2>&1 &
+        else
+            "$ZEP" --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" >/dev/null 2>&1 &
+        fi
         local cpid=$!
         disown $cpid 2>/dev/null || true
         sleep 1

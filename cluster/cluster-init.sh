@@ -65,6 +65,16 @@ require CLUSTER_NAME
 ZEP="${ZEP:-${PROJ_DIR}/zep-air}"
 SERV="${SERV:-${PROJ_DIR}/zep-air-serve}"
 ADMIN="${ADMIN:-${PROJ_DIR}/zep-air-admin}"
+SUDO_NODES="${SUDO_NODES:-0}"
+
+run_as() {
+    local user="$1"; shift
+    if [[ "$SUDO_NODES" == "1" ]]; then
+        sudo -u "$user" "$@"
+    else
+        "$@"
+    fi
+}
 
 RED='\033[31m'; GREEN='\033[32m'; NC='\033[0m'
 say() { echo -e "${GREEN}==>${NC} $1"; }
@@ -184,6 +194,19 @@ if [[ "$DO_ZFS" -eq 1 && -n "${ZFS_POOLS:-}" ]]; then
         zfs create -o mountpoint=none "$pool/$ds"
         say "  Created dataset: $pool/$ds"
     done
+
+    say "Creating node user accounts and ZFS permissions ..."
+    for entry in ${NODES:-}; do
+        IFS=':' read -r cn role poolfs <<< "$entry"
+        pool="${poolfs%%/*}"
+        id "$cn" &>/dev/null || {
+            useradd -r -s /bin/bash -d "${ZEP_BASE}/home/${cn}" -m "$cn" 2>/dev/null
+            say "  Created user: $cn"
+        }
+        zfs allow -u "$cn" clone,create,destroy,mount,promote,receive,rollback,send,snapshot "$pool" 2>/dev/null || true
+        img="${ZEP_BASE}/${pool}.img"
+        [[ -f "$img" ]] && chown "${cn}:${cn}" "$img" 2>/dev/null || true
+    done
 fi
 
 ###############################################################################
@@ -269,6 +292,8 @@ for entry in ${NODES:-}; do
     "$ZEP" --db "$node_db" config set cluster    "$CLUSTER_NAME"
     "$ZEP" --db "$node_db" config set mapping    "${CLUSTER_POOL:-za-pool-1}/${CLUSTER_FS:-za-data-1}:${poolfs}"
     [[ -z "${KEY_PASSWORD:-}" ]] || "$ZEP" --db "$node_db" config set key_password "$KEY_PASSWORD"
+
+    [[ "$SUDO_NODES" == "1" ]] && sudo chown "${cn}:${cn}" "$node_db" 2>/dev/null || true
 done
 
 say "Configuring admin database ..."
