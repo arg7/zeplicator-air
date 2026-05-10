@@ -29,3 +29,4 @@ pki/*.srl
 
 # Temp
 /tmp/
+cluster/cluster.env
