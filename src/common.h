@@ -42,6 +42,7 @@ typedef struct {
     char guid[ZEP_MAX_GUID_LEN];
     char base_guid[ZEP_MAX_GUID_LEN];
     char label[64];
+    char cluster_fs[256];
     char created[32];
     char host[64];
     uint64_t stream_size;

@@ -286,7 +286,7 @@ static void *ws_node_pipe_thread(void *arg) {
         struct ws_node_conn *conn = ws_node_connect(cfg->server_url, cfg->cert_path, cfg->key_path,
                                     cfg->ca_path, cfg->key_password, ws_path);
         if (!conn) {
-            fprintf(stderr, "ws-node: connect failed, retrying in 5s\n");
+            if (g_verbose) fprintf(stderr, "ws-node: connect failed, retrying in 5s\n");
             sleep(5);
             continue;
         }
@@ -301,7 +301,7 @@ static void *ws_node_pipe_thread(void *arg) {
             ssize_t n = ws_node_recv_frame(conn, out, WS_NODE_FRAME_MAX, &buf[0]);
             unsigned char opcode = buf[0] & 0x0F;
 
-            if (n < 0) { fprintf(stderr, "ws-node: recv error, reconnecting\n"); break; }
+            if (n < 0) { if (g_verbose) fprintf(stderr, "ws-node: recv error, reconnecting\n"); break; }
             if (opcode == WS_NODE_OP_CLOSE) { if (g_verbose) fprintf(stderr, "ws-node: close\n"); break; }
             if (opcode == WS_NODE_OP_PING) { ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)n); continue; }
             if (opcode == WS_NODE_OP_PONG) continue;
@@ -753,14 +753,14 @@ static int cmd_push(int argc, char *argv[]) {
     int pushed = 0;
 
     if (filesystem[0]) {
-        err_t ret = pipeline_push(&cfg, &http_cfg, filesystem, label);
+        err_t ret = pipeline_push(&cfg, &http_cfg, filesystem, label, NULL);
         if (ret == ZEP_ERR_OK) pushed++;
     } else if (optind < argc) {
         for (int i = optind; i < argc; i++) {
             char local_fs[ZEP_MAX_SNAPSHOT_NAME];
             if (pipeline_resolve_fs(argv[i], cfg.mapping,
                                     local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
-                err_t ret = pipeline_push(&cfg, &http_cfg, local_fs, label);
+                err_t ret = pipeline_push(&cfg, &http_cfg, local_fs, label, NULL);
                 if (ret == ZEP_ERR_OK) pushed++;
             } else {
                 fprintf(stderr, "push: no mapping for '%s'\n", argv[i]);
@@ -780,8 +780,7 @@ static int cmd_push(int argc, char *argv[]) {
             if (n >= sizeof(local_fs)) n = sizeof(local_fs) - 1;
             memcpy(local_fs, start, n);
             local_fs[n] = '\0';
-            err_t ret = pipeline_push(&cfg, &http_cfg, local_fs, label);
-            if (ret == ZEP_ERR_OK) pushed++;
+            err_t ret = pipeline_push(&cfg, &http_cfg, local_fs, label, NULL);            if (ret == ZEP_ERR_OK) pushed++;
             const char *comma = strchr(colon, ',');
             p = comma ? comma + 1 : colon + strlen(colon);
         }
@@ -1236,7 +1235,8 @@ static int cmd_cron(int argc, char *argv[]) {
                     db_config_load(db, &cfg2);
                     if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
                                             local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
-                        pipeline_push(&cfg2, &http_cfg, local_fs, label->valuestring);
+                        pipeline_push(&cfg2, &http_cfg, local_fs, label->valuestring,
+                                      cfs->valuestring);
                         tasks_done++;
                     }
                     db_close(db);

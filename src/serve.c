@@ -296,17 +296,22 @@ static void verify_snapshot(const char *cluster_key, const char *prefix) {
     const char *pusher = meta.host[0] ? meta.host : cluster_key;
     db_chain_insert(db, cluster_key, toguid, fromguid, meta.snapshot, pusher);
 
-    if (meta.label[0]) {
-        const char *at = strchr(meta.snapshot, '@');
-        if (at) {
-            size_t fs_len = (size_t)(at - meta.snapshot);
-            char fs_buf[256];
-            if (fs_len >= sizeof(fs_buf)) fs_len = sizeof(fs_buf) - 1;
-            memcpy(fs_buf, meta.snapshot, fs_len);
-            fs_buf[fs_len] = '\0';
+    if (meta.label[0] && meta.cluster_fs[0]) {
+        char cluster_buf[64] = {0};
+        sqlite3_stmt *cs = NULL;
+        sqlite3_prepare_v2(db, "SELECT cluster FROM auth WHERE cn = ?1", -1, &cs, NULL);
+        if (cs) {
+            sqlite3_bind_text(cs, 1, cluster_key, -1, SQLITE_STATIC);
+            if (sqlite3_step(cs) == SQLITE_ROW) {
+                const char *cl = (const char *)sqlite3_column_text(cs, 0);
+                if (cl && cl[0]) snprintf(cluster_buf, sizeof(cluster_buf), "%s", cl);
+            }
+            sqlite3_finalize(cs);
+        }
+        if (cluster_buf[0]) {
             char cron_key[1024];
             snprintf(cron_key, sizeof(cron_key),
-                     "cron_last_%s_%s_%s", cluster_key, fs_buf, meta.label);
+                     "cron_last_%s_%s_%s", cluster_buf, meta.cluster_fs, meta.label);
             char now_str[32];
             time_t tnow = time(NULL);
             struct tm tm;

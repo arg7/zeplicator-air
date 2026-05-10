@@ -125,7 +125,8 @@ static err_t find_base_snapshot(const char *fs, const char *base_guid, char *sna
 
 err_t pipeline_push(const zep_config_t *cfg,
                     const http_config_t *http_cfg,
-                    const char *fs, const char *label) {
+                    const char *fs, const char *label,
+                    const char *cluster_fs) {
     char base_guid[ZEP_MAX_GUID_LEN] = {0};
     char snap_name[ZEP_MAX_SNAPSHOT_NAME];
     char guid[ZEP_MAX_GUID_LEN];
@@ -250,6 +251,7 @@ err_t pipeline_push(const zep_config_t *cfg,
     snprintf(meta.guid, sizeof(meta.guid), "%s", guid);
     snprintf(meta.base_guid, sizeof(meta.base_guid), "%s", base_guid);
     snprintf(meta.label, sizeof(meta.label), "%s", label);
+    snprintf(meta.cluster_fs, sizeof(meta.cluster_fs), "%s", cluster_fs ? cluster_fs : "");
     snprintf(meta.created, sizeof(meta.created), "%s", created);
     snprintf(meta.host, sizeof(meta.host), "%s", cfg->node_name);
     meta.stream_size = stream_size;

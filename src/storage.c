@@ -54,6 +54,7 @@ err_t storage_write_meta(const char *root, const char *node, const char *prefix,
     cJSON_AddStringToObject(json, "guid", meta->guid);
     cJSON_AddStringToObject(json, "base_guid", meta->base_guid);
     cJSON_AddStringToObject(json, "label", meta->label);
+    cJSON_AddStringToObject(json, "cluster_fs", meta->cluster_fs);
     cJSON_AddStringToObject(json, "created", meta->created);
     cJSON_AddStringToObject(json, "host", meta->host);
     cJSON_AddNumberToObject(json, "stream_size", (double)meta->stream_size);
@@ -123,6 +124,7 @@ err_t storage_read_meta(const char *root, const char *node, const char *prefix,
     GET_STR(guid, "guid");
     GET_STR(base_guid, "base_guid");
     GET_STR(label, "label");
+    GET_STR(cluster_fs, "cluster_fs");
     GET_STR(created, "created");
     GET_STR(host, "host");
 
