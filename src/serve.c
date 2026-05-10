@@ -553,6 +553,8 @@ static ssize_t ws_recv_node(struct node_ws *nw, unsigned char *buf, size_t buf_s
             if (select(raw_fd + 1, &rfds, NULL, NULL, &tv) <= 0) return -1;
             return gnutls_record_recv(nw->gnutls_session, buf, buf_size);
         }
+        if (g_verbose && n <= 0) fprintf(stderr, "ws: recv TLS result=%d cn=%s\n",
+                                         (int)n, nw->cn);
         return n;
     }
     return recv(nw ? nw->sock : -1, buf, buf_size, 0);
@@ -674,10 +676,14 @@ static void *node_ws_thread(void *arg) {
             last_ping = now;
         }
 
-        if (sel > 0 && FD_ISSET(raw_sock, &rfds)) {
-            ssize_t plen = ws_recv_frame_full(nw, buf, WS_SUBCHUNK, out, WS_SUBCHUNK, &buf[0]);
-            unsigned char opcode = buf[0] & 0x0F;
-            if (plen < 0) break;
+            if (sel > 0 && FD_ISSET(raw_sock, &rfds)) {
+                ssize_t plen = ws_recv_frame_full(nw, buf, WS_SUBCHUNK, out, WS_SUBCHUNK, &buf[0]);
+                unsigned char opcode = buf[0] & 0x0F;
+                if (plen < 0) {
+                    if (g_verbose) fprintf(stderr, "ws: recv_frame_full failed plen=%zd cn=%s\n", plen, nw->cn);
+                    break;
+                }
+                if (plen == 0) continue; /* empty frame, wait for more */
 
             if (opcode == WS_OP_CLOSE) break;
             if (opcode == WS_OP_PING) {

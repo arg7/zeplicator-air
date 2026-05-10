@@ -193,7 +193,7 @@ static struct ws_node_conn *ws_node_connect(const char *server_url, const char *
         close(sock); freeaddrinfo(res); return NULL;
     }
     freeaddrinfo(res);
-    { struct timeval tv = { .tv_sec = 30, .tv_usec = 0 }; setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
+    { struct timeval tv = { .tv_sec = 90, .tv_usec = 0 }; setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
 
     struct ws_node_conn *c = calloc(1, sizeof(*c));
     if (!c) { close(sock); return NULL; }
