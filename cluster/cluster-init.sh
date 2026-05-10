@@ -237,7 +237,11 @@ JSONEOF
 
     # Stop temp server
     kill "$SERV_PID" 2>/dev/null || true
-    timeout 10 bash -c "wait $SERV_PID" 2>/dev/null || true
+    for i in $(seq 1 10); do
+        kill -0 "$SERV_PID" 2>/dev/null || break
+        sleep 1
+    done
+    kill -9 "$SERV_PID" 2>/dev/null || true
     say "Server stopped (temporary)."
 fi
 
