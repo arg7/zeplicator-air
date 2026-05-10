@@ -14,7 +14,7 @@ zep-air: src/main.c $(COMMON)
 zep-air-serve: src/serve.c src/storage.c src/db.c src/zstream.c src/auth.c
 	$(CC) $(CFLAGS) -o $@ $^ $(SERV_LDFLAGS)
 
-zep-air-admin: src/admin.c
+zep-air-admin: src/admin.c src/db.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 clean:

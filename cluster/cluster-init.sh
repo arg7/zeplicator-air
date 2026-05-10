@@ -260,6 +260,15 @@ for entry in ${NODES:-}; do
     [[ -z "${KEY_PASSWORD:-}" ]] || "$ZEP" --db "$node_db" config set key_password "$KEY_PASSWORD"
 done
 
+say "Configuring admin database ..."
+admin_db="${ZEP_BASE}/admin.db"
+rm -f "$admin_db"
+"$ZEP" --db "$admin_db" config set server_url   "$SERVER_URL"
+"$ZEP" --db "$admin_db" config set cert_path     "${PKI_DIR}/admin.crt"
+"$ZEP" --db "$admin_db" config set key_path      "${PKI_DIR}/admin.key"
+"$ZEP" --db "$admin_db" config set ca_path       "${PKI_DIR}/ca.crt"
+[[ -z "${KEY_PASSWORD:-}" ]] || "$ZEP" --db "$admin_db" config set key_password "$KEY_PASSWORD"
+
 ###############################################################################
 # 8. Generate cluster.env for cluster-ctl.sh / cluster-destroy.sh
 ###############################################################################
@@ -276,8 +285,12 @@ echo "  PKI:           ${PKI_DIR}/"
 echo "  Server DB:     ${SERVER_DB}"
 echo "  Storage:       ${SERVER_STORAGE}"
 echo "  Node DBs:      ${ZEP_BASE}/<node>.db"
+echo "  Admin DB:      ${admin_db}"
 echo ""
 echo "Next steps:"
 echo "  cluster-ctl.sh start              # launch server + nodes"
 echo "  cluster-ctl.sh stop               # stop all daemons"
 echo "  cluster-destroy.sh                # teardown everything"
+echo ""
+echo "Admin commands (no manual --cert/--ca needed):"
+echo "  zep-air-admin --db $admin_db config list"

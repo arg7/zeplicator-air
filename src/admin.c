@@ -1,6 +1,7 @@
 /* MIT License — Copyright (c) 2026 CompEd Software Design srl — see LICENSE */
 
 #include "common.h"
+#include "db.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,7 +15,6 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/sha.h>
-#include <openssl/bio.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -29,6 +29,7 @@ static char g_cert_path[ZEP_MAX_PATH];
 static char g_key_path[ZEP_MAX_PATH];
 static char g_ca_path[ZEP_MAX_PATH];
 static char g_key_password[128];
+static char g_db_path[ZEP_MAX_PATH];
 static int  g_verbose = 0;
 
 struct curl_buf {
@@ -1022,6 +1023,7 @@ static void usage(const char *prog) {
         "  --cert, -c FILE    Admin client certificate (PEM)\n"
         "  --key, -k FILE     Admin client key (PEM)\n"
         "  --ca, -C FILE      CA certificate (PEM)\n"
+        "  --db, -d FILE      Local config DB (reads server/cert/key/ca defaults)\n"
         "  --password, -P PASS  Password for encrypted key\n"
         "  --verbose, -v      Verbose output\n"
         "\n"
@@ -1075,11 +1077,28 @@ int main(int argc, char *argv[]) {
             snprintf(g_key_password, sizeof(g_key_password), "%s", argv[++i]);
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             g_verbose = 1;
+        } else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
+            snprintf(g_db_path, sizeof(g_db_path), "%s", argv[++i]);
+        } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+            snprintf(g_db_path, sizeof(g_db_path), "%s", argv[++i]);
         } else {
             argv2[argc2++] = argv[i];
         }
     }
     argv2[argc2] = NULL;
+
+    if (g_db_path[0]) {
+        sqlite3 *db = NULL;
+        if (sqlite3_open(g_db_path, &db) == SQLITE_OK && db) {
+            char buf[ZEP_MAX_PATH] = {0};
+            if (!g_server[0]) { if (db_config_get(db, "server_url",  buf, sizeof(buf)) == ZEP_ERR_OK) snprintf(g_server,   sizeof(g_server),   "%s", buf); }
+            if (!g_cert_path[0]){if (db_config_get(db, "cert_path",  buf, sizeof(buf)) == ZEP_ERR_OK) snprintf(g_cert_path, sizeof(g_cert_path), "%s", buf); }
+            if (!g_key_path[0]){if (db_config_get(db, "key_path",   buf, sizeof(buf)) == ZEP_ERR_OK) snprintf(g_key_path,  sizeof(g_key_path),  "%s", buf); }
+            if (!g_ca_path[0]){if (db_config_get(db, "ca_path",    buf, sizeof(buf)) == ZEP_ERR_OK) snprintf(g_ca_path,   sizeof(g_ca_path),   "%s", buf); }
+            if (!g_key_password[0]){if(db_config_get(db, "key_password",buf,sizeof(buf))==ZEP_ERR_OK)snprintf(g_key_password,sizeof(g_key_password),"%s",buf);}
+            sqlite3_close(db);
+        }
+    }
 
     if (argc2 < 2) { usage(argv2[0]); return 1; }
 
