@@ -213,6 +213,7 @@ fi
 # 5. Server setup
 ###############################################################################
 say "Server DB setup ..."
+rm -f "$SERVER_DB"
 sudo "$SERV" --setup \
     --cert "${PKI_DIR}/server.crt" --key "${PKI_DIR}/server.key" \
     --ca "${PKI_DIR}/ca.crt" --admin-cert "${PKI_DIR}/admin.crt" \

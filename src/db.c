@@ -361,7 +361,7 @@ err_t db_ca_fingerprint(sqlite3 *db, char *fp, size_t len) {
 
 err_t db_auth_list(sqlite3 *db, char ***names, int *count) {
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, "SELECT cn FROM auth ORDER BY role, cn", -1, &stmt, NULL) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db, "SELECT cn FROM auth WHERE role IN ('master','client') ORDER BY role, cn", -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;
 
     int cap = 16, cnt = 0;
