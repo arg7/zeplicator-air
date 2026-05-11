@@ -184,7 +184,8 @@ static char *read_file(const char *path, size_t *len) {
     return buf;
 }
 
-static void verify_snapshot(const char *cluster_key, const char *prefix) {
+static void verify_snapshot(const char *cluster_key, const char *prefix,
+                             const char *storage_base) {
     snapshot_meta_t meta;
     memset(&meta, 0, sizeof(meta));
 
@@ -260,14 +261,17 @@ static void verify_snapshot(const char *cluster_key, const char *prefix) {
     int rc = system(cmd);
     free(cmd);
     if (rc != 0) {
-        if (g_verbose) fprintf(stderr, "verify: zstd -d failed rc=%d\n", rc);
+        if (g_verbose) fprintf(stderr, "verify: zstd -d failed rc=%d, trying raw\n", rc);
+        /* rename raw data as dec_path for zstream_parse — might not be zstd */
+        unlink(dec_path);
+        free(dec_path);
+        dec_path = zst_path;
+        zst_path = NULL;
+    } else {
         unlink(zst_path);
-        free(dir_path); free(zst_path); free(dec_path);
-        storage_meta_free(&meta);
-        return;
+        free(zst_path);
+        zst_path = NULL;
     }
-    unlink(zst_path);
-    free(zst_path);
     free(dir_path);
 
     FILE *dfp = fopen(dec_path, "rb");
@@ -303,47 +307,44 @@ static void verify_snapshot(const char *cluster_key, const char *prefix) {
     }
     db_init_tables(db);
 
-    const char *pusher = meta.host[0] ? meta.host : cluster_key;
-    db_chain_insert(db, cluster_key, toguid, fromguid, meta.snapshot, pusher);
-    if (g_verbose) fprintf(stderr, "verify: chain inserted, checking cron_last label=%s, cluster_fs=%s\n",
-                          meta.label, meta.cluster_fs);
-
-    if (meta.label[0] && meta.cluster_fs[0]) {
-        char cluster_buf[64] = {0};
-        sqlite3_stmt *cs = NULL;
-        sqlite3_prepare_v2(db, "SELECT cluster FROM auth WHERE cn = ?1", -1, &cs, NULL);
-        if (cs) {
-            sqlite3_bind_text(cs, 1, cluster_key, -1, SQLITE_STATIC);
-            if (sqlite3_step(cs) == SQLITE_ROW) {
-                const char *cl = (const char *)sqlite3_column_text(cs, 0);
-                if (cl && cl[0]) snprintf(cluster_buf, sizeof(cluster_buf), "%s", cl);
-            }
-            sqlite3_finalize(cs);
+    char cluster_buf[64] = {0};
+    sqlite3_stmt *cs = NULL;
+    sqlite3_prepare_v2(db, "SELECT cluster FROM auth WHERE cn = ?1", -1, &cs, NULL);
+    if (cs) {
+        sqlite3_bind_text(cs, 1, cluster_key, -1, SQLITE_STATIC);
+        if (sqlite3_step(cs) == SQLITE_ROW) {
+            const char *cl = (const char *)sqlite3_column_text(cs, 0);
+            if (cl && cl[0]) snprintf(cluster_buf, sizeof(cluster_buf), "%s", cl);
         }
-        if (g_verbose) fprintf(stderr, "verify: label=%s cluster_fs=%s cluster=%s node=%s\n",
-                              meta.label, meta.cluster_fs, cluster_buf, cluster_key);
-        if (cluster_buf[0]) {
-            char cron_key[1024];
-            snprintf(cron_key, sizeof(cron_key),
-                     "cron_last_%s_%s_%s", cluster_buf, meta.cluster_fs, meta.label);
-            char now_str[32];
-            time_t tnow = time(NULL);
-            struct tm tm;
-            gmtime_r(&tnow, &tm);
-            strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
-            if (g_verbose) fprintf(stderr, "verify: set %s = %s\n", cron_key, now_str);
-            db_config_set(db, cron_key, now_str);
-        } else if (g_verbose) {
-            printf("verify: no cluster found for node '%s'\n", cluster_key);
-        }
-    } else if (g_verbose) {
-        printf("verify: skipping cron_last (label='%s' cluster_fs='%s')\n",
-               meta.label, meta.cluster_fs);
+        sqlite3_finalize(cs);
     }
 
-    if (g_verbose) {
-        printf("verify: cluster=%s toguid=%s fromguid=%s snap=%s\n",
-               cluster_key, toguid, fromguid, meta.snapshot);
+    const char *pusher = meta.host[0] ? meta.host : cluster_key;
+    const char *cluster = cluster_buf[0] ? cluster_buf : cluster_key;
+
+    db_snapshot_insert(db, cluster, pusher, toguid, fromguid,
+                       meta.snapshot, meta.label, meta.cluster_fs,
+                       meta.blob_count, meta.stream_size, "push",
+                       storage_base);
+
+    for (int i = 0; i < meta.blob_count; i++) {
+        char ref[16];
+        snprintf(ref, sizeof(ref), "%04d", i);
+        db_blob_upsert(db, toguid, i, meta.blobs[i].size,
+                       meta.blobs[i].sha256, ref);
+    }
+
+    if (meta.label[0] && meta.cluster_fs[0] && cluster_buf[0]) {
+        char cron_key[1024];
+        snprintf(cron_key, sizeof(cron_key),
+                 "cron_last_%s_%s_%s", cluster_buf, meta.cluster_fs, meta.label);
+        char now_str[32];
+        time_t tnow = time(NULL);
+        struct tm tm;
+        gmtime_r(&tnow, &tm);
+        strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
+        if (g_verbose) fprintf(stderr, "verify: set %s = %s\n", cron_key, now_str);
+        db_config_set(db, cron_key, now_str);
     }
 
     db_close(db);
@@ -1808,12 +1809,13 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                 char cluster_fs[512];
                                 snprintf(cluster_fs, sizeof(cluster_fs),
                                          "%s/%s", pool->string, fs->string);
+
                                 sqlite3_stmt *st2 = NULL;
                                 sqlite3_prepare_v2(g_db,
                                     "SELECT cn FROM auth WHERE cluster = ?1 AND role = 'master' LIMIT 1",
                                     -1, &st2, NULL);
-                                const char *donor = NULL;
                                 char donor_buf[64] = {0};
+                                const char *donor = NULL;
                                 if (st2) {
                                     sqlite3_bind_text(st2, 1, cluster_name, -1, SQLITE_STATIC);
                                     if (sqlite3_step(st2) == SQLITE_ROW) {
@@ -1823,11 +1825,30 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                     }
                                     sqlite3_finalize(st2);
                                 }
-                                cJSON *t = cJSON_CreateObject();
-                                cJSON_AddStringToObject(t, "action", "sync");
-                                cJSON_AddStringToObject(t, "cluster_fs", cluster_fs);
-                                if (donor) cJSON_AddStringToObject(t, "donor", donor);
-                                cJSON_AddItemToArray(tasks, t);
+
+                                if (!donor) continue;
+
+                                char client_guid[ZEP_MAX_GUID_LEN] = {0};
+                                db_snapshot_latest_guid(g_db, ctx->node,
+                                    "pull", client_guid, sizeof(client_guid));
+
+                                char *chain_js = db_snapshot_chain_json(g_db,
+                                    cluster_name, donor,
+                                    client_guid[0] ? client_guid : NULL);
+                                if (chain_js) {
+                                    cJSON *snap_arr = cJSON_Parse(chain_js);
+                                    free(chain_js);
+                                    if (snap_arr && cJSON_GetArraySize(snap_arr) > 0) {
+                                        cJSON *t = cJSON_CreateObject();
+                                        cJSON_AddStringToObject(t, "action", "sync");
+                                        cJSON_AddStringToObject(t, "cluster_fs", cluster_fs);
+                                        cJSON_AddStringToObject(t, "donor", donor);
+                                        cJSON_AddItemToObject(t, "snapshots", snap_arr);
+                                        cJSON_AddItemToArray(tasks, t);
+                                    } else if (snap_arr) {
+                                        cJSON_Delete(snap_arr);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1849,8 +1870,22 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
         if (json) {
             cJSON *guid = cJSON_GetObjectItem(json, "guid");
-            if (guid && cJSON_IsString(guid) && ctx->node[0])
-                db_ack_guid(g_db, ctx->node, guid->valuestring);
+            if (guid && cJSON_IsString(guid) && ctx->node[0]) {
+                char cl_buf[64] = {0};
+                sqlite3_stmt *cs = NULL;
+                sqlite3_prepare_v2(g_db, "SELECT cluster FROM auth WHERE cn = ?1", -1, &cs, NULL);
+                if (cs) {
+                    sqlite3_bind_text(cs, 1, ctx->node, -1, SQLITE_STATIC);
+                    if (sqlite3_step(cs) == SQLITE_ROW) {
+                        const char *cl = (const char *)sqlite3_column_text(cs, 0);
+                        if (cl && cl[0]) snprintf(cl_buf, sizeof(cl_buf), "%s", cl);
+                    }
+                    sqlite3_finalize(cs);
+                }
+                db_snapshot_insert(g_db, cl_buf[0] ? cl_buf : "", ctx->node,
+                                   guid->valuestring, "", "", "", "", 0, 0,
+                                   "pull", "");
+            }
             cJSON *lbl = cJSON_GetObjectItem(json, "label");
             cJSON *cfs = cJSON_GetObjectItem(json, "cluster_fs");
             if (lbl && cJSON_IsString(lbl) && cfs && cJSON_IsString(cfs) && ctx->node[0]) {
@@ -1925,6 +1960,123 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         return ret;
     }
 
+    /* ── GET /v1/snapshots/<guid>/meta ── */
+    if (strcmp(ctx->method, "GET") == 0 &&
+        strncmp(ctx->target_url, "/v1/snapshots/", 14) == 0) {
+        const char *rest = ctx->target_url + 14;
+        const char *meta_suf = strstr(rest, "/meta");
+        if (meta_suf && meta_suf > rest) {
+            char guid[ZEP_MAX_GUID_LEN];
+            size_t glen = (size_t)(meta_suf - rest);
+            if (glen >= sizeof(guid)) glen = sizeof(guid) - 1;
+            memcpy(guid, rest, glen);
+            guid[glen] = '\0';
+
+            sqlite3_stmt *st = NULL;
+            sqlite3_prepare_v2(g_db,
+                "SELECT storage_base FROM snapshots "
+                "WHERE guid = ?1 AND direction = 'push' LIMIT 1",
+                -1, &st, NULL);
+            if (st) {
+                sqlite3_bind_text(st, 1, guid, -1, SQLITE_STATIC);
+                if (sqlite3_step(st) == SQLITE_ROW) {
+                    const char *base = (const char *)sqlite3_column_text(st, 0);
+                    if (base && base[0]) {
+                        char *fpath = NULL;
+                        if (asprintf(&fpath, "%smeta.json",
+                                     strncmp(base, "file://", 7) == 0 ? base + 7 : base) < 0) {
+                            sqlite3_finalize(st);
+                            return send_error(conn, 500, "OOM");
+                        }
+                        FILE *f = fopen(fpath, "rb");
+                        if (f) {
+                            fseek(f, 0, SEEK_END);
+                            long sz = ftell(f);
+                            fseek(f, 0, SEEK_SET);
+                            char *body = malloc((size_t)sz + 1);
+                            if (body) {
+                                (void)!fread(body, 1, (size_t)sz, f);
+                                body[sz] = '\0';
+                            }
+                            fclose(f);
+                            free(fpath);
+                            sqlite3_finalize(st);
+                            if (body) {
+                                enum MHD_Result r = send_json(conn, 200, body);
+                                free(body);
+                                return r;
+                            }
+                            return send_error(conn, 500, "OOM");
+                        }
+                        free(fpath);
+                    }
+                }
+                sqlite3_finalize(st);
+            }
+            return send_error(conn, 404, "Snapshot not found");
+        }
+    }
+
+    /* ── GET /v1/blobs/<guid>/<part> ── */
+    if (strcmp(ctx->method, "GET") == 0 &&
+        strncmp(ctx->target_url, "/v1/blobs/", 10) == 0) {
+        const char *rest = ctx->target_url + 10;
+        const char *slash = strrchr(rest, '/');
+        if (slash && slash > rest) {
+            char guid[ZEP_MAX_GUID_LEN];
+            size_t glen = (size_t)(slash - rest);
+            if (glen >= sizeof(guid)) glen = sizeof(guid) - 1;
+            memcpy(guid, rest, glen);
+            guid[glen] = '\0';
+            int part = atoi(slash + 1);
+
+            char sref[ZEP_MAX_PATH] = {0};
+            if (db_blob_lookup(g_db, guid, part, sref, sizeof(sref)) == ZEP_ERR_OK) {
+                sqlite3_stmt *st = NULL;
+                sqlite3_prepare_v2(g_db,
+                    "SELECT storage_base FROM snapshots "
+                    "WHERE guid = ?1 AND direction = 'push' LIMIT 1",
+                    -1, &st, NULL);
+                if (st) {
+                    sqlite3_bind_text(st, 1, guid, -1, SQLITE_STATIC);
+                    if (sqlite3_step(st) == SQLITE_ROW) {
+                        const char *base = (const char *)sqlite3_column_text(st, 0);
+                        if (base && base[0]) {
+                            char *fpath = NULL;
+                            if (asprintf(&fpath, "%s%s",
+                                         strncmp(base, "file://", 7) == 0 ? base + 7 : base,
+                                         sref) >= 0) {
+                                FILE *f = fopen(fpath, "rb");
+                                if (f) {
+                                    fseek(f, 0, SEEK_END);
+                                    long sz = ftell(f);
+                                    fseek(f, 0, SEEK_SET);
+                                    void *body = malloc((size_t)sz);
+                                    if (body) { (void)!fread(body, 1, (size_t)sz, f); }
+                                    fclose(f);
+                                    free(fpath);
+                                    sqlite3_finalize(st);
+                                    if (body) {
+                                        struct MHD_Response *resp =
+                                            MHD_create_response_from_buffer((size_t)sz, body,
+                                                MHD_RESPMEM_MUST_FREE);
+                                        enum MHD_Result r = MHD_queue_response(conn, 200, resp);
+                                        MHD_destroy_response(resp);
+                                        return r;
+                                    }
+                                    return send_error(conn, 500, "OOM");
+                                }
+                                free(fpath);
+                            }
+                        }
+                    }
+                    sqlite3_finalize(st);
+                }
+            }
+            return send_error(conn, 404, "Blob not found");
+        }
+    }
+
     if (strcmp(ctx->method, "PUT") == 0) {
         if (ctx->parsed >= 3 && ctx->prefix[0] && ctx->file[0]) {
             storage_ensure_dir(g_storage_root, ctx->node, ctx->prefix);
@@ -1983,7 +2135,12 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
                     if (g_verbose) fprintf(stderr, "PUT meta: calling verify_snapshot(%s, %s)\n",
                                           ctx->node, ctx->prefix);
-                    verify_snapshot(ctx->node, ctx->prefix);
+                    {
+                        char base[ZEP_MAX_PATH * 2 + 128];
+                        snprintf(base, sizeof(base), "file://%s/%s/%s/",
+                                 g_storage_root, ctx->node, ctx->prefix);
+                        verify_snapshot(ctx->node, ctx->prefix, base);
+                    }
                     return send_json(conn, 200, "{\"ok\":true}");
                 }
                 free(path);
@@ -2002,7 +2159,12 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 if (g_verbose) fprintf(stderr, "PUT blob: %s/%04d (%zu bytes)\n",
                                        ctx->prefix, part, ctx->body_len);
                 free(path);
-                verify_snapshot(ctx->node, ctx->prefix);
+                {
+                    char base[ZEP_MAX_PATH * 2 + 128];
+                    snprintf(base, sizeof(base), "file://%s/%s/%s/",
+                             g_storage_root, ctx->node, ctx->prefix);
+                    verify_snapshot(ctx->node, ctx->prefix, base);
+                }
                 return send_json(conn, 200, "{\"ok\":true}");
             }
             free(path);

@@ -100,11 +100,15 @@ if [[ "$KEEP_POOLS" -ne 1 && -n "${ZFS_POOLS:-}" ]]; then
     say "Destroying ZFS pools ..."
     for pool in ${ZFS_POOLS:-}; do
         if zpool list -H -o name "$pool" &>/dev/null 2>&1; then
+            zfs unmount -f "$pool" 2>/dev/null || true
+            for ds in $(zfs list -H -o name -r "$pool" 2>/dev/null | tac); do
+                zfs destroy -f "$ds" 2>/dev/null || true
+            done
+            sleep 1
             zpool destroy -f "$pool" 2>/dev/null || warn "Could not destroy pool $pool"
             say "  Destroyed pool: $pool"
         fi
     done
-    # Remove loopback images
     for pool in ${ZFS_POOLS:-}; do
         img="${ZEP_BASE}/${pool}.img"
         rm -f "$img"

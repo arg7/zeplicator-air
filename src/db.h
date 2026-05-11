@@ -46,4 +46,23 @@ err_t db_set_suspended(sqlite3 *db, const char *cn, int val);
 err_t db_set_pipe_active(sqlite3 *db, const char *cn, int val);
 err_t db_update_role(sqlite3 *db, const char *cn, const char *new_role);
 
+err_t db_snapshot_insert(sqlite3 *db, const char *cluster, const char *node,
+                         const char *guid, const char *base_guid,
+                         const char *snapshot, const char *label,
+                         const char *cluster_fs, int blob_count,
+                         size_t blob_size, const char *direction,
+                         const char *storage_base);
+char *db_snapshot_chain_json(sqlite3 *db, const char *cluster,
+                             const char *master_cn,
+                             const char *client_guid);
+err_t db_snapshot_latest_guid(sqlite3 *db, const char *node,
+                              const char *direction,
+                              char *guid, size_t len);
+err_t db_blob_upsert(sqlite3 *db, const char *snapshot_guid, int part,
+                     size_t size, const char *sha256,
+                     const char *storage_ref);
+err_t db_blob_lookup(sqlite3 *db, const char *snapshot_guid, int part,
+                     char *storage_ref, size_t ref_len);
+char *db_blob_list_json(sqlite3 *db, const char *snapshot_guid);
+
 #endif

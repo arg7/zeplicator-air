@@ -229,6 +229,29 @@ err_t http_get_blob(const http_config_t *cfg, const char *node,
     return ZEP_ERR_OK;
 }
 
+err_t http_get_blob_by_guid(const http_config_t *cfg, const char *guid,
+                            int part, void **data, size_t *len) {
+    char *url = NULL;
+    if (asprintf(&url, "%s/v1/blobs/%s/%04d",
+                 cfg->server_url, guid, part) < 0)
+        return ZEP_ERR_SYS;
+
+    struct resp_buf rb = {0};
+    CURL *curl = http_init(cfg, url, &rb);
+    free(url);
+    if (!curl) return ZEP_ERR_NETWORK;
+
+    int rc = http_do(curl);
+    if (rc != ZEP_ERR_OK || !rb.data) {
+        free(rb.data);
+        return rc != ZEP_ERR_OK ? rc : ZEP_ERR_STORAGE;
+    }
+
+    *data = rb.data;
+    *len = rb.len;
+    return ZEP_ERR_OK;
+}
+
 err_t http_list_snapshots(const http_config_t *cfg, const char *node,
                           int limit, char ***prefixes, int *count) {
     char *url = NULL;

@@ -386,6 +386,114 @@ err_t pipeline_pull(const zep_config_t *cfg,
     return ZEP_ERR_OK;
 }
 
+err_t pipeline_pull_v2(const zep_config_t *cfg,
+                       const http_config_t *http_cfg,
+                       const char *fs, const char *donor_node,
+                       cJSON *snapshots) {
+    (void)donor_node;
+    if (!http_cfg->server_url[0]) {
+        fprintf(stderr, "error: server_url not configured\n");
+        return ZEP_ERR_DB;
+    }
+    if (!snapshots || !cJSON_IsArray(snapshots) || cJSON_GetArraySize(snapshots) == 0)
+        return ZEP_ERR_OK;
+
+    char local_guid[ZEP_MAX_GUID_LEN] = {0};
+    zfs_get_latest_guid(fs, local_guid, sizeof(local_guid));
+
+    cJSON *snap;
+    cJSON_ArrayForEach(snap, snapshots) {
+        cJSON *g = cJSON_GetObjectItem(snap, "guid");
+        cJSON *bg = cJSON_GetObjectItem(snap, "base_guid");
+        if (!g || !cJSON_IsString(g)) continue;
+
+        if (local_guid[0] && strcmp(g->valuestring, local_guid) == 0)
+            continue;
+
+        int can_pull = (!local_guid[0] && bg && cJSON_IsString(bg) && !bg->valuestring[0])
+                     || (bg && cJSON_IsString(bg) && strcmp(local_guid, bg->valuestring) == 0);
+        if (!can_pull) continue;
+
+        if (bg && cJSON_IsString(bg) && !bg->valuestring[0]) {
+            char cmd[ZEP_MAX_PATH];
+            snprintf(cmd, sizeof(cmd), "zfs set mountpoint=none '%s' 2>/dev/null", fs);
+            if (system(cmd) == -1) {}
+        }
+
+        cJSON *blobs = cJSON_GetObjectItem(snap, "blobs");
+        int blob_count = blobs ? cJSON_GetArraySize(blobs) : 0;
+        if (blob_count == 0) continue;
+
+        char snap_name[ZEP_MAX_SNAPSHOT_NAME] = {0};
+        {
+            cJSON *sn = cJSON_GetObjectItem(snap, "snapshot");
+            if (sn && cJSON_IsString(sn))
+                snprintf(snap_name, sizeof(snap_name), "%s", sn->valuestring);
+            else
+                snprintf(snap_name, sizeof(snap_name), "%s@pull-%s", fs, g->valuestring);
+        }
+
+        printf("Pulling guid=%s  blobs=%d\n", g->valuestring, blob_count);
+
+        FILE *recv_fp = NULL;
+        err_t ret = zfs_recv_open(fs, snap_name,
+                                   cfg->recv_options[0] ? cfg->recv_options : NULL,
+                                   cfg->pull_unzip_cmd, cfg->pull_buf_cmd,
+                                   &recv_fp);
+        if (ret != ZEP_ERR_OK) {
+            fprintf(stderr, "pull: failed to open zfs recv\n");
+            continue;
+        }
+
+        int ok = 1;
+        cJSON *b;
+        cJSON_ArrayForEach(b, blobs) {
+            cJSON *bp = cJSON_GetObjectItem(b, "part");
+            cJSON *bh = cJSON_GetObjectItem(b, "sha256");
+            if (!bp || !bh || !cJSON_IsString(bh)) continue;
+
+            int part = bp->valueint;
+            void *data = NULL;
+            size_t len = 0;
+            ret = http_get_blob_by_guid(http_cfg, g->valuestring, part, &data, &len);
+            if (ret != ZEP_ERR_OK) {
+                fprintf(stderr, "pull: failed to read blob %d for guid=%s\n", part, g->valuestring);
+                ok = 0;
+                break;
+            }
+
+            char computed[65];
+            sha256_hex(data, len, computed);
+            if (strcmp(computed, bh->valuestring) != 0) {
+                fprintf(stderr, "pull: checksum mismatch for blob %d\n  expected: %s\n  got:      %s\n",
+                        part, bh->valuestring, computed);
+                free(data);
+                ok = 0;
+                break;
+            }
+
+            printf("  blob %04d: %zu bytes  sha256=%s OK\n", part, len, computed);
+
+            size_t written = fwrite(data, 1, len, recv_fp);
+            free(data);
+            if (written != len) {
+                fprintf(stderr, "pull: failed to write data to zfs recv\n");
+                ok = 0;
+                break;
+            }
+        }
+
+        zfs_recv_close(recv_fp);
+
+        if (ok) {
+            zfs_get_latest_guid(fs, local_guid, sizeof(local_guid));
+            printf("Pull complete: guid=%s\n", g->valuestring);
+        }
+    }
+
+    return ZEP_ERR_OK;
+}
+
 err_t pipeline_resolve_zfs_cmd(const char *cmd, const char *mapping,
                                char *out, size_t out_len) {
     if (!cmd || !mapping || !out || out_len == 0)

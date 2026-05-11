@@ -5,6 +5,7 @@
 
 #include "common.h"
 #include "http.h"
+#include <cjson/cJSON.h>
 
 err_t pipeline_push(const zep_config_t *cfg,
                     const http_config_t *http_cfg,
@@ -14,6 +15,11 @@ err_t pipeline_push(const zep_config_t *cfg,
 err_t pipeline_pull(const zep_config_t *cfg,
                     const http_config_t *http_cfg,
                     const char *fs, const char *donor_node);
+
+err_t pipeline_pull_v2(const zep_config_t *cfg,
+                       const http_config_t *http_cfg,
+                       const char *fs, const char *donor_node,
+                       cJSON *snapshots);
 
 err_t pipeline_resolve_fs(const char *cluster_fs, const char *mapping,
                           char *local_fs, size_t len);

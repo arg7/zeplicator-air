@@ -1251,6 +1251,7 @@ static int cmd_cron(int argc, char *argv[]) {
             } else if (strcmp(action->valuestring, "sync") == 0 &&
                        cfs && cJSON_IsString(cfs)) {
                 cJSON *donor = cJSON_GetObjectItem(task, "donor");
+                cJSON *snap_list = cJSON_GetObjectItem(task, "snapshots");
                 char local_fs[ZEP_MAX_SNAPSHOT_NAME];
                 if (db_open(g_db_path, &db) == ZEP_ERR_OK) {
                     db_init_tables(db);
@@ -1258,8 +1259,14 @@ static int cmd_cron(int argc, char *argv[]) {
                     db_config_load(db, &cfg2);
                     if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
                                             local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
-                        pipeline_pull(&cfg2, &http_cfg, local_fs,
-                                      (donor && cJSON_IsString(donor)) ? donor->valuestring : "");
+                        if (snap_list && cJSON_IsArray(snap_list) && cJSON_GetArraySize(snap_list) > 0) {
+                            pipeline_pull_v2(&cfg2, &http_cfg, local_fs,
+                                              (donor && cJSON_IsString(donor)) ? donor->valuestring : "",
+                                              snap_list);
+                        } else {
+                            pipeline_pull(&cfg2, &http_cfg, local_fs,
+                                          (donor && cJSON_IsString(donor)) ? donor->valuestring : "");
+                        }
                         tasks_done++;
 
                         char latest[ZEP_MAX_GUID_LEN] = {0};
