@@ -159,7 +159,7 @@ static enum MHD_Result send_response(struct MHD_Connection *conn,
         ctx->status_code = status;
         const char *method = ctx->method[0] ? ctx->method : "?";
         const char *role   = ctx->role[0]   ? ctx->role   : "?";
-        zep_log("http: %s %s %s → %d (%zub)\n", role, method, ctx->target_url, status, body_len);
+        zep_log("http: %s %s %s %s → %d (%zub)\n", ctx->node[0] ? ctx->node : "?", role, method, ctx->target_url, status, body_len);
     }
     struct MHD_Response *resp = MHD_create_response_from_buffer(
         body_len, (void *)body, MHD_RESPMEM_MUST_COPY);
@@ -1295,8 +1295,6 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 db_auth_get_role_by_fp(g_db, fp_hex, role, sizeof(role));
                 snprintf(ctx->role, sizeof(ctx->role), "%s", role);
 
-                zep_log("auth: fp=%.4s role=%s %s %s\n", fp_hex, role, method, url);
-
                 size_t dn_size = 0;
                 gnutls_x509_crt_get_dn(client_cert, NULL, &dn_size);
                 if (dn_size > 0) {
@@ -1319,6 +1317,9 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                         free(dn);
                     }
                 }
+
+                zep_log("auth: fp=%.4s cn=%s role=%s %s %s\n",
+                        fp_hex, ctx->node[0] ? ctx->node : "?", role, method, url);
 
                 if (strncmp(ctx->target_url, "/v1/admin", 9) == 0 &&
                     strcmp(role, "admin") != 0) {
