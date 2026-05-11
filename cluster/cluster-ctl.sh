@@ -167,13 +167,17 @@ do_start() {
     for entry in ${NODES:-}; do
         IFS=':' read -r cn role poolfs <<< "$entry"
         local node_db="${ZEP_BASE}/home/${cn}/${cn}.db"
-        if [[ ! -f "$node_db" ]]; then
-            echo -e "  ${YELLOW}No DB for $cn ($node_db) — skipping${NC}"
-            continue
-        fi
         if [[ "$SUDO_NODES" == "1" ]]; then
-            sudo -u "$cn" "$ZEP" ${VERB:+-v} --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" >/tmp/zep-${cn}.log 2>&1 &
+            sudo -u "$cn" test -f "$node_db" || {
+                echo -e "  ${YELLOW}No DB for $cn ($node_db) — skipping${NC}"
+                continue
+            }
+            sudo -u "$cn" sh -c "\"$ZEP\" ${VERB:+-v} --db \"$node_db\" cron --daemon --interval \"$CRON_INTERVAL\" > /tmp/zep-${cn}.log 2>&1" &
         else
+            [[ -f "$node_db" ]] || {
+                echo -e "  ${YELLOW}No DB for $cn ($node_db) — skipping${NC}"
+                continue
+            }
             "$ZEP" ${VERB:+-v} --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" >/tmp/zep-${cn}.log 2>&1 &
         fi
         local cpid=$!
