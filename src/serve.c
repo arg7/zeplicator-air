@@ -673,6 +673,7 @@ static void *node_ws_thread(void *arg) {
         time_t now = time(NULL);
         if (now - last_ping >= 60) {
             ws_send_frame_gtls(nw, WS_OP_PING, NULL, 0);
+            if (g_verbose) fprintf(stderr, "ws: -> PING  cn=%s\n", nw->cn);
             last_ping = now;
         }
 
@@ -683,7 +684,6 @@ static void *node_ws_thread(void *arg) {
                     if (g_verbose) fprintf(stderr, "ws: recv_frame_full failed plen=%zd cn=%s\n", plen, nw->cn);
                     break;
                 }
-                if (plen == 0) continue; /* empty frame, wait for more */
 
             if (opcode == WS_OP_CLOSE) break;
             if (opcode == WS_OP_PING) {
@@ -694,6 +694,7 @@ static void *node_ws_thread(void *arg) {
                 nw->last_pong = time(NULL);
                 continue;
             }
+                if (plen == 0) continue; /* empty data frame */
         }
 
         if (time(NULL) - nw->last_pong > 180) break;

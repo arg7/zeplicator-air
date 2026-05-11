@@ -216,7 +216,6 @@ static struct ws_node_conn *ws_node_connect(const char *server_url, const char *
 
         c->ssl = SSL_new(ssl_ctx);
         SSL_set_fd(c->ssl, sock);
-        SSL_set_cipher_list(c->ssl, "AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-SHA256:AES128-SHA256");
         if (SSL_connect(c->ssl) <= 0) {
             SSL_CTX_free(ssl_ctx); ws_node_disconnect(c); return NULL;
         }
