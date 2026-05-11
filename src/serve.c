@@ -1763,7 +1763,24 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                 if (labels) {
                                     cJSON *lbl;
                                     cJSON_ArrayForEach(lbl, labels) {
-                                        int interval_min = lbl->valueint;
+                                        int save_count = lbl->valueint;
+                                        int interval_sec = 60; /* default: "min" */
+                                        const char *ln = lbl->string;
+                                        if (ln) {
+                                            if (strncmp(ln, "min", 3) == 0) {
+                                                if (ln[3] >= '0' && ln[3] <= '9')
+                                                    interval_sec = atoi(ln + 3) * 60;
+                                                else
+                                                    interval_sec = 60;
+                                            } else if (strncmp(ln, "hour", 4) == 0) {
+                                                interval_sec = 3600;
+                                            } else if (strncmp(ln, "day", 3) == 0) {
+                                                interval_sec = 86400;
+                                            } else if (strncmp(ln, "week", 4) == 0) {
+                                                interval_sec = 7 * 86400;
+                                            }
+                                        }
+                                        (void)save_count; /* retention count used by rotation (TBD) */
                                         char cron_key[1024];
                                         snprintf(cron_key, sizeof(cron_key),
                                             "cron_last_%s_%s_%s",
@@ -1778,7 +1795,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                             if (strptime(last_str, "%Y-%m-%dT%H:%M:%SZ", &tm))
                                                 last = timegm(&tm);
                                         }
-                                        if (last == 0 || (now - last) >= interval_min * 60) {
+                                        if (last == 0 || (now - last) >= interval_sec) {
                                             cJSON *t = cJSON_CreateObject();
                                             cJSON_AddStringToObject(t, "action", "push");
                                             cJSON_AddStringToObject(t, "cluster_fs", cluster_fs);
