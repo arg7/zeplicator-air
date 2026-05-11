@@ -136,11 +136,11 @@ err_t pipeline_push(const zep_config_t *cfg,
     memset(&meta, 0, sizeof(meta));
 
     if (!cfg->node_name[0]) {
-        fprintf(stderr, "error: node_name not configured\n");
+        zep_log( "error: node_name not configured\n");
         return ZEP_ERR_DB;
     }
     if (!http_cfg->server_url[0]) {
-        fprintf(stderr, "error: server_url not configured\n");
+        zep_log( "error: server_url not configured\n");
         return ZEP_ERR_DB;
     }
 
@@ -148,14 +148,14 @@ err_t pipeline_push(const zep_config_t *cfg,
 
     err_t ret = zfs_snapshot_create(fs, label, snap_name, sizeof(snap_name));
     if (ret != ZEP_ERR_OK) {
-        fprintf(stderr, "push: failed to create snapshot\n");
+        zep_log( "push: failed to create snapshot\n");
         return ret;
     }
     printf("Created snapshot: %s\n", snap_name);
 
     ret = zfs_get_snapshot_guid(snap_name, guid, sizeof(guid));
     if (ret != ZEP_ERR_OK) {
-        fprintf(stderr, "push: failed to get snapshot guid\n");
+        zep_log( "push: failed to get snapshot guid\n");
         zfs_destroy_snapshot(snap_name);
         return ret;
     }
@@ -167,7 +167,7 @@ err_t pipeline_push(const zep_config_t *cfg,
     if (base_guid[0]) {
         ret = find_base_snapshot(fs, base_guid, base_snap, sizeof(base_snap));
         if (ret != ZEP_ERR_OK) {
-            fprintf(stderr, "push: base snapshot not found for guid %s\n", base_guid);
+            zep_log( "push: base snapshot not found for guid %s\n", base_guid);
             base_guid[0] = '\0';
             base_snap[0] = '\0';
         }
@@ -224,7 +224,7 @@ err_t pipeline_push(const zep_config_t *cfg,
         ret = http_put_blob(http_cfg, cfg->node_name, prefix,
                             blob_count, buf, nread);
         if (ret != ZEP_ERR_OK) {
-            fprintf(stderr, "push: failed to upload blob %d\n", blob_count);
+            zep_log( "push: failed to upload blob %d\n", blob_count);
             break;
         }
 
@@ -233,7 +233,7 @@ err_t pipeline_push(const zep_config_t *cfg,
         printf("  blob %04d: %zu bytes  sha256=%s\n", blob_count - 1, nread, blobs[blob_count - 1].sha256);
 
         if (blob_count >= MAX_BLOBS) {
-            fprintf(stderr, "push: max blobs exceeded\n");
+            zep_log( "push: max blobs exceeded\n");
             ret = ZEP_ERR_SYS;
             break;
         }
@@ -254,7 +254,7 @@ err_t pipeline_push(const zep_config_t *cfg,
     snprintf(meta.cluster_fs, sizeof(meta.cluster_fs), "%s", cluster_fs ? cluster_fs : "");
     snprintf(meta.created, sizeof(meta.created), "%s", created);
     snprintf(meta.host, sizeof(meta.host), "%s", cfg->node_name);
-    fprintf(stderr, "push: cluster_fs='%s' label='%s' host='%s'\n",
+    zep_log( "push: cluster_fs='%s' label='%s' host='%s'\n",
             meta.cluster_fs, meta.label, meta.host);
     meta.stream_size = stream_size;
     meta.blob_count = blob_count;
@@ -262,7 +262,7 @@ err_t pipeline_push(const zep_config_t *cfg,
 
     ret = http_put_meta(http_cfg, cfg->node_name, prefix, &meta);
     if (ret != ZEP_ERR_OK) {
-        fprintf(stderr, "push: failed to upload meta.json\n");
+        zep_log( "push: failed to upload meta.json\n");
         free(blobs);
         zfs_destroy_snapshot(snap_name);
         return ret;
@@ -279,7 +279,7 @@ err_t pipeline_pull(const zep_config_t *cfg,
                     const http_config_t *http_cfg,
                     const char *fs, const char *donor_node) {
     if (!http_cfg->server_url[0]) {
-        fprintf(stderr, "error: server_url not configured\n");
+        zep_log( "error: server_url not configured\n");
         return ZEP_ERR_DB;
     }
 
@@ -305,7 +305,7 @@ err_t pipeline_pull(const zep_config_t *cfg,
 
         ret = http_get_meta(http_cfg, node, prefixes[i], &meta);
         if (ret != ZEP_ERR_OK) {
-            fprintf(stderr, "pull: failed to read meta for %s\n", prefixes[i]);
+            zep_log( "pull: failed to read meta for %s\n", prefixes[i]);
             continue;
         }
 
@@ -336,7 +336,7 @@ err_t pipeline_pull(const zep_config_t *cfg,
                             cfg->pull_unzip_cmd, cfg->pull_buf_cmd,
                             &recv_fp);
         if (ret != ZEP_ERR_OK) {
-            fprintf(stderr, "pull: failed to open zfs recv\n");
+            zep_log( "pull: failed to open zfs recv\n");
             storage_meta_free(&meta);
             continue;
         }
@@ -347,7 +347,7 @@ err_t pipeline_pull(const zep_config_t *cfg,
             size_t len = 0;
                 ret = http_get_blob(http_cfg, node, prefixes[i], b, &data, &len);
             if (ret != ZEP_ERR_OK) {
-                fprintf(stderr, "pull: failed to read blob %d\n", b);
+                zep_log( "pull: failed to read blob %d\n", b);
                 ok = 0;
                 break;
             }
@@ -355,7 +355,7 @@ err_t pipeline_pull(const zep_config_t *cfg,
             char computed[65];
             sha256_hex(data, len, computed);
             if (strcmp(computed, meta.blobs[b].sha256) != 0) {
-                fprintf(stderr, "pull: checksum mismatch for blob %d\n  expected: %s\n  got:      %s\n",
+                zep_log( "pull: checksum mismatch for blob %d\n  expected: %s\n  got:      %s\n",
                         b, meta.blobs[b].sha256, computed);
                 free(data);
                 ok = 0;
@@ -367,7 +367,7 @@ err_t pipeline_pull(const zep_config_t *cfg,
             size_t written = fwrite(data, 1, len, recv_fp);
             free(data);
             if (written != len) {
-                fprintf(stderr, "pull: failed to write data to zfs recv\n");
+                zep_log( "pull: failed to write data to zfs recv\n");
                 ok = 0;
                 break;
             }
@@ -392,7 +392,7 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
                        cJSON *snapshots) {
     (void)donor_node;
     if (!http_cfg->server_url[0]) {
-        fprintf(stderr, "error: server_url not configured\n");
+        zep_log( "error: server_url not configured\n");
         return ZEP_ERR_DB;
     }
     if (!snapshots || !cJSON_IsArray(snapshots) || cJSON_GetArraySize(snapshots) == 0)
@@ -442,7 +442,7 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
                                    cfg->pull_unzip_cmd, cfg->pull_buf_cmd,
                                    &recv_fp);
         if (ret != ZEP_ERR_OK) {
-            fprintf(stderr, "pull: failed to open zfs recv\n");
+            zep_log( "pull: failed to open zfs recv\n");
             continue;
         }
 
@@ -458,7 +458,7 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
             size_t len = 0;
             ret = http_get_blob_by_guid(http_cfg, g->valuestring, part, &data, &len);
             if (ret != ZEP_ERR_OK) {
-                fprintf(stderr, "pull: failed to read blob %d for guid=%s\n", part, g->valuestring);
+                zep_log( "pull: failed to read blob %d for guid=%s\n", part, g->valuestring);
                 ok = 0;
                 break;
             }
@@ -466,7 +466,7 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
             char computed[65];
             sha256_hex(data, len, computed);
             if (strcmp(computed, bh->valuestring) != 0) {
-                fprintf(stderr, "pull: checksum mismatch for blob %d\n  expected: %s\n  got:      %s\n",
+                zep_log( "pull: checksum mismatch for blob %d\n  expected: %s\n  got:      %s\n",
                         part, bh->valuestring, computed);
                 free(data);
                 ok = 0;
@@ -478,7 +478,7 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
             size_t written = fwrite(data, 1, len, recv_fp);
             free(data);
             if (written != len) {
-                fprintf(stderr, "pull: failed to write data to zfs recv\n");
+                zep_log( "pull: failed to write data to zfs recv\n");
                 ok = 0;
                 break;
             }

@@ -84,6 +84,8 @@ struct conn_ctx {
     size_t body_cap;
     int parsed;
     int authed;
+    char role[16];
+    int  status_code;
 };
 
 static void conn_ctx_free(struct conn_ctx *ctx) {
@@ -151,7 +153,14 @@ static void parse_url(const char *url, struct conn_ctx *ctx) {
 
 static enum MHD_Result send_response(struct MHD_Connection *conn,
                                       int status, const char *ctype,
-                                      const void *body, size_t body_len) {
+                                      const void *body, size_t body_len,
+                                      struct conn_ctx *ctx) {
+    if (ctx) {
+        ctx->status_code = status;
+        const char *method = ctx->method[0] ? ctx->method : "?";
+        const char *role   = ctx->role[0]   ? ctx->role   : "?";
+        zep_log("http: %s %s %s → %d (%zub)\n", role, method, ctx->target_url, status, body_len);
+    }
     struct MHD_Response *resp = MHD_create_response_from_buffer(
         body_len, (void *)body, MHD_RESPMEM_MUST_COPY);
     if (!resp) return MHD_NO;
@@ -161,12 +170,14 @@ static enum MHD_Result send_response(struct MHD_Connection *conn,
     return ret;
 }
 
-static enum MHD_Result send_error(struct MHD_Connection *conn, int status, const char *msg) {
-    return send_response(conn, status, "text/plain", msg, strlen(msg));
+static enum MHD_Result send_error(struct MHD_Connection *conn, int status,
+                                  const char *msg, struct conn_ctx *ctx) {
+    return send_response(conn, status, "text/plain", msg, strlen(msg), ctx);
 }
 
-static enum MHD_Result send_json(struct MHD_Connection *conn, int status, const char *json) {
-    return send_response(conn, status, "application/json", json, strlen(json));
+static enum MHD_Result send_json(struct MHD_Connection *conn, int status,
+                                 const char *json, struct conn_ctx *ctx) {
+    return send_response(conn, status, "application/json", json, strlen(json), ctx);
 }
 
 static char *read_file(const char *path, size_t *len) {
@@ -191,11 +202,11 @@ static void verify_snapshot(const char *cluster_key, const char *prefix,
 
     err_t ret = storage_read_meta(g_storage_root, cluster_key, prefix, &meta);
     if (ret != ZEP_ERR_OK) {
-        if (g_verbose) fprintf(stderr, "verify: read_meta failed (%d) node=%s prefix=%s\n",
+        if (g_verbose) zep_log( "verify: read_meta failed (%d) node=%s prefix=%s\n",
                               ret, cluster_key, prefix);
         return;
     }
-    if (g_verbose) fprintf(stderr, "verify: meta loaded snapshot=%s label='%s' cluster_fs='%s'\n",
+    if (g_verbose) zep_log( "verify: meta loaded snapshot=%s label='%s' cluster_fs='%s'\n",
                           meta.snapshot, meta.label, meta.cluster_fs);
 
     char *dir_path = NULL;
@@ -217,7 +228,7 @@ static void verify_snapshot(const char *cluster_key, const char *prefix,
     }
 
     if (found < meta.blob_count) {
-        if (g_verbose) fprintf(stderr, "verify: blob check found=%d/%d\n", found, meta.blob_count);
+        if (g_verbose) zep_log( "verify: blob check found=%d/%d\n", found, meta.blob_count);
         free(dir_path);
         storage_meta_free(&meta);
         return;
@@ -252,24 +263,37 @@ static void verify_snapshot(const char *cluster_key, const char *prefix,
     fclose(zst);
 
     char *cmd = NULL;
-    if (asprintf(&cmd, "zstd -d '%s' -o '%s' -f 2>/dev/null", zst_path, dec_path) < 0) {
-        unlink(zst_path);
-        free(dir_path); free(zst_path); free(dec_path);
-        storage_meta_free(&meta);
-        return;
+    int use_zstd = 0;
+    {
+        char zip_cmd[128] = {0};
+        if (db_config_get(g_db, "push_zip_cmd", zip_cmd, sizeof(zip_cmd)) == ZEP_ERR_OK
+            && zip_cmd[0])
+            use_zstd = 1;
     }
-    int rc = system(cmd);
-    free(cmd);
-    if (rc != 0) {
-        if (g_verbose) fprintf(stderr, "verify: zstd -d failed rc=%d, trying raw\n", rc);
-        /* rename raw data as dec_path for zstream_parse — might not be zstd */
+    if (use_zstd) {
+        if (asprintf(&cmd, "zstd -d '%s' -o '%s' -f 2>/dev/null", zst_path, dec_path) < 0) {
+            unlink(zst_path);
+            free(dir_path); free(zst_path); free(dec_path);
+            storage_meta_free(&meta);
+            return;
+        }
+        int rc = system(cmd);
+        free(cmd);
+        if (rc != 0) {
+            if (g_verbose) zep_log( "verify: zstd -d failed rc=%d, trying raw\n", rc);
+            unlink(dec_path);
+            free(dec_path);
+            dec_path = zst_path;
+            zst_path = NULL;
+        } else {
+            unlink(zst_path);
+            free(zst_path);
+            zst_path = NULL;
+        }
+    } else {
         unlink(dec_path);
         free(dec_path);
         dec_path = zst_path;
-        zst_path = NULL;
-    } else {
-        unlink(zst_path);
-        free(zst_path);
         zst_path = NULL;
     }
     free(dir_path);
@@ -293,7 +317,7 @@ static void verify_snapshot(const char *cluster_key, const char *prefix,
     free(decomp);
 
     if (ret != ZEP_ERR_OK) {
-        if (g_verbose) fprintf(stderr, "verify: zstream_parse failed for %s/%s rc=%d\n",
+        if (g_verbose) zep_log( "verify: zstream_parse failed for %s/%s rc=%d\n",
                 cluster_key, prefix, (int)ret);
         storage_meta_free(&meta);
         return;
@@ -301,7 +325,7 @@ static void verify_snapshot(const char *cluster_key, const char *prefix,
 
     sqlite3 *db = NULL;
     if (db_open(g_db_path, &db) != ZEP_ERR_OK) {
-        if (g_verbose) fprintf(stderr, "verify: db_open failed for %s\n", g_db_path);
+        if (g_verbose) zep_log( "verify: db_open failed for %s\n", g_db_path);
         storage_meta_free(&meta);
         return;
     }
@@ -343,7 +367,7 @@ static void verify_snapshot(const char *cluster_key, const char *prefix,
         struct tm tm;
         gmtime_r(&tnow, &tm);
         strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
-        if (g_verbose) fprintf(stderr, "verify: set %s = %s\n", cron_key, now_str);
+        if (g_verbose) zep_log( "verify: set %s = %s\n", cron_key, now_str);
         db_config_set(db, cron_key, now_str);
     }
 
@@ -393,7 +417,7 @@ static struct node_ws *node_ws_register(const char *cn, int sock) {
     nw->next = g_node_ws;
     g_node_ws = nw;
     if (g_verbose)
-        fprintf(stderr, "ws: node %s registered sock=%d\n", cn, sock);
+        zep_log( "ws: node %s registered sock=%d\n", cn, sock);
     pthread_mutex_unlock(&g_node_ws_lock);
     return nw;
 }
@@ -406,7 +430,7 @@ static void node_ws_unregister(struct node_ws *target) {
             if (prev) prev->next = nw->next;
             else g_node_ws = nw->next;
             if (g_verbose)
-                fprintf(stderr, "ws: node %s unregistered\n", nw->cn);
+                zep_log( "ws: node %s unregistered\n", nw->cn);
             pthread_mutex_destroy(&nw->lock);
             free(nw);
             break;
@@ -554,7 +578,7 @@ static ssize_t ws_recv_node(struct node_ws *nw, unsigned char *buf, size_t buf_s
             if (select(raw_fd + 1, &rfds, NULL, NULL, &tv) <= 0) return -1;
             return gnutls_record_recv(nw->gnutls_session, buf, buf_size);
         }
-        if (g_verbose && n <= 0) fprintf(stderr, "ws: recv TLS result=%d cn=%s\n",
+        if (g_verbose && n <= 0) zep_log( "ws: recv TLS result=%d cn=%s\n",
                                          (int)n, nw->cn);
         return n;
     }
@@ -639,7 +663,7 @@ static void *node_ws_thread(void *arg) {
     if (!buf || !out) { free(buf); free(out); MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return NULL; }
 
     if (g_verbose) {
-        fprintf(stderr, "ws: node %s listening sock=%d\n", nw->cn, sock);
+        zep_log( "ws: node %s listening sock=%d\n", nw->cn, sock);
         fflush(stderr);
     }
 
@@ -652,14 +676,14 @@ static void *node_ws_thread(void *arg) {
         pthread_mutex_unlock(&nw->lock);
         if (closed) {
             if (g_verbose) {
-                fprintf(stderr, "ws: node %s closed by new connection\n", nw->cn);
+                zep_log( "ws: node %s closed by new connection\n", nw->cn);
                 fflush(stderr);
             }
             break;
         }
         if (exiting) {
             if (g_verbose) {
-                fprintf(stderr, "ws: node %s exiting for pipe bridge\n", nw->cn);
+                zep_log( "ws: node %s exiting for pipe bridge\n", nw->cn);
                 fflush(stderr);
             }
             break;
@@ -674,7 +698,7 @@ static void *node_ws_thread(void *arg) {
         time_t now = time(NULL);
         if (now - last_ping >= 60) {
             ws_send_frame_gtls(nw, WS_OP_PING, NULL, 0);
-            if (g_verbose) fprintf(stderr, "ws: -> PING  cn=%s\n", nw->cn);
+            if (g_verbose) zep_log( "ws: -> PING  cn=%s\n", nw->cn);
             last_ping = now;
         }
 
@@ -682,7 +706,7 @@ static void *node_ws_thread(void *arg) {
                 ssize_t plen = ws_recv_frame_full(nw, buf, WS_SUBCHUNK, out, WS_SUBCHUNK, &buf[0]);
                 unsigned char opcode = buf[0] & 0x0F;
                 if (plen < 0) {
-                    if (g_verbose) fprintf(stderr, "ws: recv_frame_full failed plen=%zd cn=%s\n", plen, nw->cn);
+                    if (g_verbose) zep_log( "ws: recv_frame_full failed plen=%zd cn=%s\n", plen, nw->cn);
                     break;
                 }
 
@@ -702,7 +726,7 @@ static void *node_ws_thread(void *arg) {
     }
 
     if (g_verbose) {
-        fprintf(stderr, "ws: node %s disconnected\n", nw->cn);
+        zep_log( "ws: node %s disconnected\n", nw->cn);
         fflush(stderr);
     }
 
@@ -955,13 +979,13 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
     /* Find node connection */
     struct node_ws *nw = node_ws_find(node_cn);
     if (!nw) {
-        fprintf(stderr, "ws: pipe request for %s — not connected\n", node_cn);
+        zep_log( "ws: pipe request for %s — not connected\n", node_cn);
         fflush(stderr);
         MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
         return;
     }
     if (g_verbose)
-        fprintf(stderr, "ws: pipe found node %s sock=%d\n", node_cn, nw->sock);
+        zep_log( "ws: pipe found node %s sock=%d\n", node_cn, nw->sock);
 
     /* Check pipe_allow before taking over node thread */
     const char *command = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "command");
@@ -984,7 +1008,7 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
         if (!pipe_allow[0]) snprintf(pipe_allow, sizeof(pipe_allow), "zfs");
 
         if (!pipe_allowed(command, pipe_allow)) {
-            fprintf(stderr, "ws: pipe denied for '%s' to node %s\n", command, node_cn);
+            zep_log( "ws: pipe denied for '%s' to node %s\n", command, node_cn);
             char errmsg[512];
             int elen = snprintf(errmsg, sizeof(errmsg), "pipe: access denied for '%s'", command);
             unsigned char fbuf[2048];
@@ -1017,7 +1041,7 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
     /* Wait for node thread to exit */
     usleep(200000);
     if (g_verbose)
-        fprintf(stderr, "ws: pipe taking over node %s\n", node_cn);
+        zep_log( "ws: pipe taking over node %s\n", node_cn);
 
     /* Get raw TCP fd for select */
     int node_raw_fd = nw->sock;
@@ -1048,7 +1072,7 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
         char *task_json = cJSON_PrintUnformatted(task);
         if (task_json) {
             if (g_verbose)
-                fprintf(stderr, "ws: sending task to node: %s\n", task_json);
+                zep_log( "ws: sending task to node: %s\n", task_json);
             ws_send_frame_gtls(nw, WS_OP_TEXT, (unsigned char *)task_json, strlen(task_json));
             free(task_json);
         }
@@ -1186,7 +1210,7 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
     }
 
     if (g_verbose)
-        fprintf(stderr, "ws: pipe bridge ended admin=%d node=%d\n", admin_alive, node_alive);
+        zep_log( "ws: pipe bridge ended admin=%d node=%d\n", admin_alive, node_alive);
 
     {
         unsigned char cbuf[14];
@@ -1206,25 +1230,25 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
 static enum MHD_Result ws_handle_node(struct MHD_Connection *conn,
                                        const char *cn) {
     if (g_verbose)
-        fprintf(stderr, "ws: node upgrade request for %s\n", cn);
+        zep_log( "ws: node upgrade request for %s\n", cn);
 
     const char *upgrade = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Upgrade");
     const char *ws_key = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Sec-WebSocket-Key");
     const char *ws_ver = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Sec-WebSocket-Version");
 
     if (!upgrade || strcasecmp(upgrade, "websocket") != 0)
-        return send_error(conn, 400, "Upgrade: websocket required");
+        return send_error(conn, 400, "Upgrade: websocket required", NULL);
     if (!ws_key || !ws_key[0])
-        return send_error(conn, 400, "Sec-WebSocket-Key required");
+        return send_error(conn, 400, "Sec-WebSocket-Key required", NULL);
     if (!ws_ver || strcmp(ws_ver, "13") != 0)
-        return send_error(conn, 400, "Sec-WebSocket-Version: 13 required");
+        return send_error(conn, 400, "Sec-WebSocket-Version: 13 required", NULL);
 
     char accept[128];
     ws_build_accept(ws_key, accept, sizeof(accept));
 
     struct MHD_Response *resp = MHD_create_response_for_upgrade(
         &ws_node_upgrade_handler, (void *)cn);
-    if (!resp) return send_error(conn, 500, "Failed to create upgrade response");
+    if (!resp) return send_error(conn, 500, "Failed to create upgrade response", NULL);
 
     MHD_add_response_header(resp, "Upgrade", "websocket");
     MHD_add_response_header(resp, "Connection", "Upgrade");
@@ -1237,7 +1261,7 @@ static enum MHD_Result ws_handle_node(struct MHD_Connection *conn,
 
 static enum MHD_Result ws_handle_pipe(struct MHD_Connection *conn,
                                        const char *node_cn) {
-    if (g_verbose) fprintf(stderr, "ws: pipe upgrade request for node %s\n", node_cn);
+    if (g_verbose) zep_log( "ws: pipe upgrade request for node %s\n", node_cn);
     if (g_verbose) fflush(stderr);
 
     const char *upgrade = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Upgrade");
@@ -1245,21 +1269,21 @@ static enum MHD_Result ws_handle_pipe(struct MHD_Connection *conn,
     const char *ws_ver = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Sec-WebSocket-Version");
 
     if (!upgrade || strcasecmp(upgrade, "websocket") != 0)
-        return send_error(conn, 400, "Upgrade: websocket required");
+        return send_error(conn, 400, "Upgrade: websocket required", NULL);
     if (!ws_key || !ws_key[0])
-        return send_error(conn, 400, "Sec-WebSocket-Key required");
+        return send_error(conn, 400, "Sec-WebSocket-Key required", NULL);
     if (!ws_ver || strcmp(ws_ver, "13") != 0)
-        return send_error(conn, 400, "Sec-WebSocket-Version: 13 required");
+        return send_error(conn, 400, "Sec-WebSocket-Version: 13 required", NULL);
 
     if (!node_ws_find(node_cn))
-        return send_error(conn, 503, "Node not connected");
+        return send_error(conn, 503, "Node not connected", NULL);
 
     char accept[128];
     ws_build_accept(ws_key, accept, sizeof(accept));
 
     struct MHD_Response *resp = MHD_create_response_for_upgrade(
         &ws_pipe_upgrade_handler, (void *)node_cn);
-    if (!resp) return send_error(conn, 500, "Failed to create upgrade response");
+    if (!resp) return send_error(conn, 500, "Failed to create upgrade response", NULL);
 
     MHD_add_response_header(resp, "Upgrade", "websocket");
     MHD_add_response_header(resp, "Connection", "Upgrade");
@@ -1311,7 +1335,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         }
 
         if (strcmp(url, "/health") == 0) {
-            return send_response(conn, 200, "text/plain", "ok", 2);
+            return send_response(conn, 200, "text/plain", "ok", 2, ctx);
         }
 
         if (client_cert) {
@@ -1326,9 +1350,9 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
                 char role[16] = {0};
                 db_auth_get_role_by_fp(g_db, fp_hex, role, sizeof(role));
+                snprintf(ctx->role, sizeof(ctx->role), "%s", role);
 
-                if (g_verbose)
-                    fprintf(stderr, "auth: fp=%s role=%s url=%s\n", fp_hex, role, url);
+                zep_log("auth: fp=%.4s role=%s %s %s\n", fp_hex, role, method, url);
 
                 size_t dn_size = 0;
                 gnutls_x509_crt_get_dn(client_cert, NULL, &dn_size);
@@ -1355,7 +1379,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
                 if (strncmp(ctx->target_url, "/v1/admin", 9) == 0 &&
                     strcmp(role, "admin") != 0) {
-                    return send_error(conn, 403, "Admin access required");
+                    return send_error(conn, 403, "Admin access required", ctx);
                 }
             }
         }
@@ -1370,7 +1394,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
     }
 
     if (!ctx->authed) {
-        return send_error(conn, 401, "Client certificate required");
+        return send_error(conn, 401, "Client certificate required", ctx);
     }
 
     if (*upload_data_size > 0) {
@@ -1397,20 +1421,20 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             if (strcmp(ctx->method, "POST") == 0 &&
                 strcmp(ctx->target_url, "/v1/admin/clusters") == 0) {
                 cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
-                if (!json) return send_error(conn, 400, "Invalid JSON");
+                if (!json) return send_error(conn, 400, "Invalid JSON", ctx);
                 cJSON *name = cJSON_GetObjectItem(json, "name");
                 if (!name || !cJSON_IsString(name) || !name->valuestring[0]) {
                     cJSON_Delete(json);
-                    return send_error(conn, 400, "Missing cluster name");
+                    return send_error(conn, 400, "Missing cluster name", ctx);
                 }
                 char cfg_key[128];
                 snprintf(cfg_key, sizeof(cfg_key), "cluster_%s", name->valuestring);
                 char *js = cJSON_PrintUnformatted(json);
                 cJSON_Delete(json);
                 db_config_set(g_db, cfg_key, js);
-                if (g_verbose) fprintf(stderr, "cluster set: key=%s len=%zu\n", cfg_key, strlen(js));
+                if (g_verbose) zep_log( "cluster set: key=%s len=%zu\n", cfg_key, strlen(js));
                 free(js);
-                return send_json(conn, 200, "{\"ok\":true}");
+                return send_json(conn, 200, "{\"ok\":true}", ctx);
             }
 
             if (strcmp(ctx->method, "GET") == 0) {
@@ -1420,9 +1444,9 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                         char cfg_key[128], val[65536] = {0};
                         snprintf(cfg_key, sizeof(cfg_key), "cluster_%s", cn);
                         if (db_config_get(g_db, cfg_key, val, sizeof(val)) == ZEP_ERR_OK)
-                            return send_json(conn, 200, val);
+                            return send_json(conn, 200, val, ctx);
                     }
-                    return send_error(conn, 404, "Not found");
+                    return send_error(conn, 404, "Not found", ctx);
                 }
                 /* list clusters: return names */
                 cJSON *arr = cJSON_CreateArray();
@@ -1441,7 +1465,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 (void)key_buf; (void)val_buf;
                 char *js = cJSON_PrintUnformatted(arr);
                 cJSON_Delete(arr);
-                enum MHD_Result ret = send_json(conn, 200, js);
+                enum MHD_Result ret = send_json(conn, 200, js, ctx);
                 free(js);
                 return ret;
             }
@@ -1453,18 +1477,18 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     char cfg_key[128];
                     snprintf(cfg_key, sizeof(cfg_key), "cluster_%s", cn);
                     db_config_set(g_db, cfg_key, "");
-                    return send_json(conn, 200, "{\"ok\":true}");
+                    return send_json(conn, 200, "{\"ok\":true}", ctx);
                 }
-                return send_error(conn, 400, "Missing cluster name");
+                return send_error(conn, 400, "Missing cluster name", ctx);
             }
 
-            return send_error(conn, 404, "Cluster endpoint not found");
+            return send_error(conn, 404, "Cluster endpoint not found", ctx);
         }
 
         if (strcmp(ctx->method, "POST") == 0) {
             if (strcmp(ctx->target_url, "/v1/admin/nodes") == 0) {
                 cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
-                if (!json) return send_error(conn, 400, "Invalid JSON");
+                if (!json) return send_error(conn, 400, "Invalid JSON", ctx);
                 cJSON *cn = cJSON_GetObjectItem(json, "cn");
                 cJSON *role = cJSON_GetObjectItem(json, "role");
                 cJSON *pem = cJSON_GetObjectItem(json, "pem");
@@ -1483,7 +1507,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                         if (db_config_get(g_db, cfg_key, cluster_json,
                                           sizeof(cluster_json)) != ZEP_ERR_OK) {
                             cJSON_Delete(json);
-                            return send_error(conn, 400, "Cluster not found");
+                            return send_error(conn, 400, "Cluster not found", ctx);
                         }
                     }
 
@@ -1505,8 +1529,8 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     }
                 }
                 cJSON_Delete(json);
-                return ok ? send_json(conn, 200, "{\"ok\":true}")
-                          : send_error(conn, 400, "Bad request");
+                return ok ? send_json(conn, 200, "{\"ok\":true}", ctx)
+                          : send_error(conn, 400, "Bad request", ctx);
             }
         }
 
@@ -1518,7 +1542,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             for (int i = 0; i < count; i++) cJSON_AddItemToArray(arr, cJSON_CreateString(names[i]));
             char *js = cJSON_PrintUnformatted(arr);
             cJSON_Delete(arr);
-            enum MHD_Result ret = send_json(conn, 200, js);
+            enum MHD_Result ret = send_json(conn, 200, js, ctx);
             free(js);
             storage_free_list(names, count);
             return ret;
@@ -1528,9 +1552,9 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             const char *cn = ctx->target_url + 16;
             if (cn[0]) {
                 db_auth_remove(g_db, cn);
-                return send_json(conn, 200, "{\"ok\":true}");
+                return send_json(conn, 200, "{\"ok\":true}", ctx);
             }
-            return send_error(conn, 400, "Missing node name");
+            return send_error(conn, 400, "Missing node name", ctx);
         }
 
         if (strcmp(ctx->method, "GET") == 0 &&
@@ -1540,8 +1564,8 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             if (key[0]) {
                 char val[65536] = {0};
                 if (db_config_get(g_db, key, val, sizeof(val)) == ZEP_ERR_OK)
-                    return send_json(conn, 200, val);
-                return send_json(conn, 200, "null");
+                    return send_json(conn, 200, val, ctx);
+                return send_json(conn, 200, "null", ctx);
             }
             cJSON *obj = cJSON_CreateObject();
             sqlite3_stmt *st = NULL;
@@ -1557,7 +1581,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             }
             char *js = cJSON_PrintUnformatted(obj);
             cJSON_Delete(obj);
-            enum MHD_Result ret = send_json(conn, 200, js);
+            enum MHD_Result ret = send_json(conn, 200, js, ctx);
             free(js);
             return ret;
         }
@@ -1567,9 +1591,9 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             const char *key = ctx->target_url + 17;
             if (key[0]) {
                 db_config_set(g_db, key, "");
-                return send_json(conn, 200, "{\"ok\":true}");
+                return send_json(conn, 200, "{\"ok\":true}", ctx);
             }
-            return send_error(conn, 400, "Missing key");
+            return send_error(conn, 400, "Missing key", ctx);
         }
 
         /* ── pipe: admin checks if node is connected (WS-only pipe) ── */
@@ -1577,10 +1601,10 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             strcmp(ctx->target_url, "/v1/admin/pipe") == 0) {
             const char *node_param = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "node");
             if (!node_param || !node_param[0])
-                return send_error(conn, 400, "Missing node parameter");
+                return send_error(conn, 400, "Missing node parameter", ctx);
             if (!node_ws_find(node_param))
-                return send_error(conn, 503, "Node not connected");
-            return send_json(conn, 200, "{\"ok\":true}");
+                return send_error(conn, 503, "Node not connected", ctx);
+            return send_json(conn, 200, "{\"ok\":true}", ctx);
         }
 
         /* ── config set / suspend / resume / promote / rollback / snap ── */
@@ -1589,9 +1613,9 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
             if (strncmp(rest, "config/", 7) == 0) {
                 const char *key = rest + 7;
-                if (!key[0]) return send_error(conn, 400, "Missing key");
+                if (!key[0]) return send_error(conn, 400, "Missing key", ctx);
                 if (g_verbose)
-                    fprintf(stderr, "config set: key=%s body_len=%zu body=%.*s\n",
+                    zep_log( "config set: key=%s body_len=%zu body=%.*s\n",
                             key, ctx->body_len, (int)ctx->body_len, ctx->body);
                 cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
                 if (json) {
@@ -1599,13 +1623,13 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     if (val && cJSON_IsString(val)) {
                         err_t ret = db_config_set(g_db, key, val->valuestring);
                         if (g_verbose)
-                            fprintf(stderr, "config set: db_config_set returned %d\n", ret);
+                            zep_log( "config set: db_config_set returned %d\n", ret);
                     }
                     cJSON_Delete(json);
                 } else if (g_verbose) {
-                    fprintf(stderr, "config set: JSON parse failed\n");
+                    zep_log( "config set: JSON parse failed\n");
                 }
-                return send_json(conn, 200, "{\"ok\":true}");
+                return send_json(conn, 200, "{\"ok\":true}", ctx);
             }
 
             if (strncmp(rest, "suspend", 7) == 0) {
@@ -1622,17 +1646,17 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     else
                         db_set_suspended(g_db, arg, 0);
                     if (st) { sqlite3_step(st); sqlite3_finalize(st); }
-                    return send_json(conn, 200, "{\"ok\":true}");
+                    return send_json(conn, 200, "{\"ok\":true}", ctx);
                 }
                 sqlite3_prepare_v2(g_db,
                     "UPDATE auth SET suspended = 0", -1, &st, NULL);
                 if (st) { sqlite3_step(st); sqlite3_finalize(st); }
-                return send_json(conn, 200, "{\"ok\":true}");
+                return send_json(conn, 200, "{\"ok\":true}", ctx);
             }
 
             if (strncmp(rest, "promote/", 8) == 0) {
                 const char *new_master = rest + 8;
-                if (!new_master[0]) return send_error(conn, 400, "Missing node");
+                if (!new_master[0]) return send_error(conn, 400, "Missing node", ctx);
                 char cluster[64] = {0}, old_master_cn[64] = {0};
                 sqlite3_stmt *st = NULL;
                 sqlite3_prepare_v2(g_db,
@@ -1644,7 +1668,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                  (const char *)sqlite3_column_text(st, 0));
                     sqlite3_finalize(st);
                 }
-                if (!cluster[0]) return send_error(conn, 400, "Node not in any cluster");
+                if (!cluster[0]) return send_error(conn, 400, "Node not in any cluster", ctx);
                 sqlite3_prepare_v2(g_db,
                     "SELECT cn FROM auth WHERE cluster = ? AND role = 'master'",
                     -1, &st, NULL);
@@ -1661,12 +1685,12 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 }
                 db_update_role(g_db, new_master, "master");
                 db_set_suspended(g_db, new_master, 0);
-                return send_json(conn, 200, "{\"ok\":true}");
+                return send_json(conn, 200, "{\"ok\":true}", ctx);
             }
 
             if (strncmp(rest, "rollback/", 9) == 0) {
                 const char *snap = rest + 9;
-                if (!snap[0]) return send_error(conn, 400, "Missing snapshot name");
+                if (!snap[0]) return send_error(conn, 400, "Missing snapshot name", ctx);
                 char key[256];
                 snprintf(key, sizeof(key), "rollback_target");
                 db_config_set(g_db, key, snap);
@@ -1674,42 +1698,42 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 sqlite3_prepare_v2(g_db,
                     "UPDATE auth SET suspended = 1", -1, &st, NULL);
                 if (st) { sqlite3_step(st); sqlite3_finalize(st); }
-                return send_json(conn, 200, "{\"ok\":true}");
+                return send_json(conn, 200, "{\"ok\":true}", ctx);
             }
 
             if (strncmp(rest, "snap/", 5) == 0) {
                 const char *snap_name = rest + 5;
-                if (!snap_name[0]) return send_error(conn, 400, "Missing snapshot name");
+                if (!snap_name[0]) return send_error(conn, 400, "Missing snapshot name", ctx);
                 char key[256];
                 snprintf(key, sizeof(key), "manual_snap_%s", snap_name);
                 db_config_set(g_db, key, "pending");
-                return send_json(conn, 200, "{\"ok\":true}");
+                return send_json(conn, 200, "{\"ok\":true}", ctx);
             }
 
             if (strncmp(rest, "unsnap/", 7) == 0) {
                 const char *snap_name = rest + 7;
-                if (!snap_name[0]) return send_error(conn, 400, "Missing snapshot name");
+                if (!snap_name[0]) return send_error(conn, 400, "Missing snapshot name", ctx);
                 char key[256];
                 snprintf(key, sizeof(key), "manual_snap_%s", snap_name);
                 db_config_set(g_db, key, "");
-                return send_json(conn, 200, "{\"ok\":true}");
+                return send_json(conn, 200, "{\"ok\":true}", ctx);
             }
         }
 
-        return send_error(conn, 404, "Admin endpoint not found");
+        return send_error(conn, 404, "Admin endpoint not found", ctx);
     }
 
     /* ── WebSocket: node persistent connection ── */
     if (strncmp(ctx->target_url, "/v1/ws/node", 11) == 0) {
         const char *cn = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "cn");
-        if (!cn || !cn[0]) return send_error(conn, 400, "Missing cn parameter");
+        if (!cn || !cn[0]) return send_error(conn, 400, "Missing cn parameter", ctx);
         return ws_handle_node(conn, cn);
     }
 
     /* ── WebSocket: admin pipe connection ── */
     if (strncmp(ctx->target_url, "/v1/ws/pipe", 11) == 0) {
         const char *node_cn = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "node");
-        if (!node_cn || !node_cn[0]) return send_error(conn, 400, "Missing node parameter");
+        if (!node_cn || !node_cn[0]) return send_error(conn, 400, "Missing node parameter", ctx);
         return ws_handle_pipe(conn, node_cn);
     }
 
@@ -1788,7 +1812,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                         char last_str[32] = {0};
                                         db_config_get(g_db, cron_key, last_str,
                                                       sizeof(last_str));
-                                        if (g_verbose) fprintf(stderr, "cron/sync: %s = '%s'\n", cron_key, last_str);
+                                        if (g_verbose) zep_log( "cron/sync: %s = '%s'\n", cron_key, last_str);
                                         time_t last = 0;
                                         if (last_str[0]) {
                                             struct tm tm = {0};
@@ -1876,14 +1900,14 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
         char *js = cJSON_PrintUnformatted(tasks);
         cJSON_Delete(tasks);
-        enum MHD_Result ret = send_json(conn, 200, js);
+        enum MHD_Result ret = send_json(conn, 200, js, ctx);
         free(js);
         return ret;
     }
 
     if (strcmp(ctx->method, "POST") == 0 &&
         strcmp(ctx->target_url, "/v1/cron/ack") == 0) {
-        if (g_verbose) fprintf(stderr, "cron/ack: body=%.*s\n", (int)ctx->body_len, (const char *)ctx->body);
+        if (g_verbose) zep_log( "cron/ack: body=%.*s\n", (int)ctx->body_len, (const char *)ctx->body);
         cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
         if (json) {
             cJSON *guid = cJSON_GetObjectItem(json, "guid");
@@ -1926,13 +1950,13 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     struct tm tm;
                     gmtime_r(&tnow, &tm);
                     strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
-                    if (g_verbose) fprintf(stderr, "cron/ack: set %s = %s\n", cron_key, now_str);
+                    if (g_verbose) zep_log( "cron/ack: set %s = %s\n", cron_key, now_str);
                     db_config_set(g_db, cron_key, now_str);
                 }
             }
             cJSON_Delete(json);
         }
-        return send_json(conn, 200, "{\"ok\":true}");
+        return send_json(conn, 200, "{\"ok\":true}", ctx);
     }
 
     if (strcmp(ctx->method, "GET") == 0 &&
@@ -1972,7 +1996,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
         char *js = cJSON_PrintUnformatted(arr);
         cJSON_Delete(arr);
-        enum MHD_Result ret = send_json(conn, 200, js);
+        enum MHD_Result ret = send_json(conn, 200, js, ctx);
         free(js);
         return ret;
     }
@@ -2003,7 +2027,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                         if (asprintf(&fpath, "%smeta.json",
                                      strncmp(base, "file://", 7) == 0 ? base + 7 : base) < 0) {
                             sqlite3_finalize(st);
-                            return send_error(conn, 500, "OOM");
+                            return send_error(conn, 500, "OOM", ctx);
                         }
                         FILE *f = fopen(fpath, "rb");
                         if (f) {
@@ -2019,18 +2043,18 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                             free(fpath);
                             sqlite3_finalize(st);
                             if (body) {
-                                enum MHD_Result r = send_json(conn, 200, body);
+                                enum MHD_Result r = send_json(conn, 200, body, ctx);
                                 free(body);
                                 return r;
                             }
-                            return send_error(conn, 500, "OOM");
+                            return send_error(conn, 500, "OOM", ctx);
                         }
                         free(fpath);
                     }
                 }
                 sqlite3_finalize(st);
             }
-            return send_error(conn, 404, "Snapshot not found");
+            return send_error(conn, 404, "Snapshot not found", ctx);
         }
     }
 
@@ -2081,7 +2105,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                         MHD_destroy_response(resp);
                                         return r;
                                     }
-                                    return send_error(conn, 500, "OOM");
+                                    return send_error(conn, 500, "OOM", ctx);
                                 }
                                 free(fpath);
                             }
@@ -2090,7 +2114,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     sqlite3_finalize(st);
                 }
             }
-            return send_error(conn, 404, "Blob not found");
+            return send_error(conn, 404, "Blob not found", ctx);
         }
     }
 
@@ -2102,12 +2126,12 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 char *path = NULL;
                 if (asprintf(&path, "%s/%s/%s/meta.json",
                              g_storage_root, ctx->node, ctx->prefix) < 0)
-                    return send_error(conn, 500, "OOM");
+                    return send_error(conn, 500, "OOM", ctx);
                 FILE *f = fopen(path, "wb");
                 if (f) {
                     fwrite(ctx->body, 1, ctx->body_len, f);
                     fclose(f);
-                    if (g_verbose) fprintf(stderr, "PUT meta: %s/%s (%zu bytes) body=%.*s\n",
+                    if (g_verbose) zep_log( "PUT meta: %s/%s (%zu bytes) body=%.*s\n",
                                           ctx->prefix, "meta.json", ctx->body_len,
                                           (int)ctx->body_len, (const char *)ctx->body);
                     free(path);
@@ -2140,7 +2164,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                     struct tm tm;
                                     gmtime_r(&tnow, &tm);
                                     strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
-                                    if (g_verbose) fprintf(stderr, "PUT meta: set %s = %s\n", cron_key, now_str);
+                                    if (g_verbose) zep_log( "PUT meta: set %s = %s\n", cron_key, now_str);
                                     db_config_set(g_db, cron_key, now_str);
                                 } else if (g_verbose) {
                                     printf("PUT meta: no cluster for node '%s'\n", ctx->node);
@@ -2150,7 +2174,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                         }
                     }
 
-                    if (g_verbose) fprintf(stderr, "PUT meta: calling verify_snapshot(%s, %s)\n",
+                    if (g_verbose) zep_log( "PUT meta: calling verify_snapshot(%s, %s)\n",
                                           ctx->node, ctx->prefix);
                     {
                         char base[ZEP_MAX_PATH * 2 + 128];
@@ -2158,22 +2182,22 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                  g_storage_root, ctx->node, ctx->prefix);
                         verify_snapshot(ctx->node, ctx->prefix, base);
                     }
-                    return send_json(conn, 200, "{\"ok\":true}");
+                    return send_json(conn, 200, "{\"ok\":true}", ctx);
                 }
                 free(path);
-                return send_error(conn, 500, "Failed to write meta.json");
+                return send_error(conn, 500, "Failed to write meta.json", ctx);
             }
 
             int part = atoi(ctx->file);
             char *path = NULL;
             if (asprintf(&path, "%s/%s/%s/%04d",
                          g_storage_root, ctx->node, ctx->prefix, part) < 0)
-                return send_error(conn, 500, "OOM");
+                return send_error(conn, 500, "OOM", ctx);
             FILE *f = fopen(path, "wb");
             if (f) {
                 fwrite(ctx->body, 1, ctx->body_len, f);
                 fclose(f);
-                if (g_verbose) fprintf(stderr, "PUT blob: %s/%04d (%zu bytes)\n",
+                if (g_verbose) zep_log( "PUT blob: %s/%04d (%zu bytes)\n",
                                        ctx->prefix, part, ctx->body_len);
                 free(path);
                 {
@@ -2182,17 +2206,17 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                              g_storage_root, ctx->node, ctx->prefix);
                     verify_snapshot(ctx->node, ctx->prefix, base);
                 }
-                return send_json(conn, 200, "{\"ok\":true}");
+                return send_json(conn, 200, "{\"ok\":true}", ctx);
             }
             free(path);
-            return send_error(conn, 500, "Failed to write blob");
+            return send_error(conn, 500, "Failed to write blob", ctx);
         }
-        return send_error(conn, 400, "Bad request");
+        return send_error(conn, 400, "Bad request", ctx);
     }
 
     if (strcmp(ctx->method, "GET") == 0) {
         if (strcmp(ctx->target_url, "/health") == 0) {
-            return send_response(conn, 200, "text/plain", "ok", 2);
+            return send_response(conn, 200, "text/plain", "ok", 2, ctx);
         }
 
         if (ctx->parsed == 1 && ctx->node[0] && !ctx->prefix[0]) {
@@ -2213,7 +2237,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             pos += (size_t)snprintf(json + pos, cap - pos, "]\n");
             storage_free_list(prefixes, count);
 
-            enum MHD_Result ret = send_json(conn, 200, json);
+            enum MHD_Result ret = send_json(conn, 200, json, ctx);
             free(json);
             return ret;
         }
@@ -2223,18 +2247,18 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             if (strcmp(ctx->file, "meta.json") == 0) {
                 if (asprintf(&path, "%s/%s/%s/meta.json",
                              g_storage_root, ctx->node, ctx->prefix) < 0)
-                    return send_error(conn, 500, "OOM");
+                    return send_error(conn, 500, "OOM", ctx);
             } else {
                 int part = atoi(ctx->file);
                 if (asprintf(&path, "%s/%s/%s/%04d",
                              g_storage_root, ctx->node, ctx->prefix, part) < 0)
-                    return send_error(conn, 500, "OOM");
+                    return send_error(conn, 500, "OOM", ctx);
             }
 
             size_t flen = 0;
             char *data = read_file(path, &flen);
             free(path);
-            if (!data) return send_error(conn, 404, "Not found");
+            if (!data) return send_error(conn, 404, "Not found", ctx);
 
             const char *ctype = strstr(ctx->file, ".json") ? "application/json"
                                                            : "application/octet-stream";
@@ -2246,10 +2270,10 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             MHD_destroy_response(resp);
             return ret;
         }
-        return send_error(conn, 404, "Not found");
+        return send_error(conn, 404, "Not found", ctx);
     }
 
-    return send_error(conn, 405, "Method not allowed");
+    return send_error(conn, 405, "Method not allowed", ctx);
 }
 
 static void sig_handler(int sig) {
@@ -2300,19 +2324,19 @@ static int load_pem(const char *path, char **data) {
 }
 
 static void usage_serve(const char *prog) {
-    fprintf(stderr, "Usage: %s [options]\n", prog);
-    fprintf(stderr, "  -p, --port PORT       Listen port (default: 8443)\n");
-    fprintf(stderr, "  -s, --storage DIR     Storage directory (default: /var/lib/zep-air)\n");
-    fprintf(stderr, "  -c, --cert FILE       TLS server certificate (PEM)\n");
-    fprintf(stderr, "  -k, --key FILE        TLS server private key (PEM)\n");
-    fprintf(stderr, "  -a, --ca FILE         CA certificate for client auth (optional)\n");
-    fprintf(stderr, "  -D, --db FILE         SQLite database path (default: /var/lib/zep-air/zep-air.db)\n");
-    fprintf(stderr, "  -S, --setup           Run setup mode: store CA + server + admin certs in DB, then exit\n");
-    fprintf(stderr, "  -A, --admin-cert      Admin client certificate for setup mode (PEM)\n");
-    fprintf(stderr, "  -P, --password PASS   Password for encrypted private keys\n");
-    fprintf(stderr, "  -N, --no-tls          Disable TLS (plain HTTP, for WS debugging)\n");
-    fprintf(stderr, "  -v, --verbose         Verbose output\n");
-    fprintf(stderr, "  -h, --help            This help\n");
+    zep_log( "Usage: %s [options]\n", prog);
+    zep_log( "  -p, --port PORT       Listen port (default: 8443)\n");
+    zep_log( "  -s, --storage DIR     Storage directory (default: /var/lib/zep-air)\n");
+    zep_log( "  -c, --cert FILE       TLS server certificate (PEM)\n");
+    zep_log( "  -k, --key FILE        TLS server private key (PEM)\n");
+    zep_log( "  -a, --ca FILE         CA certificate for client auth (optional)\n");
+    zep_log( "  -D, --db FILE         SQLite database path (default: /var/lib/zep-air/zep-air.db)\n");
+    zep_log( "  -S, --setup           Run setup mode: store CA + server + admin certs in DB, then exit\n");
+    zep_log( "  -A, --admin-cert      Admin client certificate for setup mode (PEM)\n");
+    zep_log( "  -P, --password PASS   Password for encrypted private keys\n");
+    zep_log( "  -N, --no-tls          Disable TLS (plain HTTP, for WS debugging)\n");
+    zep_log( "  -v, --verbose         Verbose output\n");
+    zep_log( "  -h, --help            This help\n");
 }
 
 int serve_main(int argc, char *argv[]) {
@@ -2355,7 +2379,7 @@ int serve_main(int argc, char *argv[]) {
 
     if (g_setup_mode) {
         if (!g_cert_path[0] || !g_ca_path[0] || !g_admin_cert_path[0]) {
-            fprintf(stderr, "error: --setup requires --cert, --key, --ca, and --admin-cert\n");
+            zep_log( "error: --setup requires --cert, --key, --ca, and --admin-cert\n");
             return 1;
         }
         if (load_pem(g_cert_path, &cert_pem) != 0) return 1;
@@ -2418,7 +2442,7 @@ int serve_main(int argc, char *argv[]) {
             }
         }
         if (!admin) {
-            fprintf(stderr, "error: failed to load admin cert from %s\n", g_admin_cert_path);
+            zep_log( "error: failed to load admin cert from %s\n", g_admin_cert_path);
             db_close(g_db);
             free(cert_pem); free(key_pem); free(ca_pem);
             return 1;
@@ -2443,7 +2467,7 @@ int serve_main(int argc, char *argv[]) {
 
     if (!g_no_tls) {
         if (!g_cert_path[0] || !g_key_path[0]) {
-            fprintf(stderr, "error: --cert and --key are required (or use --no-tls)\n");
+            zep_log( "error: --cert and --key are required (or use --no-tls)\n");
             return 1;
         }
 
@@ -2508,7 +2532,7 @@ int serve_main(int argc, char *argv[]) {
     free(ca_pem);
 
     if (!g_daemon) {
-        fprintf(stderr, "Failed to start HTTPS server\n");
+        zep_log( "Failed to start HTTPS server\n");
         return 1;
     }
 

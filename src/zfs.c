@@ -27,7 +27,7 @@ err_t zfs_snapshot_create(const char *fs, const char *label, char *out_name, siz
     if (fread(errbuf, 1, sizeof(errbuf) - 1, p) == 0 && ferror(p)) {}
     int rc = pclose(p);
     if (rc != 0) {
-        fprintf(stderr, "zfs snapshot failed: %s\n", errbuf);
+        zep_log( "zfs snapshot failed: %s\n", errbuf);
         return ZEP_ERR_ZFS;
     }
     return ZEP_ERR_OK;
@@ -53,7 +53,7 @@ err_t zfs_snapshot_create_cluster(const char *fs, const char *cluster,
     if (fread(errbuf, 1, sizeof(errbuf) - 1, p) == 0 && ferror(p)) {}
     int rc = pclose(p);
     if (rc != 0) {
-        fprintf(stderr, "zfs snapshot failed: %s\n", errbuf);
+        zep_log( "zfs snapshot failed: %s\n", errbuf);
         return ZEP_ERR_ZFS;
     }
     return ZEP_ERR_OK;
@@ -96,7 +96,7 @@ void zfs_send_close(FILE *fp) {
     if (fp) {
         int rc = pclose(fp);
         if (rc != 0) {
-            fprintf(stderr, "warning: zfs send exited with code %d\n", rc);
+            zep_log( "warning: zfs send exited with code %d\n", rc);
         }
     }
 }
@@ -136,7 +136,7 @@ void zfs_recv_close(FILE *fp) {
     if (fp) {
         int rc = pclose(fp);
         if (rc != 0) {
-            fprintf(stderr, "warning: zfs recv exited with code %d\n", rc);
+            zep_log( "warning: zfs recv exited with code %d\n", rc);
         }
     }
 }
@@ -202,7 +202,7 @@ err_t zfs_destroy_snapshot(const char *snapshot) {
     if (fread(errbuf, 1, sizeof(errbuf) - 1, p) == 0 && ferror(p)) {}
     int rc = pclose(p);
     if (rc != 0) {
-        fprintf(stderr, "zfs destroy failed: %s\n", errbuf);
+        zep_log( "zfs destroy failed: %s\n", errbuf);
         return ZEP_ERR_ZFS;
     }
     return ZEP_ERR_OK;

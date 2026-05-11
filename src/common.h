@@ -75,4 +75,13 @@ static inline uint32_t zep_invert_ts(time_t t) {
     return (uint32_t)(ZEP_MAX_UINT32 - (uint64_t)t);
 }
 
+#define zep_log(fmt, ...) do { \
+    time_t _zt = time(NULL); \
+    struct tm _ztm; \
+    localtime_r(&_zt, &_ztm); \
+    char _zts[32]; \
+    strftime(_zts, sizeof(_zts), "%Y-%m-%dT%H:%M:%S", &_ztm); \
+    fprintf(stderr, "[%s] " fmt, _zts, ##__VA_ARGS__); \
+} while(0)
+
 #endif

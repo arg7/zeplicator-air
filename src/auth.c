@@ -93,13 +93,13 @@ err_t auth_verify_client(sqlite3 *db, X509 *client_cert,
 
     char *cn = auth_extract_cn(client_cert);
     if (!cn) {
-        fprintf(stderr, "auth: failed to extract CN from client cert\n");
+        zep_log( "auth: failed to extract CN from client cert\n");
         return ZEP_ERR_CERT;
     }
 
     char *fp = auth_cert_fingerprint(client_cert);
     if (!fp) {
-        fprintf(stderr, "auth: failed to compute fingerprint\n");
+        zep_log( "auth: failed to compute fingerprint\n");
         free(cn);
         return ZEP_ERR_CERT;
     }
@@ -109,7 +109,7 @@ err_t auth_verify_client(sqlite3 *db, X509 *client_cert,
 
     if (ret == ZEP_ERR_OK) {
         if (strcasecmp(fp, stored_fp) != 0) {
-            fprintf(stderr, "auth: fingerprint mismatch for CN=%s  (got=%s)\n", cn, fp);
+            zep_log( "auth: fingerprint mismatch for CN=%s  (got=%s)\n", cn, fp);
             free(cn); free(fp);
             return ZEP_ERR_CERT;
         }
@@ -124,7 +124,7 @@ err_t auth_verify_client(sqlite3 *db, X509 *client_cert,
             }
             BIO_free(bio);
         }
-        if (g_verbose) fprintf(stderr, "auth: registered new cert CN=%s fp=%s\n", cn, fp);
+        if (g_verbose) zep_log( "auth: registered new cert CN=%s fp=%.4s\n", cn, fp);
     }
 
     snprintf(node_name, len, "%s", cn);
@@ -143,7 +143,7 @@ err_t auth_verify_server_cert(X509 *server_cert, const char *expected_fqdn,
         return ZEP_ERR_CERT;
 
     if (verify_ca_signature(server_cert, store) != 0) {
-        fprintf(stderr, "auth: server cert not signed by trusted CA\n");
+        zep_log( "auth: server cert not signed by trusted CA\n");
         X509_STORE_free(store);
         return ZEP_ERR_CERT;
     }
@@ -153,7 +153,7 @@ err_t auth_verify_server_cert(X509 *server_cert, const char *expected_fqdn,
     if (!cn) return ZEP_ERR_CERT;
 
     if (strcmp(cn, expected_fqdn) != 0) {
-        fprintf(stderr, "auth: CN mismatch: expected=%s got=%s\n",
+        zep_log( "auth: CN mismatch: expected=%s got=%s\n",
                 expected_fqdn, cn);
         free(cn);
         return ZEP_ERR_CERT;

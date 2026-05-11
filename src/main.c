@@ -143,11 +143,11 @@ static int ws_node_send_frame(struct ws_node_conn *c, unsigned char opcode,
                                const unsigned char *payload, size_t payload_len) {
     unsigned char frame[WS_NODE_FRAME_MAX + 14];
     size_t flen = ws_node_build_frame(frame, sizeof(frame), opcode, payload, payload_len);
-    if (flen == 0) { fprintf(stderr, "ws-node: build_frame failed\n"); return -1; }
+    if (flen == 0) { zep_log( "ws-node: build_frame failed\n"); return -1; }
     int ret = ws_node_write(c, frame, (int)flen);
-    if (g_verbose) fprintf(stderr, "ws-node: write opcode=0x%02x flen=%zu ret=%d\n", opcode, flen, ret);
+    if (g_verbose) zep_log( "ws-node: write opcode=0x%02x flen=%zu ret=%d\n", opcode, flen, ret);
     if (ret <= 0) {
-        fprintf(stderr, "ws-node: write error errno=%d\n", errno);
+        zep_log( "ws-node: write error errno=%d\n", errno);
         return -1;
     }
     return 0;
@@ -282,12 +282,12 @@ static void *ws_node_pipe_thread(void *arg) {
         char ws_path[256];
         snprintf(ws_path, sizeof(ws_path), "/v1/ws/node?cn=%s", cfg->node_name);
 
-        if (g_verbose) fprintf(stderr, "ws-node: connecting to %s%s\n", cfg->server_url, ws_path);
+        if (g_verbose) zep_log( "ws-node: connecting to %s%s\n", cfg->server_url, ws_path);
 
         struct ws_node_conn *conn = ws_node_connect(cfg->server_url, cfg->cert_path, cfg->key_path,
                                     cfg->ca_path, cfg->key_password, ws_path);
         if (!conn) {
-            if (g_verbose) fprintf(stderr, "ws-node: connect failed, retrying in 5s\n");
+            if (g_verbose) zep_log( "ws-node: connect failed, retrying in 5s\n");
             sleep(5);
             continue;
         }
@@ -302,8 +302,8 @@ static void *ws_node_pipe_thread(void *arg) {
             ssize_t n = ws_node_recv_frame(conn, out, WS_NODE_FRAME_MAX, &buf[0]);
             unsigned char opcode = buf[0] & 0x0F;
 
-            if (n < 0) { if (g_verbose) fprintf(stderr, "ws-node: recv error, reconnecting\n"); break; }
-            if (opcode == WS_NODE_OP_CLOSE) { if (g_verbose) fprintf(stderr, "ws-node: close\n"); break; }
+            if (n < 0) { if (g_verbose) zep_log( "ws-node: recv error, reconnecting\n"); break; }
+            if (opcode == WS_NODE_OP_CLOSE) { if (g_verbose) zep_log( "ws-node: close\n"); break; }
             if (opcode == WS_NODE_OP_PING) { ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)n); continue; }
             if (opcode == WS_NODE_OP_PONG) continue;
             if (opcode == WS_NODE_OP_EOF) continue;
@@ -352,7 +352,7 @@ static void *ws_node_pipe_thread(void *arg) {
                                 pid_t pid = forkpty(&pty_master, NULL, NULL, NULL);
                                 if (pid < 0) {
                                     free(cmd_copy);
-                                    fprintf(stderr, "ws-node: forkpty() failed\n");
+                                    zep_log( "ws-node: forkpty() failed\n");
                                     cJSON_Delete(task);
                                     continue;
                                 }
@@ -372,7 +372,7 @@ static void *ws_node_pipe_thread(void *arg) {
                                 int pty_alive = 1;
                                 int ws_alive = 1;
 
-                                if (g_verbose) fprintf(stderr, "ws-node: interactive pipe started: %s pid=%d\n", cmd_str, (int)pid);
+                                if (g_verbose) zep_log( "ws-node: interactive pipe started: %s pid=%d\n", cmd_str, (int)pid);
 
                                 int ws_fd = conn->sock;
                                 int ws_flags = fcntl(ws_fd, F_GETFL, 0);
@@ -455,7 +455,7 @@ static void *ws_node_pipe_thread(void *arg) {
                                 close(pty_master);
                                 int status = 0;
                                 waitpid(pid, &status, 0);
-                                if (g_verbose) fprintf(stderr, "ws-node: interactive pipe done, child exit=%d\n", WEXITSTATUS(status));
+                                if (g_verbose) zep_log( "ws-node: interactive pipe done, child exit=%d\n", WEXITSTATUS(status));
                                 {
                                     unsigned char exit_byte = (unsigned char)WEXITSTATUS(status);
                                     ws_node_send_frame(conn, WS_NODE_OP_EXIT, &exit_byte, 1);
@@ -466,7 +466,7 @@ static void *ws_node_pipe_thread(void *arg) {
 
                             int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2];
                             if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
-                                fprintf(stderr, "ws-node: pipe() failed\n");
+                                zep_log( "ws-node: pipe() failed\n");
                                 cJSON_Delete(task);
                                 continue;
                             }
@@ -474,7 +474,7 @@ static void *ws_node_pipe_thread(void *arg) {
                             pid_t pid = fork();
                             if (pid < 0) {
                                 free(cmd_copy);
-                                fprintf(stderr, "ws-node: fork() failed\n");
+                                zep_log( "ws-node: fork() failed\n");
                                 close(stdin_pipe[0]); close(stdin_pipe[1]);
                                 close(stdout_pipe[0]); close(stdout_pipe[1]);
                                 close(stderr_pipe[0]); close(stderr_pipe[1]);
@@ -518,7 +518,7 @@ static void *ws_node_pipe_thread(void *arg) {
                             unsigned char *pending_data = NULL;
                             ssize_t pending_len = 0;
 
-                            if (g_verbose) fprintf(stderr, "ws-node: pipe started: %s pid=%d\n", cmd_str, (int)pid);
+                            if (g_verbose) zep_log( "ws-node: pipe started: %s pid=%d\n", cmd_str, (int)pid);
 
                             int ws_fd = conn->sock;
                             int ws_flags = fcntl(ws_fd, F_GETFL, 0);
@@ -630,7 +630,7 @@ static void *ws_node_pipe_thread(void *arg) {
 
                             int status = 0;
                             waitpid(pid, &status, 0);
-                            if (g_verbose) fprintf(stderr, "ws-node: pipe done, child exit=%d\n", WEXITSTATUS(status));
+                            if (g_verbose) zep_log( "ws-node: pipe done, child exit=%d\n", WEXITSTATUS(status));
                             {
                                 unsigned char exit_byte = (unsigned char)WEXITSTATUS(status);
                                 ws_node_send_frame(conn, WS_NODE_OP_EXIT, &exit_byte, 1);
@@ -652,7 +652,7 @@ static void *ws_node_pipe_thread(void *arg) {
 }
 
 static void usage(const char *prog) {
-    fprintf(stderr,
+    zep_log(
         "Zeplicator Air v%s — air-gapped ZFS replication\n"
         "\n"
         "Usage: %s <command> [options]\n"
@@ -732,7 +732,7 @@ static int cmd_push(int argc, char *argv[]) {
     }
 
     if (!label[0]) {
-        fprintf(stderr, "error: --label is required\n");
+        zep_log( "error: --label is required\n");
         return 1;
     }
 
@@ -764,7 +764,7 @@ static int cmd_push(int argc, char *argv[]) {
                 err_t ret = pipeline_push(&cfg, &http_cfg, local_fs, label, NULL);
                 if (ret == ZEP_ERR_OK) pushed++;
             } else {
-                fprintf(stderr, "push: no mapping for '%s'\n", argv[i]);
+                zep_log( "push: no mapping for '%s'\n", argv[i]);
             }
         }
     } else if (cfg.mapping[0]) {
@@ -786,7 +786,7 @@ static int cmd_push(int argc, char *argv[]) {
             p = comma ? comma + 1 : colon + strlen(colon);
         }
     } else {
-        fprintf(stderr, "error: no filesystem specified (use -f, positional args, or configure mapping)\n");
+        zep_log( "error: no filesystem specified (use -f, positional args, or configure mapping)\n");
         db_close(db);
         return 1;
     }
@@ -830,7 +830,7 @@ static int cmd_pull(int argc, char *argv[]) {
     }
 
     if (!filesystem[0] && optind >= argc && !cfg.mapping[0]) {
-        fprintf(stderr, "error: no filesystem specified (use -f, positional args, or configure mapping)\n");
+        zep_log( "error: no filesystem specified (use -f, positional args, or configure mapping)\n");
         db_close(db);
         return 1;
     }
@@ -856,7 +856,7 @@ static int cmd_pull(int argc, char *argv[]) {
                 err_t ret = pipeline_pull(&cfg, &http_cfg, local_fs, donor);
                 if (ret == ZEP_ERR_OK) pulled++;
             } else {
-                fprintf(stderr, "pull: no mapping for '%s'\n", argv[i]);
+                zep_log( "pull: no mapping for '%s'\n", argv[i]);
             }
         }
     } else if (cfg.mapping[0]) {
@@ -906,7 +906,7 @@ static int cmd_snap(int argc, char *argv[]) {
         }
     }
     if (!label[0]) {
-        fprintf(stderr, "error: --label is required\n");
+        zep_log( "error: --label is required\n");
         return 1;
     }
 
@@ -938,7 +938,7 @@ static int cmd_snap(int argc, char *argv[]) {
                     created++;
                 }
             } else {
-                fprintf(stderr, "snap: no mapping for '%s'\n", argv[i]);
+                zep_log( "snap: no mapping for '%s'\n", argv[i]);
             }
         }
     } else if (cfg.mapping[0]) {
@@ -965,7 +965,7 @@ static int cmd_snap(int argc, char *argv[]) {
             p = comma ? comma + 1 : colon + strlen(colon);
         }
     } else {
-        fprintf(stderr, "error: no filesystem specified\n");
+        zep_log( "error: no filesystem specified\n");
         db_close(db);
         return 1;
     }
@@ -1060,7 +1060,7 @@ static int cmd_rotate(int argc, char *argv[]) {
         }
     }
 
-    if (!p) { fprintf(stderr, "rotate: no filesystem specified\n"); db_close(db); return 1; }
+    if (!p) { zep_log( "rotate: no filesystem specified\n"); db_close(db); return 1; }
 
     /* list snapshots for the fs */
     char cmd[1024];
@@ -1198,7 +1198,7 @@ static int cmd_cron(int argc, char *argv[]) {
             memcpy(tcfg, &cfg, sizeof(*tcfg));
             pthread_create(&g_ws_tid, NULL, ws_node_pipe_thread, (void *)tcfg);
             pthread_detach(g_ws_tid);
-            if (g_verbose) fprintf(stderr, "cron: WS pipe listener started for %s\n", cfg.node_name);
+            if (g_verbose) zep_log( "cron: WS pipe listener started for %s\n", cfg.node_name);
         }
     }
 
@@ -1279,7 +1279,7 @@ static int cmd_cron(int argc, char *argv[]) {
                             http_post_json(&http_cfg, "/v1/cron/ack", body);
                         }
                     } else {
-                        fprintf(stderr, "cron: resolve_fs FAILED for cfs=%s\n", cfs->valuestring);
+                        zep_log( "cron: resolve_fs FAILED for cfs=%s\n", cfs->valuestring);
                     }
                     db_close(db);
                 }
@@ -1298,7 +1298,7 @@ static int cmd_cron(int argc, char *argv[]) {
 
 static int cmd_config(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: zep-air config <set|get|list> [args]\n");
+        zep_log( "Usage: zep-air config <set|get|list> [args]\n");
         return 1;
     }
 
@@ -1311,11 +1311,11 @@ static int cmd_config(int argc, char *argv[]) {
 
     if (strcmp(sub, "set") == 0) {
         if (argc < 4) {
-            fprintf(stderr, "Usage: zep-air config set KEY VALUE\n");
+            zep_log( "Usage: zep-air config set KEY VALUE\n");
             rc = 1;
         } else {
             if (db_config_set(db, argv[2], argv[3]) != ZEP_ERR_OK) {
-                fprintf(stderr, "Failed to set config\n");
+                zep_log( "Failed to set config\n");
                 rc = 1;
             } else {
                 printf("Set %s = %s\n", argv[2], argv[3]);
@@ -1323,7 +1323,7 @@ static int cmd_config(int argc, char *argv[]) {
         }
     } else if (strcmp(sub, "get") == 0) {
         if (argc < 3) {
-            fprintf(stderr, "Usage: zep-air config get KEY\n");
+            zep_log( "Usage: zep-air config get KEY\n");
             rc = 1;
         } else {
             char value[512] = {0};
@@ -1346,7 +1346,7 @@ static int cmd_config(int argc, char *argv[]) {
     } else if (strcmp(sub, "--help") == 0 || strcmp(sub, "-h") == 0) {
         printf("Usage: zep-air config <set|get|list> [args]\n");
     } else {
-        fprintf(stderr, "Unknown config command: %s\n", sub);
+        zep_log( "Unknown config command: %s\n", sub);
         rc = 1;
     }
 
@@ -1426,7 +1426,7 @@ int main(int argc, char *argv[]) {
     if (strcmp(cmd, "config") == 0) return cmd_config(sub_argc, sub_argv);
     if (strcmp(cmd, "status") == 0) return cmd_status(sub_argc, sub_argv);
 
-    fprintf(stderr, "Unknown command: %s\n", cmd);
+    zep_log( "Unknown command: %s\n", cmd);
     usage(argv2[0]);
     return 1;
 }
