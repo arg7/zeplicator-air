@@ -52,14 +52,14 @@ static CURL *http_init(const http_config_t *cfg, const char *url,
     return curl;
 }
 
-static int http_do(CURL *curl) {
+static int http_do(CURL *curl, int keep) {
     CURLcode rc = curl_easy_perform(curl);
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     char *eff_url = NULL;
     curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &eff_url);
     zep_log("http: %ld %s\n", http_code, eff_url ? eff_url : "?");
-    curl_easy_cleanup(curl);
+    if (!keep) curl_easy_cleanup(curl);
     if (rc != CURLE_OK) {
         zep_log( "http: %s\n", curl_easy_strerror(rc));
         return ZEP_ERR_NETWORK;
@@ -69,6 +69,44 @@ static int http_do(CURL *curl) {
         return ZEP_ERR_NETWORK;
     }
     return ZEP_ERR_OK;
+}
+
+err_t http_persistent_start(http_config_t *cfg) {
+    if (cfg->curl) http_persistent_stop(cfg);
+    cfg->curl = curl_easy_init();
+    if (!cfg->curl) return ZEP_ERR_NETWORK;
+    curl_easy_setopt(cfg->curl, CURLOPT_SSLCERT, cfg->cert_path);
+    curl_easy_setopt(cfg->curl, CURLOPT_SSLKEY, cfg->key_path[0] ? cfg->key_path : cfg->cert_path);
+    curl_easy_setopt(cfg->curl, CURLOPT_CAINFO, cfg->ca_path);
+    curl_easy_setopt(cfg->curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(cfg->curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(cfg->curl, CURLOPT_TIMEOUT, 120L);
+    curl_easy_setopt(cfg->curl, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(cfg->curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(cfg->curl, CURLOPT_KEEP_SENDING_ON_ERROR, 1L);
+    if (cfg->key_password[0])
+        curl_easy_setopt(cfg->curl, CURLOPT_KEYPASSWD, cfg->key_password);
+    return ZEP_ERR_OK;
+}
+
+void http_persistent_stop(http_config_t *cfg) {
+    if (cfg->curl) { curl_easy_cleanup(cfg->curl); cfg->curl = NULL; }
+}
+
+static CURL *http_reuse(http_config_t *cfg, const char *url, struct resp_buf *rb) {
+    if (cfg->curl) {
+        curl_easy_setopt(cfg->curl, CURLOPT_URL, url);
+        curl_easy_setopt(cfg->curl, CURLOPT_WRITEFUNCTION, write_cb);
+        curl_easy_setopt(cfg->curl, CURLOPT_WRITEDATA, rb);
+        curl_easy_setopt(cfg->curl, CURLOPT_HTTPGET, 1L);
+        curl_easy_setopt(cfg->curl, CURLOPT_POSTFIELDS, NULL);
+        curl_easy_setopt(cfg->curl, CURLOPT_POSTFIELDSIZE, 0L);
+        curl_easy_setopt(cfg->curl, CURLOPT_CUSTOMREQUEST, NULL);
+        curl_easy_setopt(cfg->curl, CURLOPT_UPLOAD, 0L);
+        curl_easy_setopt(cfg->curl, CURLOPT_NOBODY, 0L);
+        return cfg->curl;
+    }
+    return NULL;
 }
 
 err_t http_put_blob(const http_config_t *cfg, const char *node,
@@ -94,7 +132,7 @@ err_t http_put_blob(const http_config_t *cfg, const char *node,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
 
-    int rc = http_do(curl);
+    int rc = http_do(curl, 0);
     free(rb.data);
     return rc;
 }
@@ -139,7 +177,7 @@ err_t http_put_meta(const http_config_t *cfg, const char *node,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, js_str);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
 
-    int rc = http_do(curl);
+    int rc = http_do(curl, 0);
     free(js_str);
     free(rb.data);
     return rc;
@@ -157,7 +195,7 @@ err_t http_get_meta(const http_config_t *cfg, const char *node,
     free(url);
     if (!curl) return ZEP_ERR_NETWORK;
 
-    int rc = http_do(curl);
+    int rc = http_do(curl, 0);
     if (rc != ZEP_ERR_OK) { free(rb.data); return rc; }
 
     /* parse JSON in the same way storage_read_meta does */
@@ -221,7 +259,7 @@ err_t http_get_blob(const http_config_t *cfg, const char *node,
     free(url);
     if (!curl) return ZEP_ERR_NETWORK;
 
-    int rc = http_do(curl);
+    int rc = http_do(curl, 0);
     if (rc != ZEP_ERR_OK || !rb.data) {
         free(rb.data);
         return rc != ZEP_ERR_OK ? rc : ZEP_ERR_STORAGE;
@@ -244,7 +282,7 @@ err_t http_get_blob_by_guid(const http_config_t *cfg, const char *guid,
     free(url);
     if (!curl) return ZEP_ERR_NETWORK;
 
-    int rc = http_do(curl);
+    int rc = http_do(curl, 0);
     if (rc != ZEP_ERR_OK || !rb.data) {
         free(rb.data);
         return rc != ZEP_ERR_OK ? rc : ZEP_ERR_STORAGE;
@@ -267,7 +305,7 @@ err_t http_list_snapshots(const http_config_t *cfg, const char *node,
     free(url);
     if (!curl) return ZEP_ERR_NETWORK;
 
-    int rc = http_do(curl);
+    int rc = http_do(curl, 0);
     if (rc != ZEP_ERR_OK || !rb.data) {
         free(rb.data);
         *count = 0;
@@ -314,11 +352,14 @@ char *http_get_json(const http_config_t *cfg, const char *path) {
         return NULL;
 
     struct resp_buf rb = {0};
-    CURL *curl = http_init(cfg, url, &rb);
+    CURL *curl = http_reuse((http_config_t *)cfg, url, &rb);
+    if (!curl) {
+        curl = http_init(cfg, url, &rb);
+        if (!curl) { free(url); return NULL; }
+    }
     free(url);
-    if (!curl) return NULL;
 
-    int rc = http_do(curl);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
     if (rc != ZEP_ERR_OK || !rb.data) {
         free(rb.data);
         return NULL;
@@ -332,14 +373,17 @@ err_t http_post_json(const http_config_t *cfg, const char *path, const char *bod
         return ZEP_ERR_SYS;
 
     struct resp_buf rb = {0};
-    CURL *curl = http_init(cfg, url, &rb);
+    CURL *curl = http_reuse((http_config_t *)cfg, url, &rb);
+    if (!curl) {
+        curl = http_init(cfg, url, &rb);
+        if (!curl) { free(url); return ZEP_ERR_SYS; }
+    }
     free(url);
-    if (!curl) return ZEP_ERR_NETWORK;
 
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
 
-    int rc = http_do(curl);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
     free(rb.data);
     return rc;
 }
@@ -408,7 +452,7 @@ err_t http_put_pipe_meta(const http_config_t *cfg, const char *session,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
 
-    int rc = http_do(curl);
+    int rc = http_do(curl, 0);
     free(body);
     free(rb.data);
     return rc;
@@ -425,7 +469,7 @@ err_t http_post_pipe_done(const http_config_t *cfg, const char *session) {
     if (!curl) return ZEP_ERR_NETWORK;
 
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "POST");
-    int rc = http_do(curl);
+    int rc = http_do(curl, 0);
     free(rb.data);
     return rc;
 }

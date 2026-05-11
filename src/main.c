@@ -1165,6 +1165,10 @@ static int cmd_cron(int argc, char *argv[]) {
         }
     }
 
+    /* In daemon mode, maintain persistent curl handle for connection reuse */
+    if (daemon_mode)
+        http_persistent_start(&http_cfg);
+
     do {
         char *json = http_get_json(&http_cfg, "/v1/cron/sync");
         if (!json) {
@@ -1408,6 +1412,9 @@ static int cmd_cron(int argc, char *argv[]) {
                 sleep(1);
         }
     } while (daemon_mode && g_daemon_running);
+
+    if (daemon_mode)
+        http_persistent_stop(&http_cfg);
 
     return 0;
 }

@@ -5,12 +5,13 @@
 
 #include "common.h"
 
-typedef struct {
+typedef struct http_config {
     char server_url[512];
     char cert_path[ZEP_MAX_PATH];
     char key_path[ZEP_MAX_PATH];
     char ca_path[ZEP_MAX_PATH];
     char key_password[128];
+    void *curl;  /* CURL * persistent handle for daemon mode */
 } http_config_t;
 
 err_t http_put_blob(const http_config_t *cfg, const char *node,
@@ -29,6 +30,9 @@ err_t http_list_snapshots(const http_config_t *cfg, const char *node,
                           int limit, char ***prefixes, int *count);
 char *http_get_json(const http_config_t *cfg, const char *path);
 err_t http_post_json(const http_config_t *cfg, const char *path, const char *body);
+
+err_t http_persistent_start(http_config_t *cfg);
+void http_persistent_stop(http_config_t *cfg);
 
 err_t http_put_pipe_meta(const http_config_t *cfg, const char *session, uint64_t size);
 err_t http_put_pipe_chunk(const http_config_t *cfg, const char *session,
