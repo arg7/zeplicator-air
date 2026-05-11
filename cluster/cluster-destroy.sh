@@ -116,7 +116,18 @@ if [[ "$KEEP_POOLS" -ne 1 && -n "${ZFS_POOLS:-}" ]]; then
 fi
 
 ###############################################################################
-# 5. Remove data directory
+# 5. Remove node user accounts
+###############################################################################
+say "Removing node user accounts ..."
+for entry in ${NODES:-}; do
+    IFS=':' read -r cn role poolfs <<< "$entry"
+    if id "$cn" &>/dev/null 2>&1; then
+        userdel -r "$cn" 2>/dev/null && say "  Removed user: $cn" || warn "  Could not remove user: $cn"
+    fi
+done
+
+###############################################################################
+# 6. Remove data directory
 ###############################################################################
 if [[ -d "$ZEP_BASE" ]]; then
     say "Removing ${ZEP_BASE} ..."
@@ -124,7 +135,7 @@ if [[ -d "$ZEP_BASE" ]]; then
 fi
 
 ###############################################################################
-# 6. Remove hosts entries
+# 7. Remove hosts entries
 ###############################################################################
 if [[ -n "${SERVER_HOST:-}" ]]; then
     say "Removing /etc/hosts entry for ${SERVER_HOST} ..."
