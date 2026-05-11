@@ -262,6 +262,7 @@ static ws_conn_t *ws_connect(const char *server_url, const char *path) {
 
         ssl = SSL_new(ctx);
         SSL_set_fd(ssl, sock);
+        SSL_set_cipher_list(ssl, "AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-SHA256:AES128-SHA256");
         if (SSL_connect(ssl) <= 0) {
             if (g_verbose) fprintf(stderr, "ws: SSL_connect failed\n");
             SSL_free(ssl); SSL_CTX_free(ctx); close(sock); return NULL;
