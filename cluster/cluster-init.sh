@@ -274,6 +274,9 @@ JSONEOF
     done
     kill -9 "$SERV_PID" 2>/dev/null || true
     say "Server stopped (temporary)."
+
+    # Fix storage permissions: temp server ran as root, created subdirs owned by root
+    sudo chown -R "${OWNER}:${OWNER}" "${SERVER_STORAGE}" 2>/dev/null || true
 fi
 
 ###############################################################################
@@ -283,6 +286,7 @@ say "Configuring node databases ..."
 for entry in ${NODES:-}; do
     IFS=':' read -r cn role poolfs <<< "$entry"
     node_db="${ZEP_BASE}/home/${cn}/${cn}.db"
+    sudo mkdir -p "$(dirname "$node_db")" 2>/dev/null || true
     rm -f "$node_db"
 
     "$ZEP" --db "$node_db" config set node_name  "$cn"
@@ -304,6 +308,7 @@ rm -f "$admin_db"
 "$ZEP" --db "$admin_db" config set key_path      "${PKI_DIR}/admin.key"
 "$ZEP" --db "$admin_db" config set ca_path       "${PKI_DIR}/ca.crt"
 [[ -z "${KEY_PASSWORD:-}" ]] || "$ZEP" --db "$admin_db" config set key_password "$KEY_PASSWORD"
+chown "${OWNER}:${OWNER}" "$admin_db" 2>/dev/null || true
 
 ###############################################################################
 # 8. Generate cluster.env for cluster-ctl.sh / cluster-destroy.sh
