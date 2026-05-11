@@ -1742,27 +1742,73 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         strcmp(ctx->target_url, "/v1/cron/sync") == 0) {
         cJSON *tasks = cJSON_CreateArray();
 
-        char role[16] = {0}, cluster_name[64] = {0};
+        char role[16] = {0}, cluster_name[64] = {0}, last_err[256] = {0};
         int suspended = 0;
         if (ctx->node[0]) {
             sqlite3_stmt *st = NULL;
             sqlite3_prepare_v2(g_db,
-                "SELECT role, cluster, suspended FROM auth WHERE cn = ?",
+                "SELECT role, cluster, suspended, last_err FROM auth WHERE cn = ?",
                 -1, &st, NULL);
             if (st) {
                 sqlite3_bind_text(st, 1, ctx->node, -1, SQLITE_STATIC);
                 if (sqlite3_step(st) == SQLITE_ROW) {
                     const char *r = (const char *)sqlite3_column_text(st, 0);
                     const char *c = (const char *)sqlite3_column_text(st, 1);
+                    const char *le = (const char *)sqlite3_column_text(st, 3);
                     suspended = sqlite3_column_int(st, 2);
                     snprintf(role, sizeof(role), "%s", r ? r : "");
                     snprintf(cluster_name, sizeof(cluster_name), "%s", c ? c : "");
+                    if (le && le[0])
+                        snprintf(last_err, sizeof(last_err), "%s", le);
                 }
                 sqlite3_finalize(st);
             }
         }
+        int drift = last_err[0] && strncmp(last_err, "rotation drift", 14) == 0;
 
         time_t now = time(NULL);
+
+        if (drift && cluster_name[0]) {
+            sqlite3_stmt *cl = NULL;
+            sqlite3_prepare_v2(g_db,
+                "UPDATE auth SET last_err = '' WHERE cn = ?1",
+                -1, &cl, NULL);
+            if (cl) {
+                sqlite3_bind_text(cl, 1, ctx->node, -1, SQLITE_STATIC);
+                sqlite3_step(cl);
+                sqlite3_finalize(cl);
+            }
+            char cfg_key[128], cluster_json[65536] = {0};
+            snprintf(cfg_key, sizeof(cfg_key), "cluster_%s", cluster_name);
+            if (db_config_get(g_db, cfg_key, cluster_json,
+                              sizeof(cluster_json)) == ZEP_ERR_OK) {
+                cJSON *cj = cJSON_Parse(cluster_json);
+                if (cj) {
+                    cJSON *pools = cJSON_GetObjectItem(cj, "pools");
+                    if (pools) {
+                        cJSON *pool;
+                        cJSON_ArrayForEach(pool, pools) {
+                            cJSON *fs;
+                            cJSON_ArrayForEach(fs, pool) {
+                                cJSON *t = cJSON_CreateObject();
+                                cJSON_AddStringToObject(t, "action", "inventory");
+                                char cfs[512];
+                                snprintf(cfs, sizeof(cfs), "%s/%s",
+                                    pool->string, fs->string);
+                                cJSON_AddStringToObject(t, "cluster_fs", cfs);
+                                cJSON_AddItemToArray(tasks, t);
+                            }
+                        }
+                    }
+                    cJSON_Delete(cj);
+                }
+            }
+            char *js = cJSON_PrintUnformatted(tasks);
+            cJSON_Delete(tasks);
+            enum MHD_Result ret = send_json(conn, 200, js, ctx);
+            free(js);
+            return ret;
+        }
 
         if (suspended) {
             cJSON_AddItemToArray(tasks, cJSON_CreateObject());
@@ -2143,14 +2189,60 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         strcmp(ctx->target_url, "/v1/cron/rotate-ack") == 0) {
         cJSON *json = cJSON_ParseWithLength((const char *)ctx->body,
                                              ctx->body_len);
-        if (json) {
+        if (json && ctx->node[0]) {
             cJSON *del_arr = cJSON_GetObjectItem(json, "deleted");
-            if (del_arr && cJSON_IsArray(del_arr) && ctx->node[0]) {
+            if (del_arr && cJSON_IsArray(del_arr)) {
                 cJSON *g;
                 cJSON_ArrayForEach(g, del_arr) {
                     if (cJSON_IsString(g))
                         db_snapshot_delete_node_guid(g_db, ctx->node,
                                                       g->valuestring);
+                }
+            }
+            cJSON *rem = cJSON_GetObjectItem(json, "remaining");
+            if (rem && cJSON_IsArray(rem)) {
+                cJSON *r;
+                cJSON_ArrayForEach(r, rem) {
+                    cJSON *cf = cJSON_GetObjectItem(r, "cluster_fs");
+                    cJSON *lb = cJSON_GetObjectItem(r, "label");
+                    cJSON *cnt = cJSON_GetObjectItem(r, "count");
+                    if (!cf || !lb || !cnt) continue;
+                    int node_count = cnt->valueint;
+
+                    sqlite3_stmt *st = NULL;
+                    sqlite3_prepare_v2(g_db,
+                        "SELECT COUNT(*) FROM snapshots "
+                        "WHERE node = ?1 AND cluster_fs = ?2 "
+                        "  AND label = ?3",
+                        -1, &st, NULL);
+                    if (st) {
+                        sqlite3_bind_text(st, 1, ctx->node, -1, SQLITE_STATIC);
+                        sqlite3_bind_text(st, 2, cf->valuestring, -1, SQLITE_STATIC);
+                        sqlite3_bind_text(st, 3, lb->valuestring, -1, SQLITE_STATIC);
+                        int db_count = 0;
+                        if (sqlite3_step(st) == SQLITE_ROW)
+                            db_count = sqlite3_column_int(st, 0);
+                        sqlite3_finalize(st);
+
+                        if (db_count != node_count) {
+                            char err[256];
+                            snprintf(err, sizeof(err),
+                                "rotation drift: %s:%s node=%d db=%d",
+                                cf->valuestring, lb->valuestring,
+                                node_count, db_count);
+                            zep_log("cron/rotate-ack: %s\n", err);
+                            sqlite3_stmt *up = NULL;
+                            sqlite3_prepare_v2(g_db,
+                                "UPDATE auth SET last_err = ?1 WHERE cn = ?2",
+                                -1, &up, NULL);
+                            if (up) {
+                                sqlite3_bind_text(up, 1, err, -1, SQLITE_STATIC);
+                                sqlite3_bind_text(up, 2, ctx->node, -1, SQLITE_STATIC);
+                                sqlite3_step(up);
+                                sqlite3_finalize(up);
+                            }
+                        }
+                    }
                 }
             }
             cJSON_Delete(json);
@@ -2182,9 +2274,54 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
             if (snaps && cJSON_IsArray(snaps) && cfs &&
                 cJSON_IsString(cfs) && cl_buf[0]) {
-                int has_common = 0;
 
+                /* build comma-separated guid list for NOT IN clause */
+                char guid_list[65536] = {0};
+                char *glp = guid_list;
+                size_t gl_rem = sizeof(guid_list) - 1;
                 cJSON *sn;
+                cJSON_ArrayForEach(sn, snaps) {
+                    cJSON *g = cJSON_GetObjectItem(sn, "guid");
+                    if (!g || !cJSON_IsString(g)) continue;
+                    if (glp != guid_list) {
+                        if (gl_rem > 2) {
+                            *glp++ = ','; *glp++ = '\'';
+                            gl_rem -= 2;
+                        } else break;
+                    } else {
+                        if (gl_rem > 1) {
+                            *glp++ = '\'';
+                            gl_rem -= 1;
+                        }
+                    }
+                    size_t gn = strlen(g->valuestring);
+                    if (gn > gl_rem - 1) gn = gl_rem - 1;
+                    memcpy(glp, g->valuestring, gn);
+                    glp += gn;
+                    gl_rem -= gn;
+                    if (gl_rem > 1) {
+                        *glp++ = '\'';
+                        gl_rem -= 1;
+                    }
+                }
+                *glp = '\0';
+
+                char del_sql[66000];
+                snprintf(del_sql, sizeof(del_sql),
+                    "DELETE FROM snapshots "
+                    "WHERE node = '%s' AND cluster = '%s' "
+                    "  AND cluster_fs = '%s' "
+                    "  AND guid NOT IN (%s)",
+                    ctx->node, cl_buf, cfs->valuestring,
+                    guid_list[0] ? guid_list : "''");
+                sqlite3_stmt *del = NULL;
+                sqlite3_prepare_v2(g_db, del_sql, -1, &del, NULL);
+                if (del) {
+                    sqlite3_step(del);
+                    sqlite3_finalize(del);
+                }
+
+                int has_common = 0;
                 cJSON_ArrayForEach(sn, snaps) {
                     cJSON *g = cJSON_GetObjectItem(sn, "guid");
                     cJSON *snap = cJSON_GetObjectItem(sn, "snapshot");
@@ -2211,7 +2348,17 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     }
                 }
 
-                if (!has_common) {
+                if (has_common) {
+                    sqlite3_stmt *up = NULL;
+                    sqlite3_prepare_v2(g_db,
+                        "UPDATE auth SET last_err = '' WHERE cn = ?1",
+                        -1, &up, NULL);
+                    if (up) {
+                        sqlite3_bind_text(up, 1, ctx->node, -1, SQLITE_STATIC);
+                        sqlite3_step(up);
+                        sqlite3_finalize(up);
+                    }
+                } else {
                     sqlite3_stmt *up = NULL;
                     sqlite3_prepare_v2(g_db,
                         "UPDATE auth SET suspended = 1, "

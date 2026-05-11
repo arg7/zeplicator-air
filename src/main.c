@@ -1320,7 +1320,7 @@ static int cmd_cron(int argc, char *argv[]) {
                 free(rj);
                 if (rot) {
                     cJSON *skip = cJSON_GetObjectItem(rot, "skip");
-                    if (!cJSON_IsTrue(skip)) {
+                     if (!cJSON_IsTrue(skip)) {
                         cJSON *list = cJSON_GetObjectItem(rot, "rotate");
                         cJSON *deleted = cJSON_CreateArray();
                         if (list && cJSON_IsArray(list)) {
@@ -1341,21 +1341,61 @@ static int cmd_cron(int argc, char *argv[]) {
                                     }
                                 }
                             }
-                        }
-                        if (cJSON_GetArraySize(deleted) > 0) {
-                            cJSON *ack = cJSON_CreateObject();
-                            cJSON_AddItemToObject(ack, "deleted", deleted);
-                            char *body = cJSON_PrintUnformatted(ack);
-                            cJSON_Delete(ack);
-                            http_post_json(&http_cfg, "/v1/cron/rotate-ack", body);
-                            free(body);
-                            deleted = cJSON_CreateArray();
+                            cJSON *remaining = cJSON_CreateArray();
+                            cJSON *seen = cJSON_CreateObject();
+                            cJSON *item2;
+                            cJSON_ArrayForEach(item2, list) {
+                                cJSON *cf = cJSON_GetObjectItem(item2, "cluster_fs");
+                                cJSON *lb = cJSON_GetObjectItem(item2, "label");
+                                if (!cf || !lb) continue;
+                                char key[256];
+                                snprintf(key, sizeof(key), "%s:%s",
+                                    cf->valuestring, lb->valuestring);
+                                if (!cJSON_GetObjectItem(seen, key)) {
+                                    cJSON_AddTrueToObject(seen, key);
+                                    char local_fs[ZEP_MAX_SNAPSHOT_NAME];
+                                    if (pipeline_resolve_fs(cf->valuestring,
+                                            cfg.mapping, local_fs,
+                                            sizeof(local_fs)) == ZEP_ERR_OK) {
+                                        char cmd[1024];
+                                        snprintf(cmd, sizeof(cmd),
+                                            "zfs list -H -t snapshot '%s' 2>/dev/null | grep '@.*%s-' | wc -l",
+                                            local_fs, lb->valuestring);
+                                        FILE *fp = popen(cmd, "r");
+                                        int count = 0;
+                                        if (fp) {
+                                            if (fscanf(fp, "%d", &count) != 1)
+                                                count = 0;
+                                            pclose(fp);
+                                        }
+                                        cJSON *r = cJSON_CreateObject();
+                                        cJSON_AddStringToObject(r, "cluster_fs",
+                                            cf->valuestring);
+                                        cJSON_AddStringToObject(r, "label",
+                                            lb->valuestring);
+                                        cJSON_AddNumberToObject(r, "count", count);
+                                        cJSON_AddItemToArray(remaining, r);
+                                    }
+                                }
+                            }
+                            cJSON_Delete(seen);
+                            {
+                                cJSON *ack = cJSON_CreateObject();
+                                cJSON_AddItemToObject(ack, "deleted", deleted);
+                                cJSON_AddItemToObject(ack, "remaining", remaining);
+                                char *body = cJSON_PrintUnformatted(ack);
+                                cJSON_Delete(ack);
+                                http_post_json(&http_cfg, "/v1/cron/rotate-ack", body);
+                                free(body);
+                                deleted = cJSON_CreateArray();
+                            }
                         } else {
                             cJSON_Delete(deleted);
                         }
                     }
                     cJSON_Delete(rot);
                 }
+                cJSON_Delete(rot);
             }
         }
 
