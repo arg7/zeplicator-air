@@ -118,21 +118,18 @@ err_t http_put_blob(const http_config_t *cfg, const char *node,
         return ZEP_ERR_SYS;
 
     struct resp_buf rb = {0};
-    CURL *curl = http_init(cfg, url, &rb);
+    CURL *curl = http_reuse((http_config_t *)cfg, url, &rb);
+    if (!curl) {
+        curl = http_init(cfg, url, &rb);
+        if (!curl) { free(url); return ZEP_ERR_NETWORK; }
+    }
     free(url);
-    if (!curl) return ZEP_ERR_NETWORK;
 
-    curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
-    curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)len);
-    curl_easy_setopt(curl, CURLOPT_READDATA, &data);
-    curl_easy_setopt(curl, CURLOPT_READFUNCTION, NULL);
-
-    /* curl wants a read callback for upload, use default FILE* or set a custom one */
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)len);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)len);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
 
-    int rc = http_do(curl, 0);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
     free(rb.data);
     return rc;
 }
@@ -168,16 +165,19 @@ err_t http_put_meta(const http_config_t *cfg, const char *node,
             meta->cluster_fs, node, prefix, js_str);
 
     struct resp_buf rb = {0};
-    CURL *curl = http_init(cfg, url, &rb);
+    CURL *curl = http_reuse((http_config_t *)cfg, url, &rb);
+    if (!curl) {
+        curl = http_init(cfg, url, &rb);
+        if (!curl) { free(url); free(js_str); return ZEP_ERR_NETWORK; }
+    }
     free(url);
-    if (!curl) { free(js_str); return ZEP_ERR_NETWORK; }
 
     size_t jlen = strlen(js_str);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)jlen);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, js_str);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
 
-    int rc = http_do(curl, 0);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
     free(js_str);
     free(rb.data);
     return rc;
@@ -191,11 +191,14 @@ err_t http_get_meta(const http_config_t *cfg, const char *node,
         return ZEP_ERR_SYS;
 
     struct resp_buf rb = {0};
-    CURL *curl = http_init(cfg, url, &rb);
+    CURL *curl = http_reuse((http_config_t *)cfg, url, &rb);
+    if (!curl) {
+        curl = http_init(cfg, url, &rb);
+        if (!curl) { free(url); return ZEP_ERR_NETWORK; }
+    }
     free(url);
-    if (!curl) return ZEP_ERR_NETWORK;
 
-    int rc = http_do(curl, 0);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
     if (rc != ZEP_ERR_OK) { free(rb.data); return rc; }
 
     /* parse JSON in the same way storage_read_meta does */
@@ -255,11 +258,14 @@ err_t http_get_blob(const http_config_t *cfg, const char *node,
         return ZEP_ERR_SYS;
 
     struct resp_buf rb = {0};
-    CURL *curl = http_init(cfg, url, &rb);
+    CURL *curl = http_reuse((http_config_t *)cfg, url, &rb);
+    if (!curl) {
+        curl = http_init(cfg, url, &rb);
+        if (!curl) { free(url); return ZEP_ERR_NETWORK; }
+    }
     free(url);
-    if (!curl) return ZEP_ERR_NETWORK;
 
-    int rc = http_do(curl, 0);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
     if (rc != ZEP_ERR_OK || !rb.data) {
         free(rb.data);
         return rc != ZEP_ERR_OK ? rc : ZEP_ERR_STORAGE;
@@ -278,11 +284,14 @@ err_t http_get_blob_by_guid(const http_config_t *cfg, const char *guid,
         return ZEP_ERR_SYS;
 
     struct resp_buf rb = {0};
-    CURL *curl = http_init(cfg, url, &rb);
+    CURL *curl = http_reuse((http_config_t *)cfg, url, &rb);
+    if (!curl) {
+        curl = http_init(cfg, url, &rb);
+        if (!curl) { free(url); return ZEP_ERR_NETWORK; }
+    }
     free(url);
-    if (!curl) return ZEP_ERR_NETWORK;
 
-    int rc = http_do(curl, 0);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
     if (rc != ZEP_ERR_OK || !rb.data) {
         free(rb.data);
         return rc != ZEP_ERR_OK ? rc : ZEP_ERR_STORAGE;
@@ -301,11 +310,14 @@ err_t http_list_snapshots(const http_config_t *cfg, const char *node,
         return ZEP_ERR_SYS;
 
     struct resp_buf rb = {0};
-    CURL *curl = http_init(cfg, url, &rb);
+    CURL *curl = http_reuse((http_config_t *)cfg, url, &rb);
+    if (!curl) {
+        curl = http_init(cfg, url, &rb);
+        if (!curl) { free(url); return ZEP_ERR_NETWORK; }
+    }
     free(url);
-    if (!curl) return ZEP_ERR_NETWORK;
 
-    int rc = http_do(curl, 0);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
     if (rc != ZEP_ERR_OK || !rb.data) {
         free(rb.data);
         *count = 0;
