@@ -773,10 +773,7 @@ static int cmd_pipe(int argc, char *argv[]) {
     char cmd_buf[4096] = {0};
     for (int i = cmd_start; i < argc; i++) {
         if (i > cmd_start) strncat(cmd_buf, " ", sizeof(cmd_buf) - strlen(cmd_buf) - 1);
-        int needs_quote = (strchr(argv[i], ' ') || strchr(argv[i], '\t')) && !strchr(argv[i], '|');
-        if (needs_quote) strncat(cmd_buf, "\"", sizeof(cmd_buf) - strlen(cmd_buf) - 1);
         strncat(cmd_buf, argv[i], sizeof(cmd_buf) - strlen(cmd_buf) - 1);
-        if (needs_quote) strncat(cmd_buf, "\"", sizeof(cmd_buf) - strlen(cmd_buf) - 1);
     }
 
     const char *target_node = node;

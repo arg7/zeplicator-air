@@ -537,37 +537,30 @@ static ssize_t ws_send_frame_gtls(struct node_ws *nw, unsigned char opcode,
         free(frame);
         return -1;
     }
-    if (g_no_tls) {
-        ssize_t sent = send(nw ? nw->sock : -1, frame, flen, MSG_NOSIGNAL);
-        free(frame);
-        return sent == (ssize_t)flen ? (ssize_t)flen : -1;
-    }
-
-    ssize_t sent = 0;
     if (nw && nw->gnutls_session) {
+        ssize_t sent = 0;
         while ((size_t)sent < flen) {
             ssize_t n = gnutls_record_send(nw->gnutls_session, frame + sent, flen - (size_t)sent);
             if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
                 int raw_fd = (int)(intptr_t)gnutls_transport_get_ptr(nw->gnutls_session);
-                    if (raw_fd < 0) { free(frame); return -1; }
-                    fd_set wfds; FD_ZERO(&wfds); FD_SET(raw_fd, &wfds);
-                    struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
-                    if (select(raw_fd + 1, NULL, &wfds, NULL, &tv) <= 0) { free(frame); return -1; }
-                    continue;
-                }
-                if (n <= 0) { free(frame); return -1; }
-                sent += n;
+                if (raw_fd < 0) { free(frame); return -1; }
+                fd_set wfds; FD_ZERO(&wfds); FD_SET(raw_fd, &wfds);
+                struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
+                if (select(raw_fd + 1, NULL, &wfds, NULL, &tv) <= 0) { free(frame); return -1; }
+                continue;
             }
-            free(frame);
-            return (ssize_t)flen;
+            if (n <= 0) { free(frame); return -1; }
+            sent += n;
+        }
+        free(frame);
+        return (ssize_t)flen;
     }
+    ssize_t sent = send(nw ? nw->sock : -1, frame, flen, MSG_NOSIGNAL);
     free(frame);
-    return -1;
+    return sent == (ssize_t)flen ? (ssize_t)flen : -1;
 }
 
 static ssize_t ws_recv_node(struct node_ws *nw, unsigned char *buf, size_t buf_size) {
-    if (g_no_tls)
-        return recv(nw ? nw->sock : -1, buf, buf_size, 0);
     if (nw && nw->gnutls_session) {
         ssize_t n = gnutls_record_recv(nw->gnutls_session, buf, buf_size);
         if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
@@ -653,7 +646,7 @@ static void *node_ws_thread(void *arg) {
     free(ctx);
 
     int raw_sock = sock;
-    if (!g_no_tls && nw->gnutls_session)
+    if (nw->gnutls_session)
         raw_sock = (int)(intptr_t)gnutls_transport_get_ptr(nw->gnutls_session);
     if (raw_sock < 0) raw_sock = sock;
 
@@ -992,16 +985,6 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
     const char *interactive = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "interactive");
     int is_interactive = (interactive && strcmp(interactive, "1") == 0);
     if (command) {
-        gnutls_session_t admin_tls_check = NULL;
-        int admin_raw_fd_check = sock;
-        if (!g_no_tls) {
-            const union MHD_ConnectionInfo *aci = MHD_get_connection_info(conn, MHD_CONNECTION_INFO_GNUTLS_SESSION);
-            if (aci && aci->tls_session) {
-                admin_tls_check = (gnutls_session_t)aci->tls_session;
-                admin_raw_fd_check = (int)(intptr_t)gnutls_transport_get_ptr(admin_tls_check);
-            }
-        }
-        if (admin_raw_fd_check < 0) admin_raw_fd_check = sock;
 
         char pipe_allow[2048] = {0};
         db_config_get(g_db, "pipe_allow", pipe_allow, sizeof(pipe_allow));
@@ -1014,20 +997,11 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
             unsigned char fbuf[2048];
             size_t flen;
             flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_TEXT, (unsigned char *)errmsg, (size_t)elen);
-            if (flen > 0) {
-                if (g_no_tls) send(sock, fbuf, flen, MSG_NOSIGNAL);
-                else if (admin_tls_check) gnutls_record_send(admin_tls_check, fbuf, flen);
-            }
+            if (flen > 0) send(sock, fbuf, flen, MSG_NOSIGNAL);
             flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_EXIT, (unsigned char *)"\x01", 1);
-            if (flen > 0) {
-                if (g_no_tls) send(sock, fbuf, flen, MSG_NOSIGNAL);
-                else if (admin_tls_check) gnutls_record_send(admin_tls_check, fbuf, flen);
-            }
+            if (flen > 0) send(sock, fbuf, flen, MSG_NOSIGNAL);
             flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_CLOSE, NULL, 0);
-            if (flen > 0) {
-                if (g_no_tls) send(sock, fbuf, flen, MSG_NOSIGNAL);
-                else if (admin_tls_check) gnutls_record_send(admin_tls_check, fbuf, flen);
-            }
+            if (flen > 0) send(sock, fbuf, flen, MSG_NOSIGNAL);
             MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
             return;
         }
@@ -1045,25 +1019,12 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
 
     /* Get raw TCP fd for select */
     int node_raw_fd = nw->sock;
-    if (!g_no_tls && nw->mhd_conn) {
-        const union MHD_ConnectionInfo *ci = MHD_get_connection_info(nw->mhd_conn, MHD_CONNECTION_INFO_GNUTLS_SESSION);
-        if (ci && ci->tls_session)
-            node_raw_fd = (int)(intptr_t)gnutls_transport_get_ptr((gnutls_session_t)ci->tls_session);
-    }
+    if (nw->gnutls_session)
+        node_raw_fd = (int)(intptr_t)gnutls_transport_get_ptr(nw->gnutls_session);
     if (node_raw_fd < 0) node_raw_fd = nw->sock;
-
-    gnutls_session_t admin_tls = NULL;
     int admin_raw_fd = sock;
-    if (!g_no_tls) {
-        const union MHD_ConnectionInfo *aci = MHD_get_connection_info(conn, MHD_CONNECTION_INFO_GNUTLS_SESSION);
-        if (aci && aci->tls_session) {
-            admin_tls = (gnutls_session_t)aci->tls_session;
-            admin_raw_fd = (int)(intptr_t)gnutls_transport_get_ptr(admin_tls);
-        }
-    }
-    if (admin_raw_fd < 0) admin_raw_fd = sock;
 
-    /* Send task JSON to node (via GnuTLS) */
+    /* Send task JSON to node */
     if (command) {
         cJSON *task = cJSON_CreateObject();
         cJSON_AddStringToObject(task, "action", "pipe");
@@ -1107,14 +1068,8 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
             /* Admin → Node: read raw bytes into accumulator */
             if (admin_alive && FD_ISSET(admin_raw_fd, &rfds)) {
                 unsigned char tmp[16384];
-                ssize_t n;
-                if (g_no_tls)
-                    n = recv(sock, tmp, sizeof(tmp), 0);
-                else
-                    n = gnutls_record_recv(admin_tls, tmp, sizeof(tmp));
-                if (g_no_tls ? (n <= 0) : (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED))
-                    { /* retry */ }
-                else if (n <= 0) {
+                ssize_t n = recv(sock, tmp, sizeof(tmp), 0);
+                if (n <= 0) {
                     admin_alive = 0;
                 } else if (admin_acc_len + (size_t)n > WS_ADMIN_BUF) {
                     admin_alive = 0;
@@ -1142,13 +1097,7 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
                         if (flen > 0) {
                             ssize_t sent = 0;
                             while ((size_t)sent < flen) {
-                                ssize_t n;
-                                if (g_no_tls)
-                                    n = send(sock, fbuf + sent, flen - (size_t)sent, MSG_NOSIGNAL);
-                                else
-                                    n = gnutls_record_send(admin_tls, fbuf + sent, flen - (size_t)sent);
-                                if (g_no_tls ? (n <= 0) : (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED))
-                                    { usleep(1000); continue; }
+                                ssize_t n = send(sock, fbuf + sent, flen - (size_t)sent, MSG_NOSIGNAL);
                                 if (n <= 0) break;
                                 sent += n;
                             }
@@ -1189,10 +1138,7 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
             } else if (aop == WS_OP_PING) {
                 unsigned char fbuf[WS_SUBCHUNK + 14];
                 size_t flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_PONG, admin_buf + hlen, (size_t)plen_val);
-                if (flen > 0) {
-                    if (g_no_tls) send(sock, fbuf, flen, MSG_NOSIGNAL);
-                    else gnutls_record_send(admin_tls, fbuf, flen);
-                }
+                if (flen > 0) send(sock, fbuf, flen, MSG_NOSIGNAL);
             } else if (node_alive && (aop == WS_OP_BIN || aop == WS_OP_TEXT || aop == WS_OP_EOF || aop == WS_OP_EXIT)) {
                 if (ws_send_frame_gtls(nw, aop, admin_buf + hlen, (size_t)plen_val) < 0)
                     node_alive = 0;
@@ -1215,10 +1161,7 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
     {
         unsigned char cbuf[14];
         size_t clen = ws_build_frame(cbuf, sizeof(cbuf), WS_OP_CLOSE, NULL, 0);
-        if (g_no_tls)
-            send(sock, cbuf, clen, MSG_NOSIGNAL);
-        else if (admin_tls)
-            gnutls_record_send(admin_tls, cbuf, clen);
+        send(sock, cbuf, clen, MSG_NOSIGNAL);
     }
     MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
 

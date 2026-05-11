@@ -81,22 +81,27 @@ static void ws_node_disconnect(struct ws_node_conn *c) {
 
 static size_t ws_node_build_frame(unsigned char *buf, size_t buf_size,
                                     unsigned char opcode, const unsigned char *payload, size_t payload_len) {
-    size_t header_len = 2;
+    size_t header_len = 2 + 4; /* 2 byte header + 4 byte mask */
     if (payload_len >= 126) header_len += payload_len < 65536 ? 2 : 8;
     if (buf_size < header_len + payload_len) return 0;
     buf[0] = 0x80 | opcode;
     if (payload_len < 126) {
-        buf[1] = (unsigned char)payload_len;
+        buf[1] = 0x80 | (unsigned char)payload_len;
     } else if (payload_len < 65536) {
-        buf[1] = 126;
+        buf[1] = 0x80 | 126;
         buf[2] = (unsigned char)((payload_len >> 8) & 0xFF);
         buf[3] = (unsigned char)(payload_len & 0xFF);
     } else {
-        buf[1] = 127;
+        buf[1] = 0x80 | 127;
         for (int i = 0; i < 8; i++)
             buf[2 + i] = (unsigned char)((payload_len >> (56 - i * 8)) & 0xFF);
     }
-    memcpy(buf + header_len, payload, payload_len);
+    size_t mask_offset = header_len - 4;
+    unsigned char mask[4];
+    for (int i = 0; i < 4; i++) mask[i] = (unsigned char)(rand() % 256);
+    memcpy(buf + mask_offset, mask, 4);
+    for (size_t i = 0; i < payload_len; i++)
+        buf[header_len + i] = payload[i] ^ mask[i % 4];
     return header_len + payload_len;
 }
 
@@ -1150,7 +1155,7 @@ static int cmd_cron(int argc, char *argv[]) {
     signal(SIGHUP, daemon_signal_handler);
 
     /* Start WS pipe listener in daemon mode */
-    if (0 && daemon_mode && cfg.node_name[0]) {
+    if (daemon_mode && cfg.node_name[0]) {
         zep_config_t *tcfg = malloc(sizeof(*tcfg));
         if (tcfg) {
             memcpy(tcfg, &cfg, sizeof(*tcfg));
@@ -1395,7 +1400,6 @@ static int cmd_cron(int argc, char *argv[]) {
                     }
                     cJSON_Delete(rot);
                 }
-                cJSON_Delete(rot);
             }
         }
 
