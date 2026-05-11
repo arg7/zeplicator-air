@@ -293,7 +293,7 @@ for entry in ${NODES:-}; do
     "$ZEP" --db "$node_db" config set cluster    "$CLUSTER_NAME"
     "$ZEP" --db "$node_db" config set mapping    "${CLUSTER_POOL:-za-pool-1}/${CLUSTER_FS:-za-data-1}:${poolfs}"
     [[ -z "${KEY_PASSWORD:-}" ]] || "$ZEP" --db "$node_db" config set key_password "$KEY_PASSWORD"
-    id "$cn" &>/dev/null && chown "${cn}:${cn}" "$node_db" 2>/dev/null || true
+    id "$cn" &>/dev/null && chown -R "${cn}:${cn}" "$(dirname "$node_db")" 2>/dev/null || true
 done
 
 say "Configuring admin database ..."
