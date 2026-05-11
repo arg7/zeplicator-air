@@ -271,6 +271,7 @@ static struct ws_node_conn *ws_node_connect(const char *server_url, const char *
     return c;
 }
 
+__attribute__((unused))
 static void *ws_node_pipe_thread(void *arg) {
     zep_config_t *cfg = (zep_config_t *)arg;
     if (!cfg) return NULL;
@@ -1186,14 +1187,15 @@ static int cmd_cron(int argc, char *argv[]) {
     snprintf(http_cfg.key_password, sizeof(http_cfg.key_password), "%s", cfg.key_password);
     db_close(db);
 
+    signal(SIGTERM, daemon_signal_handler);
+    signal(SIGINT, daemon_signal_handler);
+    signal(SIGHUP, daemon_signal_handler);
+
     /* Start WS pipe listener in daemon mode */
-    if (daemon_mode && cfg.node_name[0]) {
+    if (0 && daemon_mode && cfg.node_name[0]) {
         zep_config_t *tcfg = malloc(sizeof(*tcfg));
         if (tcfg) {
             memcpy(tcfg, &cfg, sizeof(*tcfg));
-            signal(SIGTERM, daemon_signal_handler);
-            signal(SIGINT, daemon_signal_handler);
-            signal(SIGHUP, daemon_signal_handler);
             pthread_create(&g_ws_tid, NULL, ws_node_pipe_thread, (void *)tcfg);
             pthread_detach(g_ws_tid);
             if (g_verbose) fprintf(stderr, "cron: WS pipe listener started for %s\n", cfg.node_name);
@@ -1276,6 +1278,8 @@ static int cmd_cron(int argc, char *argv[]) {
                             snprintf(body, sizeof(body), "{\"guid\":\"%s\"}", latest);
                             http_post_json(&http_cfg, "/v1/cron/ack", body);
                         }
+                    } else {
+                        fprintf(stderr, "cron: resolve_fs FAILED for cfs=%s\n", cfs->valuestring);
                     }
                     db_close(db);
                 }

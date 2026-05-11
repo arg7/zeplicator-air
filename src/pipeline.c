@@ -410,11 +410,12 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
         if (local_guid[0] && strcmp(g->valuestring, local_guid) == 0)
             continue;
 
-        int can_pull = (!local_guid[0] && bg && cJSON_IsString(bg) && !bg->valuestring[0])
+        int is_full = (!bg->valuestring[0] || strcmp(bg->valuestring, "0") == 0);
+        int can_pull = (!local_guid[0] && bg && cJSON_IsString(bg) && is_full)
                      || (bg && cJSON_IsString(bg) && strcmp(local_guid, bg->valuestring) == 0);
         if (!can_pull) continue;
 
-        if (bg && cJSON_IsString(bg) && !bg->valuestring[0]) {
+        if (bg && cJSON_IsString(bg) && is_full) {
             char cmd[ZEP_MAX_PATH];
             snprintf(cmd, sizeof(cmd), "zfs set mountpoint=none '%s' 2>/dev/null", fs);
             if (system(cmd) == -1) {}
