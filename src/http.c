@@ -84,6 +84,11 @@ err_t http_persistent_start(http_config_t *cfg) {
     curl_easy_setopt(cfg->curl, CURLOPT_CONNECTTIMEOUT, 15L);
     curl_easy_setopt(cfg->curl, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(cfg->curl, CURLOPT_KEEP_SENDING_ON_ERROR, 1L);
+    {
+        struct curl_slist *headers = NULL;
+        headers = curl_slist_append(headers, "Connection: keep-alive");
+        curl_easy_setopt(cfg->curl, CURLOPT_HTTPHEADER, headers);
+    }
     if (cfg->key_password[0])
         curl_easy_setopt(cfg->curl, CURLOPT_KEYPASSWD, cfg->key_password);
     return ZEP_ERR_OK;
