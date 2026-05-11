@@ -1843,6 +1843,8 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 if (cj) {
                     cJSON *pools = cJSON_GetObjectItem(cj, "pools");
                     if (pools) {
+                        int no_records = (db_node_pull_count(g_db, cluster_name,
+                                             ctx->node) == 0);
                         cJSON *pool;
                         cJSON_ArrayForEach(pool, pools) {
                             cJSON *fs;
@@ -1850,6 +1852,14 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                 char cluster_fs[512];
                                 snprintf(cluster_fs, sizeof(cluster_fs),
                                          "%s/%s", pool->string, fs->string);
+
+                                if (no_records) {
+                                    cJSON *t = cJSON_CreateObject();
+                                    cJSON_AddStringToObject(t, "action", "inventory");
+                                    cJSON_AddStringToObject(t, "cluster_fs", cluster_fs);
+                                    cJSON_AddItemToArray(tasks, t);
+                                    continue;
+                                }
 
                                 sqlite3_stmt *st2 = NULL;
                                 sqlite3_prepare_v2(g_db,
@@ -1923,9 +1933,16 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     }
                     sqlite3_finalize(cs);
                 }
-                db_snapshot_insert(g_db, cl_buf[0] ? cl_buf : "", ctx->node,
-                                   guid->valuestring, "", "", "", "", 0, 0,
-                                   "pull", "");
+                char snap_buf[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                char lbl_buf[64] = {0};
+                char cfs_buf[512] = {0};
+                db_snapshot_push_meta(g_db, guid->valuestring,
+                    snap_buf, sizeof(snap_buf),
+                    lbl_buf, sizeof(lbl_buf),
+                    cfs_buf, sizeof(cfs_buf));
+                db_snapshot_insert(g_db, cl_buf[0] ? cl_buf : "",
+                    ctx->node, guid->valuestring, "", snap_buf,
+                    lbl_buf, cfs_buf, 0, 0, "pull", "");
             }
             cJSON *lbl = cJSON_GetObjectItem(json, "label");
             cJSON *cfs = cJSON_GetObjectItem(json, "cluster_fs");
@@ -1999,6 +2016,219 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
         enum MHD_Result ret = send_json(conn, 200, js, ctx);
         free(js);
         return ret;
+    }
+
+    /* ── GET /v1/cron/rotation ── */
+    if (strcmp(ctx->method, "GET") == 0 &&
+        strcmp(ctx->target_url, "/v1/cron/rotation") == 0) {
+        const char *cluster_param = MHD_lookup_connection_value(conn,
+            MHD_GET_ARGUMENT_KIND, "cluster");
+        if (!cluster_param) cluster_param = "";
+
+        cJSON *resp = cJSON_CreateObject();
+
+        if (ctx->node[0]) {
+            sqlite3_stmt *st = NULL;
+            sqlite3_prepare_v2(g_db,
+                "SELECT pipe_active, suspended, mapping FROM auth WHERE cn = ?1",
+                -1, &st, NULL);
+            if (st) {
+                sqlite3_bind_text(st, 1, ctx->node, -1, SQLITE_STATIC);
+                if (sqlite3_step(st) == SQLITE_ROW) {
+                    int pipe_active = sqlite3_column_int(st, 0);
+                    int suspended = sqlite3_column_int(st, 1);
+                    const char *mapping = (const char *)sqlite3_column_text(st, 2);
+
+                    if (pipe_active || suspended) {
+                        cJSON_AddBoolToObject(resp, "skip", 1);
+                        sqlite3_finalize(st);
+                        char *js = cJSON_PrintUnformatted(resp);
+                        cJSON_Delete(resp);
+                        enum MHD_Result ret = send_json(conn, 200, js, ctx);
+                        free(js);
+                        return ret;
+                    }
+
+                    cJSON *rotate = cJSON_CreateArray();
+
+                    char cfg_key[128], cj_buf[65536] = {0};
+                    cJSON *cluster_json = NULL;
+                    snprintf(cfg_key, sizeof(cfg_key), "cluster_%s",
+                             cluster_param);
+                    if (db_config_get(g_db, cfg_key, cj_buf,
+                            sizeof(cj_buf)) == ZEP_ERR_OK)
+                        cluster_json = cJSON_Parse(cj_buf);
+
+                    db_rotation_candidates(g_db, cluster_param, ctx->node,
+                                           mapping ? mapping : "",
+                                           cluster_json, rotate);
+
+                    if (cluster_json) cJSON_Delete(cluster_json);
+
+                    cJSON *protected_arr = cJSON_CreateArray();
+                    char ancestor[ZEP_MAX_GUID_LEN] = {0};
+                    if (db_common_ancestor(g_db, cluster_param, ancestor,
+                            sizeof(ancestor)) == ZEP_ERR_OK && ancestor[0])
+                        cJSON_AddItemToArray(protected_arr,
+                            cJSON_CreateString(ancestor));
+
+                    sqlite3_stmt *st2 = NULL;
+                    sqlite3_prepare_v2(g_db,
+                        "SELECT last_ack_guid FROM auth "
+                        "WHERE cluster = ?1 AND role = 'client' "
+                        "  AND last_ack_guid != ''",
+                        -1, &st2, NULL);
+                    if (st2) {
+                        sqlite3_bind_text(st2, 1, cluster_param,
+                            -1, SQLITE_STATIC);
+                        while (sqlite3_step(st2) == SQLITE_ROW)
+                            cJSON_AddItemToArray(protected_arr,
+                                cJSON_CreateString(
+                                    (const char *)sqlite3_column_text(st2, 0)));
+                        sqlite3_finalize(st2);
+                    }
+
+                    sqlite3_prepare_v2(g_db,
+                        "SELECT guid FROM snapshots "
+                        "WHERE cluster = ?1 AND direction = 'push' "
+                        "ORDER BY rowid DESC LIMIT 1",
+                        -1, &st2, NULL);
+                    if (st2) {
+                        sqlite3_bind_text(st2, 1, cluster_param,
+                            -1, SQLITE_STATIC);
+                        if (sqlite3_step(st2) == SQLITE_ROW)
+                            cJSON_AddItemToArray(protected_arr,
+                                cJSON_CreateString(
+                                    (const char *)sqlite3_column_text(st2, 0)));
+                        sqlite3_finalize(st2);
+                    }
+
+                    cJSON *filtered = cJSON_CreateArray();
+                    int rc = cJSON_GetArraySize(rotate);
+                    for (int i = 0; i < rc; i++) {
+                        cJSON *item = cJSON_GetArrayItem(rotate, i);
+                        if (!item) continue;
+                        cJSON *g = cJSON_GetObjectItem(item, "guid");
+                        if (!g) continue;
+                        int prot = 0;
+                        int pc = cJSON_GetArraySize(protected_arr);
+                        for (int j = 0; j < pc; j++) {
+                            cJSON *pg = cJSON_GetArrayItem(protected_arr, j);
+                            if (pg && cJSON_IsString(pg) &&
+                                strcmp(g->valuestring, pg->valuestring) == 0)
+                                { prot = 1; break; }
+                        }
+                        if (!prot)
+                            cJSON_AddItemToArray(filtered,
+                                cJSON_Duplicate(item, 1));
+                    }
+                    cJSON_Delete(protected_arr);
+
+                    cJSON_AddBoolToObject(resp, "skip", 0);
+                    cJSON_AddItemToObject(resp, "rotate", filtered);
+                }
+                sqlite3_finalize(st);
+            }
+        }
+
+        char *js = cJSON_PrintUnformatted(resp);
+        cJSON_Delete(resp);
+        enum MHD_Result ret = send_json(conn, 200, js, ctx);
+        free(js);
+        return ret;
+    }
+
+    /* ── POST /v1/cron/rotate-ack ── */
+    if (strcmp(ctx->method, "POST") == 0 &&
+        strcmp(ctx->target_url, "/v1/cron/rotate-ack") == 0) {
+        cJSON *json = cJSON_ParseWithLength((const char *)ctx->body,
+                                             ctx->body_len);
+        if (json) {
+            cJSON *del_arr = cJSON_GetObjectItem(json, "deleted");
+            if (del_arr && cJSON_IsArray(del_arr) && ctx->node[0]) {
+                cJSON *g;
+                cJSON_ArrayForEach(g, del_arr) {
+                    if (cJSON_IsString(g))
+                        db_snapshot_delete_node_guid(g_db, ctx->node,
+                                                      g->valuestring);
+                }
+            }
+            cJSON_Delete(json);
+        }
+        return send_json(conn, 200, "{\"ok\":true}", ctx);
+    }
+
+    /* ── POST /v1/cron/inventory ── */
+    if (strcmp(ctx->method, "POST") == 0 &&
+        strcmp(ctx->target_url, "/v1/cron/inventory") == 0) {
+        cJSON *json = cJSON_ParseWithLength((const char *)ctx->body,
+                                             ctx->body_len);
+        if (json && ctx->node[0]) {
+            cJSON *cfs = cJSON_GetObjectItem(json, "cluster_fs");
+            cJSON *snaps = cJSON_GetObjectItem(json, "snapshots");
+            char cl_buf[64] = {0};
+            sqlite3_stmt *cs = NULL;
+            sqlite3_prepare_v2(g_db,
+                "SELECT cluster FROM auth WHERE cn = ?1", -1, &cs, NULL);
+            if (cs) {
+                sqlite3_bind_text(cs, 1, ctx->node, -1, SQLITE_STATIC);
+                if (sqlite3_step(cs) == SQLITE_ROW) {
+                    const char *cl = (const char *)sqlite3_column_text(cs, 0);
+                    if (cl && cl[0])
+                        snprintf(cl_buf, sizeof(cl_buf), "%s", cl);
+                }
+                sqlite3_finalize(cs);
+            }
+
+            if (snaps && cJSON_IsArray(snaps) && cfs &&
+                cJSON_IsString(cfs) && cl_buf[0]) {
+                int has_common = 0;
+
+                cJSON *sn;
+                cJSON_ArrayForEach(sn, snaps) {
+                    cJSON *g = cJSON_GetObjectItem(sn, "guid");
+                    cJSON *snap = cJSON_GetObjectItem(sn, "snapshot");
+                    cJSON *lbl = cJSON_GetObjectItem(sn, "label");
+                    if (!g || !snap || !lbl) continue;
+
+                    db_snapshot_insert(g_db, cl_buf, ctx->node,
+                        g->valuestring, "",
+                        snap->valuestring, lbl->valuestring,
+                        cfs->valuestring, 0, 0, "pull", "");
+
+                    if (!has_common) {
+                        sqlite3_stmt *ck = NULL;
+                        sqlite3_prepare_v2(g_db,
+                            "SELECT 1 FROM snapshots "
+                            "WHERE guid = ?1 AND direction = 'push' AND cluster = ?2",
+                            -1, &ck, NULL);
+                        if (ck) {
+                            sqlite3_bind_text(ck, 1, g->valuestring, -1, SQLITE_STATIC);
+                            sqlite3_bind_text(ck, 2, cl_buf, -1, SQLITE_STATIC);
+                            has_common = (sqlite3_step(ck) == SQLITE_ROW);
+                            sqlite3_finalize(ck);
+                        }
+                    }
+                }
+
+                if (!has_common) {
+                    sqlite3_stmt *up = NULL;
+                    sqlite3_prepare_v2(g_db,
+                        "UPDATE auth SET suspended = 1, "
+                        "last_err = 'no common snapshots for ' || ?1 "
+                        "WHERE cn = ?2",
+                        -1, &up, NULL);
+                    if (up) {
+                        sqlite3_bind_text(up, 1, cfs->valuestring, -1, SQLITE_STATIC);
+                        sqlite3_bind_text(up, 2, ctx->node, -1, SQLITE_STATIC);
+                        sqlite3_step(up);
+                        sqlite3_finalize(up);
+                    }
+                }
+            }
+            cJSON_Delete(json);
+        }
+        return send_json(conn, 200, "{\"ok\":true}", ctx);
     }
 
     /* ── GET /v1/snapshots/<guid>/meta ── */

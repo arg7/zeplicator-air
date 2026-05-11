@@ -106,6 +106,8 @@ err_t db_init_tables(sqlite3 *db) {
     }
     sqlite3_exec(db, "ALTER TABLE auth ADD COLUMN pipe_active INTEGER NOT NULL DEFAULT 0",
                  NULL, NULL, NULL);
+    sqlite3_exec(db, "ALTER TABLE auth ADD COLUMN last_err TEXT DEFAULT ''",
+                 NULL, NULL, NULL);
     return ZEP_ERR_OK;
 }
 
@@ -537,6 +539,31 @@ err_t db_snapshot_latest_guid(sqlite3 *db, const char *node,
     return ret;
 }
 
+err_t db_snapshot_push_meta(sqlite3 *db, const char *guid,
+                             char *snapshot, size_t sn_len,
+                             char *label, size_t lbl_len,
+                             char *cluster_fs, size_t cfs_len) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT snapshot, label, cluster_fs FROM snapshots "
+            "WHERE guid = ?1 AND direction = 'push' LIMIT 1",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
+    err_t ret = ZEP_ERR_NOT_FOUND;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        snprintf(snapshot, sn_len, "%s",
+            sqlite3_column_text(stmt, 0));
+        snprintf(label, lbl_len, "%s",
+            sqlite3_column_text(stmt, 1));
+        snprintf(cluster_fs, cfs_len, "%s",
+            sqlite3_column_text(stmt, 2));
+        ret = ZEP_ERR_OK;
+    }
+    sqlite3_finalize(stmt);
+    return ret;
+}
+
 char *db_blob_list_json(sqlite3 *db, const char *snapshot_guid) {
     const char *sql =
         "SELECT part, size, sha256 FROM blobs "
@@ -670,4 +697,176 @@ err_t db_blob_lookup(sqlite3 *db, const char *snapshot_guid, int part,
     }
     sqlite3_finalize(stmt);
     return ret;
+}
+
+err_t db_common_ancestor(sqlite3 *db, const char *cluster,
+                         char *guid, size_t len) {
+    const char *sql =
+        "SELECT guid FROM snapshots WHERE cluster = ?1 "
+        "GROUP BY guid "
+        "HAVING COUNT(DISTINCT node) = (SELECT COUNT(*) FROM auth WHERE cluster = ?1) "
+        "ORDER BY MAX(rowid) DESC LIMIT 1";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, cluster, -1, SQLITE_STATIC);
+    err_t ret = ZEP_ERR_NOT_FOUND;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        snprintf(guid, len, "%s", sqlite3_column_text(stmt, 0));
+        ret = ZEP_ERR_OK;
+    }
+    sqlite3_finalize(stmt);
+    return ret;
+}
+
+err_t db_snapshot_delete_node_guid(sqlite3 *db, const char *node,
+                                    const char *guid) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "DELETE FROM snapshots WHERE node = ? AND guid = ?",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, node, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, guid, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
+}
+
+int db_node_pull_count(sqlite3 *db, const char *cluster, const char *node) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT COUNT(*) FROM snapshots "
+            "WHERE node = ?1 AND cluster = ?2 AND direction = 'pull'",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(stmt, 1, node, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, cluster, -1, SQLITE_STATIC);
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+err_t db_rotation_candidates(sqlite3 *db, const char *cluster,
+                              const char *node, const char *mapping,
+                              cJSON *cluster_json, cJSON *out) {
+    if (!cluster_json) return ZEP_ERR_OK;
+
+    cJSON *pools = cJSON_GetObjectItem(cluster_json, "pools");
+    if (!pools) return ZEP_ERR_OK;
+
+    cJSON *pool;
+    cJSON_ArrayForEach(pool, pools) {
+        cJSON *fs;
+        cJSON_ArrayForEach(fs, pool) {
+            char cluster_fs[512];
+            snprintf(cluster_fs, sizeof(cluster_fs), "%s/%s",
+                     pool->string, fs->string);
+
+            cJSON *labels = cJSON_GetObjectItem(fs, "labels");
+            if (!labels) continue;
+
+            cJSON *lbl;
+            cJSON_ArrayForEach(lbl, labels) {
+                int retention = lbl->valueint;
+                const char *label = lbl->string;
+                if (!label || retention <= 0) continue;
+
+                if (mapping && mapping[0]) {
+                    const char *mp = mapping;
+                    while (*mp) {
+                        const char *colon = strchr(mp, ':');
+                        if (!colon) break;
+
+                        if ((size_t)(colon - mp) == strlen(cluster_fs) &&
+                            strncmp(mp, cluster_fs, strlen(cluster_fs)) == 0) {
+
+                            const char *comma = strchr(colon, ',');
+                            const char *entry_end = comma ? comma :
+                                colon + strlen(colon);
+                            const char *paren = strchr(colon, '(');
+                            const char *cp = paren ? strchr(paren, ')') : NULL;
+
+                            if (paren && cp && cp < entry_end) {
+                                const char *lp = paren + 1;
+                                while (lp < cp) {
+                                    const char *lc = strchr(lp, ':');
+                                    const char *le = strchr(lp, ',');
+                                    if (!le || le > cp) le = cp;
+                                    if (lc && lc < le) {
+                                        size_t ln = (size_t)(lc - lp);
+                                        if (ln == strlen(label) &&
+                                            strncmp(lp, label, ln) == 0) {
+                                            int ov = atoi(lc + 1);
+                                            if (ov > 0) retention = ov;
+                                        }
+                                    }
+                                    lp = le;
+                                    if (*lp == ',') lp++;
+                                }
+                            }
+                            break;
+                        }
+                        const char *nc = strchr(colon, ',');
+                        mp = nc ? nc + 1 : colon + strlen(colon);
+                    }
+                }
+
+                sqlite3_stmt *st = NULL;
+                if (sqlite3_prepare_v2(db,
+                        "SELECT guid, snapshot FROM snapshots "
+                        "WHERE node = ?1 AND cluster_fs = ?2 "
+                        "  AND label = ?3 AND cluster = ?4 "
+                        "ORDER BY rowid ASC",
+                        -1, &st, NULL) == SQLITE_OK) {
+                    sqlite3_bind_text(st, 1, node, -1, SQLITE_STATIC);
+                    sqlite3_bind_text(st, 2, cluster_fs, -1, SQLITE_STATIC);
+                    sqlite3_bind_text(st, 3, label, -1, SQLITE_STATIC);
+                    sqlite3_bind_text(st, 4, cluster, -1, SQLITE_STATIC);
+
+                    struct row_s {
+                        char guid[ZEP_MAX_GUID_LEN];
+                        char snapshot[ZEP_MAX_SNAPSHOT_NAME];
+                    } *rows = NULL;
+                    int rcount = 0, rcap = 0;
+
+                    while (sqlite3_step(st) == SQLITE_ROW) {
+                        if (rcount >= rcap) {
+                            rcap = rcap ? rcap * 2 : 32;
+                            rows = realloc(rows,
+                                (size_t)rcap * sizeof(*rows));
+                        }
+                        snprintf(rows[rcount].guid,
+                            sizeof(rows[rcount].guid), "%s",
+                            (const char *)sqlite3_column_text(st, 0));
+                        snprintf(rows[rcount].snapshot,
+                            sizeof(rows[rcount].snapshot), "%s",
+                            (const char *)sqlite3_column_text(st, 1));
+                        rcount++;
+                    }
+                    sqlite3_finalize(st);
+
+                    if (rcount > retention) {
+                        int excess = rcount - retention;
+                        for (int i = 0; i < excess && i < rcount; i++) {
+                            cJSON *obj = cJSON_CreateObject();
+                            cJSON_AddStringToObject(obj, "guid",
+                                rows[i].guid);
+                            cJSON_AddStringToObject(obj, "snapshot",
+                                rows[i].snapshot);
+                            cJSON_AddStringToObject(obj, "cluster_fs",
+                                cluster_fs);
+                            cJSON_AddStringToObject(obj, "label",
+                                label);
+                            cJSON_AddItemToArray(out, obj);
+                        }
+                    }
+                    free(rows);
+                }
+            }
+        }
+    }
+    return ZEP_ERR_OK;
 }

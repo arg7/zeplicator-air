@@ -5,6 +5,7 @@
 
 #include "common.h"
 #include <sqlite3.h>
+#include <cjson/cJSON.h>
 
 err_t db_open(const char *path, sqlite3 **db);
 void  db_close(sqlite3 *db);
@@ -64,5 +65,18 @@ err_t db_blob_upsert(sqlite3 *db, const char *snapshot_guid, int part,
 err_t db_blob_lookup(sqlite3 *db, const char *snapshot_guid, int part,
                      char *storage_ref, size_t ref_len);
 char *db_blob_list_json(sqlite3 *db, const char *snapshot_guid);
+
+err_t db_common_ancestor(sqlite3 *db, const char *cluster,
+                         char *guid, size_t len);
+err_t db_snapshot_delete_node_guid(sqlite3 *db, const char *node,
+                                    const char *guid);
+int   db_node_pull_count(sqlite3 *db, const char *cluster, const char *node);
+err_t db_rotation_candidates(sqlite3 *db, const char *cluster,
+                              const char *node, const char *mapping,
+                              cJSON *cluster_json, cJSON *out);
+err_t db_snapshot_push_meta(sqlite3 *db, const char *guid,
+                             char *snapshot, size_t sn_len,
+                             char *label, size_t lbl_len,
+                             char *cluster_fs, size_t cfs_len);
 
 #endif

@@ -432,9 +432,9 @@ static void *ws_node_pipe_thread(void *arg) {
                                                                 ws.ws_col = (unsigned short)cols->valueint;
                                                                 ws.ws_xpixel = 0;
                                                                 ws.ws_ypixel = 0;
-                                                                ioctl(pty_master, TIOCSWINSZ, &ws);
-                                                                kill(pid, SIGWINCH);
-                                                            }
+                                                                 ioctl(pty_master, TIOCSWINSZ, &ws);
+                                                                 kill(pid, SIGWINCH);
+                                                        }
                                                         }
                                                         cJSON_Delete(msg);
                                                     }
@@ -1007,17 +1007,20 @@ static int cmd_rotate(int argc, char *argv[]) {
     snprintf(http_cfg.ca_path, sizeof(http_cfg.ca_path), "%s", cfg.ca_path);
     snprintf(http_cfg.key_password, sizeof(http_cfg.key_password), "%s", cfg.key_password);
 
-    /* get protected guids from server */
-    char *pjson = http_get_json(&http_cfg,
-        cfg.cluster[0] ? "" : NULL);
-    char *protected_url = NULL;
-    if (cfg.cluster[0])
-        if (asprintf(&protected_url, "/v1/cron/protected?%s", cfg.cluster) < 0)
-            return ZEP_ERR_SYS;
+    if (!cfg.cluster[0]) {
+        zep_log( "rotate: no cluster configured\n");
+        db_close(db);
+        return 1;
+    }
 
     char **protected_guids = NULL;
     int pcount = 0;
-    if (cfg.cluster[0]) {
+    {
+        char *protected_url = NULL;
+        if (asprintf(&protected_url, "/v1/cron/protected?%s", cfg.cluster) < 0) {
+            db_close(db);
+            return 1;
+        }
         char *pj = http_get_json(&http_cfg, protected_url);
         free(protected_url);
         if (pj) {
@@ -1035,114 +1038,69 @@ static int cmd_rotate(int argc, char *argv[]) {
             }
         }
     }
-    (void)pjson;
 
+    char rot_url[256];
+    snprintf(rot_url, sizeof(rot_url), "/v1/cron/rotation?cluster=%s", cfg.cluster);
+    char *rj = http_get_json(&http_cfg, rot_url);
     int purged = 0;
-    const char *p = filesystem[0] ? filesystem :
-                    (optind < argc ? argv[optind] : NULL);
+    cJSON *deleted = cJSON_CreateArray();
 
-    if (!p && cfg.mapping[0]) {
-        const char *mp = cfg.mapping;
-        while (*mp) {
-            const char *colon = strchr(mp, ':');
-            if (!colon) break;
-            char local_fs[ZEP_MAX_SNAPSHOT_NAME];
-            const char *start = colon + 1;
-            const char *end = strchr(start, ',');
-            if (!end) end = start + strlen(start);
-            const char *paren = strchr(start, '(');
-            size_t n = paren ? (size_t)(paren - start) : (size_t)(end - start);
-            if (n >= sizeof(local_fs)) n = sizeof(local_fs) - 1;
-            memcpy(local_fs, start, n);
-            local_fs[n] = '\0';
-            p = local_fs;
-            break;
-        }
-    }
+    if (rj) {
+        cJSON *rot = cJSON_Parse(rj);
+        free(rj);
+        if (rot) {
+            cJSON *skip = cJSON_GetObjectItem(rot, "skip");
+            if (!cJSON_IsTrue(skip)) {
+                cJSON *list = cJSON_GetObjectItem(rot, "rotate");
+                if (list && cJSON_IsArray(list)) {
+                    cJSON *item;
+                    cJSON_ArrayForEach(item, list) {
+                        cJSON *sid = cJSON_GetObjectItem(item, "snapshot");
+                        cJSON *sg = cJSON_GetObjectItem(item, "guid");
+                        if (!sid || !cJSON_IsString(sid) ||
+                            !sg || !cJSON_IsString(sg))
+                            continue;
 
-    if (!p) { zep_log( "rotate: no filesystem specified\n"); db_close(db); return 1; }
+                        int prot = 0;
+                        for (int k = 0; k < pcount; k++)
+                            if (protected_guids[k] &&
+                                strcmp(protected_guids[k], sg->valuestring) == 0)
+                                { prot = 1; break; }
+                        if (prot) continue;
 
-    /* list snapshots for the fs */
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "zfs list -Hp -t snapshot -o name -s creation '%s' 2>/dev/null", p);
-    FILE *fp = popen(cmd, "r");
-    if (!fp) { db_close(db); return 1; }
-
-    char line[512];
-    typedef struct { char *name; char label[64]; char guid[ZEP_MAX_GUID_LEN]; } snap_t;
-    snap_t *snaps = NULL;
-    int scount = 0, scap = 0;
-
-    while (fgets(line, sizeof(line), fp)) {
-        size_t sl = strlen(line);
-        while (sl > 0 && (line[sl-1] == '\n' || line[sl-1] == '\r')) line[--sl] = '\0';
-        if (!line[0]) continue;
-        if (scount >= scap) {
-            scap = scap ? scap * 2 : 64;
-            snaps = realloc(snaps, (size_t)scap * sizeof(snap_t));
-        }
-        snaps[scount].name = strdup(line);
-        /* extract label: after @<cluster>-<label>- */
-        char *at = strchr(line, '@');
-        if (at) {
-            char *dash2 = strchr(at + 1, '-');
-            if (dash2) dash2 = strchr(dash2 + 1, '-');
-            if (dash2) {
-                size_t llen = (size_t)(dash2 - (at + 1));
-                if (llen >= sizeof(snaps[scount].label)) llen = sizeof(snaps[scount].label) - 1;
-                memcpy(snaps[scount].label, at + 1, llen);
-                snaps[scount].label[llen] = '\0';
-            }
-        }
-        snprintf(cmd, sizeof(cmd), "zfs get -Hp -o value guid '%s' 2>/dev/null", line);
-        FILE *gp = popen(cmd, "r");
-        if (gp) {
-            if (fgets(snaps[scount].guid, sizeof(snaps[scount].guid), gp)) {
-                size_t gsl = strlen(snaps[scount].guid);
-                while (gsl > 0 && (snaps[scount].guid[gsl-1] == '\n' ||
-                       snaps[scount].guid[gsl-1] == '\r'))
-                    snaps[scount].guid[--gsl] = '\0';
-            }
-            pclose(gp);
-        }
-        scount++;
-    }
-    pclose(fp);
-
-    /* count per label, purge excess oldest first, skip protected */
-    for (int i = 0; i < scount; i++) {
-        if (!snaps[i].label[0]) continue;
-        int count = 0;
-        for (int j = 0; j < scount; j++)
-            if (strcmp(snaps[j].label, snaps[i].label) == 0) count++;
-
-        int retention = 60; /* default */
-        /* could read from cluster config, use 60 for now */
-
-        if (count > retention && snaps[i].guid[0]) {
-            int protected = 0;
-            for (int k = 0; k < pcount; k++)
-                if (protected_guids[k] && strcmp(protected_guids[k], snaps[i].guid) == 0)
-                    { protected = 1; break; }
-            if (protected) continue;
-
-            char dcmd[1024];
-            snprintf(dcmd, sizeof(dcmd), "zfs destroy '%s' 2>&1", snaps[i].name);
-            FILE *dp = popen(dcmd, "r");
-            if (dp) {
-                char ebuf[256] = {0};
-                if (fread(ebuf, 1, sizeof(ebuf)-1, dp) == 0 && ferror(dp)) {}
-                int rc = pclose(dp);
-                if (rc == 0) {
-                    printf("purged: %s (label=%s, count=%d)\n", snaps[i].name, snaps[i].label, count);
-                    purged++;
+                        char dcmd[1024];
+                        snprintf(dcmd, sizeof(dcmd),
+                            "zfs destroy '%s' 2>&1", sid->valuestring);
+                        FILE *dp = popen(dcmd, "r");
+                        if (dp) {
+                            if (pclose(dp) == 0) {
+                                printf("purged: %s (label=%s)\n",
+                                    sid->valuestring,
+                                    cJSON_GetObjectItem(item, "label")
+                                        ? cJSON_GetObjectItem(item, "label")->valuestring : "");
+                                purged++;
+                                cJSON_AddItemToArray(deleted,
+                                    cJSON_CreateString(sg->valuestring));
+                            }
+                        }
+                    }
                 }
             }
+            cJSON_Delete(rot);
         }
     }
 
-    for (int i = 0; i < scount; i++) free(snaps[i].name);
-    free(snaps);
+    if (cJSON_GetArraySize(deleted) > 0) {
+        cJSON *ack = cJSON_CreateObject();
+        cJSON_AddItemToObject(ack, "deleted", deleted);
+        char *body = cJSON_PrintUnformatted(ack);
+        cJSON_Delete(ack);
+        http_post_json(&http_cfg, "/v1/cron/rotate-ack", body);
+        free(body);
+        deleted = cJSON_CreateArray();
+    }
+    cJSON_Delete(deleted);
+
     for (int i = 0; i < pcount; i++) free(protected_guids[i]);
     free(protected_guids);
     db_close(db);
@@ -1283,9 +1241,123 @@ static int cmd_cron(int argc, char *argv[]) {
                     }
                     db_close(db);
                 }
+            } else if (strcmp(action->valuestring, "inventory") == 0 &&
+                       cfs && cJSON_IsString(cfs)) {
+                char local_fs[ZEP_MAX_SNAPSHOT_NAME];
+                if (db_open(g_db_path, &db) == ZEP_ERR_OK) {
+                    db_init_tables(db);
+                    zep_config_t cfg2;
+                    db_config_load(db, &cfg2);
+                    if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
+                                            local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
+                        cJSON *snaps = cJSON_CreateArray();
+                        char cmd[1024];
+                        snprintf(cmd, sizeof(cmd),
+                            "zfs list -Hp -t snapshot -o name '%s' 2>/dev/null",
+                            local_fs);
+                        FILE *fp = popen(cmd, "r");
+                        if (fp) {
+                            char line[ZEP_MAX_SNAPSHOT_NAME];
+                            while (fgets(line, sizeof(line), fp)) {
+                                size_t sl = strlen(line);
+                                while (sl > 0 && (line[sl-1] == '\n' || line[sl-1] == '\r'))
+                                    line[--sl] = '\0';
+                                if (!line[0]) continue;
+                                char label[64] = {0};
+                                char *at = strchr(line, '@');
+                                if (at) {
+                                    char *d1 = strchr(at + 1, '-');
+                                    char *d2 = d1 ? strchr(d1 + 1, '-') : NULL;
+                                    if (d2) {
+                                        size_t ll = (size_t)(d2 - (at + 1));
+                                        if (ll >= sizeof(label)) ll = sizeof(label) - 1;
+                                        memcpy(label, at + 1, ll);
+                                        label[ll] = '\0';
+                                    }
+                                }
+                                char gbuf[ZEP_MAX_GUID_LEN] = {0};
+                                snprintf(cmd, sizeof(cmd),
+                                    "zfs get -Hp -o value guid '%s' 2>/dev/null",
+                                    line);
+                                FILE *gp = popen(cmd, "r");
+                                if (gp) {
+                                    if (fgets(gbuf, sizeof(gbuf), gp)) {
+                                        size_t gl = strlen(gbuf);
+                                        while (gl > 0 && (gbuf[gl-1] == '\n' || gbuf[gl-1] == '\r'))
+                                            gbuf[--gl] = '\0';
+                                    }
+                                    pclose(gp);
+                                }
+                                cJSON *sn = cJSON_CreateObject();
+                                cJSON_AddStringToObject(sn, "guid", gbuf);
+                                cJSON_AddStringToObject(sn, "snapshot", line);
+                                cJSON_AddStringToObject(sn, "label", label);
+                                cJSON_AddItemToArray(snaps, sn);
+                            }
+                            pclose(fp);
+                        }
+                        cJSON *inv = cJSON_CreateObject();
+                        cJSON_AddStringToObject(inv, "cluster_fs", cfs->valuestring);
+                        cJSON_AddItemToObject(inv, "snapshots", snaps);
+                        char *body = cJSON_PrintUnformatted(inv);
+                        cJSON_Delete(inv);
+                        http_post_json(&http_cfg, "/v1/cron/inventory", body);
+                        free(body);
+                        tasks_done++;
+                    }
+                    db_close(db);
+                }
             }
         }
         cJSON_Delete(tasks);
+
+        if (cfg.cluster[0]) {
+            char rot_url[256];
+            snprintf(rot_url, sizeof(rot_url), "/v1/cron/rotation?cluster=%s", cfg.cluster);
+            char *rj = http_get_json(&http_cfg, rot_url);
+            if (rj) {
+                cJSON *rot = cJSON_Parse(rj);
+                free(rj);
+                if (rot) {
+                    cJSON *skip = cJSON_GetObjectItem(rot, "skip");
+                    if (!cJSON_IsTrue(skip)) {
+                        cJSON *list = cJSON_GetObjectItem(rot, "rotate");
+                        cJSON *deleted = cJSON_CreateArray();
+                        if (list && cJSON_IsArray(list)) {
+                            cJSON *item;
+                            cJSON_ArrayForEach(item, list) {
+                                cJSON *sid = cJSON_GetObjectItem(item, "snapshot");
+                                cJSON *sg = cJSON_GetObjectItem(item, "guid");
+                                if (sid && cJSON_IsString(sid) &&
+                                    sg && cJSON_IsString(sg)) {
+                                    char dcmd[1024];
+                                    snprintf(dcmd, sizeof(dcmd),
+                                        "zfs destroy '%s' 2>/dev/null", sid->valuestring);
+                                    int rc = system(dcmd);
+                                    if (rc == 0) {
+                                        cJSON_AddItemToArray(deleted,
+                                            cJSON_CreateString(sg->valuestring));
+                                        tasks_done++;
+                                    }
+                                }
+                            }
+                        }
+                        if (cJSON_GetArraySize(deleted) > 0) {
+                            cJSON *ack = cJSON_CreateObject();
+                            cJSON_AddItemToObject(ack, "deleted", deleted);
+                            char *body = cJSON_PrintUnformatted(ack);
+                            cJSON_Delete(ack);
+                            http_post_json(&http_cfg, "/v1/cron/rotate-ack", body);
+                            free(body);
+                            deleted = cJSON_CreateArray();
+                        } else {
+                            cJSON_Delete(deleted);
+                        }
+                    }
+                    cJSON_Delete(rot);
+                }
+            }
+        }
 
         if (daemon_mode) {
             for (int s = 0; s < interval && g_daemon_running; s++)
