@@ -30,6 +30,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
 
 static char g_storage_root[ZEP_MAX_PATH] = "/var/lib/zep-air";
 static char g_db_path[ZEP_MAX_PATH]       = "/var/lib/zep-air/zep-air.db";
@@ -42,6 +43,7 @@ static char g_key_password[128] = "";
 int g_verbose = 0;
 static int  g_setup_mode = 0;
 static int  g_no_tls = 0;
+static int  g_resume = 0;
 static struct MHD_Daemon *g_daemon = NULL;
 static sqlite3 *g_db = NULL;
 
@@ -135,6 +137,9 @@ static void parse_url(const char *url, struct conn_ctx *ctx) {
                             n++;
                         } else if (strncmp(tok, "meta.json", 9) == 0) {
                             snprintf(ctx->file, sizeof(ctx->file), "meta.json");
+                            n++;
+                        } else if (strcmp(tok, "status") == 0) {
+                            snprintf(ctx->file, sizeof(ctx->file), "status");
                             n++;
                         } else if (strcmp(tok, "blobs") == 0) {
                             tok = strtok_r(NULL, "", &save);
@@ -373,6 +378,8 @@ static void verify_snapshot(const char *cluster_key, const char *prefix,
 
     db_close(db);
     storage_meta_free(&meta);
+
+    db_upload_complete(g_db, prefix);
 }
 
 static struct node_ws *node_ws_find_locked(const char *cn) {
@@ -2039,6 +2046,16 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                         return ret;
                     }
 
+                    if (g_resume && db_upload_has_incomplete(g_db, ctx->node)) {
+                        cJSON_AddBoolToObject(resp, "skip", 1);
+                        sqlite3_finalize(st);
+                        char *js = cJSON_PrintUnformatted(resp);
+                        cJSON_Delete(resp);
+                        enum MHD_Result ret = send_json(conn, 200, js, ctx);
+                        free(js);
+                        return ret;
+                    }
+
                     cJSON *rotate = cJSON_CreateArray();
 
                     char cfg_key[128], cj_buf[65536] = {0};
@@ -2377,6 +2394,131 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             }
             return send_error(conn, 404, "Snapshot not found", ctx);
         }
+    }
+
+    /* ── GET /v1/nodes/<n>/snapshots/<p>/status (resume) ── */
+    if (g_resume && strcmp(ctx->method, "GET") == 0 &&
+        ctx->parsed >= 3 && ctx->prefix[0] &&
+        strcmp(ctx->file, "status") == 0) {
+        char *meta_path = NULL;
+        if (asprintf(&meta_path, "%s/%s/%s/meta.json",
+                     g_storage_root, ctx->node, ctx->prefix) < 0)
+            return send_error(conn, 500, "OOM", ctx);
+        int meta_ok = (access(meta_path, F_OK) == 0);
+        free(meta_path);
+        if (meta_ok)
+            return send_json(conn, 200, "{\"complete\":true}", ctx);
+
+        char *dir_path = NULL;
+        if (asprintf(&dir_path, "%s/%s/%s",
+                     g_storage_root, ctx->node, ctx->prefix) < 0)
+            return send_error(conn, 500, "OOM", ctx);
+
+        int count = 0;
+        DIR *d = opendir(dir_path);
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                if (ent->d_name[0] >= '0' && ent->d_name[0] <= '9')
+                    count++;
+            }
+            closedir(d);
+        }
+
+        if (count == 0) {
+            free(dir_path);
+            return send_json(conn, 200,
+                "{\"chunk_start\":0,\"resume_token\":\"\","
+                "\"previous_count\":0,\"previous_size\":0}", ctx);
+        }
+
+        unsigned char *concat = NULL;
+        size_t concat_len = 0;
+        size_t concat_cap = 0;
+        cJSON *blobs_arr = cJSON_CreateArray();
+        uint64_t total_size = 0;
+
+        for (int i = 0; i < count; i++) {
+            char *blob_path = NULL;
+            if (asprintf(&blob_path, "%s/%04d", dir_path, i) < 0)
+                continue;
+
+            FILE *f = fopen(blob_path, "rb");
+            free(blob_path);
+            if (!f) continue;
+
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (sz <= 0) { fclose(f); continue; }
+
+            unsigned char *data = malloc((size_t)sz);
+            if (!data) { fclose(f); break; }
+
+            (void)!fread(data, 1, (size_t)sz, f);
+            fclose(f);
+
+            char sha256[65];
+            {
+                unsigned char hash[32];
+                SHA256(data, (size_t)sz, hash);
+                for (int j = 0; j < 32; j++)
+                    sprintf(sha256 + j * 2, "%02x", hash[j]);
+                sha256[64] = '\0';
+            }
+
+            cJSON *b = cJSON_CreateObject();
+            cJSON_AddNumberToObject(b, "part", i);
+            cJSON_AddNumberToObject(b, "size", (double)sz);
+            cJSON_AddStringToObject(b, "sha256", sha256);
+            cJSON_AddItemToArray(blobs_arr, b);
+
+            if (concat_len + (size_t)sz > concat_cap) {
+                concat_cap = concat_cap ? concat_cap * 2 : 16777216;
+                while (concat_cap < concat_len + (size_t)sz)
+                    concat_cap *= 2;
+                unsigned char *nb = realloc(concat, concat_cap);
+                if (!nb) { free(data); free(concat); break; }
+                concat = nb;
+            }
+            memcpy(concat + concat_len, data, (size_t)sz);
+            concat_len += (size_t)sz;
+            total_size += (uint64_t)sz;
+            free(data);
+        }
+
+        char resume_token[ZEP_MAX_LINE] = {0};
+        if (concat && concat_len > 0) {
+            err_t tok_ret = zstream_token_generate(concat, concat_len,
+                                                    resume_token, sizeof(resume_token));
+            if (tok_ret != ZEP_ERR_OK)
+                resume_token[0] = '\0';
+        }
+        free(concat);
+
+        db_upload_track(g_db, ctx->prefix, ctx->node, count,
+                        resume_token[0] ? resume_token : "");
+
+        char *blobs_js = cJSON_PrintUnformatted(blobs_arr);
+        cJSON_Delete(blobs_arr);
+
+        char *body = NULL;
+        if (asprintf(&body,
+            "{\"resume_token\":\"%s\",\"chunk_start\":%d,"
+            "\"previous_count\":%d,\"previous_size\":%llu,"
+            "\"previous_blobs\":%s}",
+            resume_token, count, count,
+            (unsigned long long)total_size, blobs_js) < 0) {
+            free(blobs_js);
+            free(dir_path);
+            return send_error(conn, 500, "OOM", ctx);
+        }
+        free(blobs_js);
+
+        enum MHD_Result ret = send_json(conn, 200, body, ctx);
+        free(body);
+        free(dir_path);
+        return ret;
     }
 
     /* ── GET /v1/blobs/<guid>/<part> ── */
@@ -2807,6 +2949,12 @@ int serve_main(int argc, char *argv[]) {
         return 1;
     }
     db_init_tables(g_db);
+
+    {
+        char buf[32];
+        if (db_config_get(g_db, "resume", buf, sizeof(buf)) == ZEP_ERR_OK)
+            g_resume = atoi(buf);
+    }
 
     if (!g_no_tls && g_ca_path[0]) {
         X509_STORE *ca_store = NULL;

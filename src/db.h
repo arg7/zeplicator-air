@@ -79,4 +79,9 @@ err_t db_snapshot_push_meta(sqlite3 *db, const char *guid,
                              char *label, size_t lbl_len,
                              char *cluster_fs, size_t cfs_len);
 
+err_t db_upload_track(sqlite3 *db, const char *prefix, const char *node,
+                       int total_chunks, const char *resume_token);
+err_t db_upload_complete(sqlite3 *db, const char *prefix);
+int   db_upload_has_incomplete(sqlite3 *db, const char *node);
+
 #endif

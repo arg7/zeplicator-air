@@ -96,6 +96,14 @@ err_t db_init_tables(sqlite3 *db) {
         "  sha256        TEXT NOT NULL,"
         "  storage_ref   TEXT NOT NULL,"
         "  UNIQUE(snapshot_guid, part)"
+        ");"
+        "CREATE TABLE IF NOT EXISTS snapshot_upload ("
+        "  prefix        TEXT PRIMARY KEY,"
+        "  node          TEXT NOT NULL,"
+        "  total_chunks  INTEGER NOT NULL DEFAULT 0,"
+        "  resume_token  TEXT NOT NULL DEFAULT '',"
+        "  complete      INTEGER NOT NULL DEFAULT 0,"
+        "  created_at    TEXT NOT NULL DEFAULT (datetime('now'))"
         ");";
     char *err = NULL;
     int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
@@ -171,6 +179,10 @@ err_t db_config_load(sqlite3 *db, zep_config_t *cfg) {
             long v = atol(buf);
             if (v > 0) cfg->chunk_size = (size_t)v;
         }
+
+        if (db_config_get(db, "resume", buf, sizeof(buf)) == ZEP_ERR_OK)
+            cfg->resume = atoi(buf);
+        else cfg->resume = 0;
     }
     return ZEP_ERR_OK;
 }
@@ -869,4 +881,46 @@ err_t db_rotation_candidates(sqlite3 *db, const char *cluster,
         }
     }
     return ZEP_ERR_OK;
+}
+
+err_t db_upload_track(sqlite3 *db, const char *prefix, const char *node,
+                       int total_chunks, const char *resume_token) {
+    const char *sql =
+        "INSERT OR REPLACE INTO snapshot_upload "
+        "(prefix, node, total_chunks, resume_token, complete) "
+        "VALUES (?, ?, ?, ?, 0)";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, prefix, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, node, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 3, total_chunks);
+    sqlite3_bind_text(stmt, 4, resume_token ? resume_token : "", -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
+}
+
+err_t db_upload_complete(sqlite3 *db, const char *prefix) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "DELETE FROM snapshot_upload WHERE prefix = ?1",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, prefix, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
+}
+
+int db_upload_has_incomplete(sqlite3 *db, const char *node) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT 1 FROM snapshot_upload WHERE node = ?1 AND complete = 0 LIMIT 1",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(stmt, 1, node, -1, SQLITE_STATIC);
+    int found = (sqlite3_step(stmt) == SQLITE_ROW);
+    sqlite3_finalize(stmt);
+    return found;
 }

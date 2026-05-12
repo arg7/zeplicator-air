@@ -61,11 +61,21 @@ err_t zfs_snapshot_create_cluster(const char *fs, const char *cluster,
 
 err_t zfs_send_open(const char *fs, const char *from_snap, const char *to_snap,
                     int send_all, const char *extra_opts,
-                    const char *zip_cmd, const char *buf_cmd, FILE **fp) {
+                    const char *zip_cmd, const char *buf_cmd,
+                    const char *resume_token, FILE **fp) {
     (void)fs;
     char cmd[4096];
 
-    if (from_snap && from_snap[0]) {
+    if (resume_token && resume_token[0]) {
+        snprintf(cmd, sizeof(cmd),
+            "zfs send %s -t '%s' '%s' 2>/dev/null%s%s%s%s",
+            extra_opts ? extra_opts : "",
+            resume_token, to_snap,
+            buf_cmd && buf_cmd[0] ? " | " : "",
+            buf_cmd && buf_cmd[0] ? buf_cmd : "",
+            zip_cmd && zip_cmd[0] ? " | " : "",
+            zip_cmd && zip_cmd[0] ? zip_cmd : "");
+    } else if (from_snap && from_snap[0]) {
         snprintf(cmd, sizeof(cmd),
             "zfs send %s %s '%s' '%s' 2>/dev/null%s%s%s%s",
             extra_opts ? extra_opts : "",

@@ -6,7 +6,7 @@ SERV_LDFLAGS = $(LDFLAGS) $(shell pkg-config --libs gnutls)
 
 COMMON   = src/db.c src/zfs.c src/storage.c src/pipeline.c src/http.c
 
-all: zep-air zep-air-serve zep-air-admin
+all: zep-air zep-air-serve zep-air-admin zep-stream-ff
 
 zep-air: src/main.c $(COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lutil
@@ -17,10 +17,13 @@ zep-air-serve: src/serve.c src/storage.c src/db.c src/zstream.c src/auth.c
 zep-air-admin: src/admin.c src/db.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+zep-stream-ff: src/stream-ff.c
+	$(CC) -Wall -Wextra -Werror -g -O2 -std=c11 -D_GNU_SOURCE -o $@ $^
+
 clean:
-	rm -f zep-air zep-air-serve zep-air-admin
+	rm -f zep-air zep-air-serve zep-air-admin zep-stream-ff
 
 install: all
-	cp zep-air zep-air-serve zep-air-admin /usr/local/bin/
+	cp zep-air zep-air-serve zep-air-admin zep-stream-ff /usr/local/bin/
 
 .PHONY: all clean install

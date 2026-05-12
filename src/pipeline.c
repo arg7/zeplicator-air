@@ -4,12 +4,16 @@
 #include "storage.h"
 #include "zfs.h"
 #include "http.h"
+#include "db.h"
 #include "common.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include <openssl/evp.h>
+#include <sqlite3.h>
+#include <cjson/cJSON.h>
 
 err_t pipeline_resolve_fs(const char *cluster_fs, const char *mapping,
                           char *local_fs, size_t len) {
@@ -126,12 +130,18 @@ static err_t find_base_snapshot(const char *fs, const char *base_guid, char *sna
 err_t pipeline_push(const zep_config_t *cfg,
                     const http_config_t *http_cfg,
                     const char *fs, const char *label,
-                    const char *cluster_fs) {
+                    const char *cluster_fs, sqlite3 *db) {
     char base_guid[ZEP_MAX_GUID_LEN] = {0};
     char snap_name[ZEP_MAX_SNAPSHOT_NAME];
     char guid[ZEP_MAX_GUID_LEN];
     char base_snap[ZEP_MAX_SNAPSHOT_NAME] = {0};
     char created[32];
+    char resume_token[ZEP_MAX_LINE] = {0};
+    int chunk_start = 0;
+    int prev_blob_count = 0;
+    uint64_t prev_stream_size = 0;
+    blob_info_t *prev_blobs = NULL;
+    int is_resume = 0;
     snapshot_meta_t meta;
     memset(&meta, 0, sizeof(meta));
 
@@ -144,11 +154,106 @@ err_t pipeline_push(const zep_config_t *cfg,
         return ZEP_ERR_DB;
     }
 
+    /* ── check for interrupted push (resume) ── */
+    if (cfg->resume && db) {
+        char state_key[320];
+        snprintf(state_key, sizeof(state_key), "push_state_%s_%s",
+                 cluster_fs ? cluster_fs : fs, label);
+        char state_buf[ZEP_MAX_LINE * 2];
+        if (db_config_get(db, state_key, state_buf, sizeof(state_buf)) == ZEP_ERR_OK
+            && state_buf[0]) {
+            char *save = NULL;
+            char *s = strdup(state_buf);
+            if (!s) goto new_push;
+            char *tok = strtok_r(s, ":", &save);
+            char stored_prefix[ZEP_MAX_PATH] = {0};
+            char stored_snap[ZEP_MAX_SNAPSHOT_NAME] = {0};
+            char stored_base[ZEP_MAX_SNAPSHOT_NAME] = {0};
+            if (tok) snprintf(stored_prefix, sizeof(stored_prefix), "%s", tok);
+            tok = strtok_r(NULL, ":", &save);
+            if (tok) snprintf(stored_snap, sizeof(stored_snap), "%s", tok);
+            tok = strtok_r(NULL, ":", &save);
+            if (tok && tok[0]) snprintf(stored_base, sizeof(stored_base), "%s", tok);
+            free(s);
+
+            if (stored_prefix[0] && stored_snap[0]) {
+                char *status_url = NULL;
+                if (asprintf(&status_url, "/v1/nodes/%s/snapshots/%s/status",
+                             cfg->node_name, stored_prefix) < 0)
+                    goto new_push;
+                char *status_json = http_get_json(http_cfg, status_url);
+                free(status_url);
+
+                if (status_json) {
+                    cJSON *status_obj = cJSON_Parse(status_json);
+                    free(status_json);
+                    if (status_obj) {
+                        cJSON *comp = cJSON_GetObjectItem(status_obj, "complete");
+                        if (cJSON_IsTrue(comp)) {
+                            cJSON_Delete(status_obj);
+                            db_config_set(db, state_key, "");
+                            goto new_push;
+                        }
+                        cJSON *rt = cJSON_GetObjectItem(status_obj, "resume_token");
+                        cJSON *cs = cJSON_GetObjectItem(status_obj, "chunk_start");
+                        cJSON *pc = cJSON_GetObjectItem(status_obj, "previous_count");
+                        cJSON *ps = cJSON_GetObjectItem(status_obj, "previous_size");
+                        cJSON *pb = cJSON_GetObjectItem(status_obj, "previous_blobs");
+                        if (rt && cJSON_IsString(rt) && rt->valuestring[0])
+                            snprintf(resume_token, sizeof(resume_token), "%s", rt->valuestring);
+                        if (cs && cJSON_IsNumber(cs))
+                            chunk_start = cs->valueint;
+                        if (pc && cJSON_IsNumber(pc))
+                            prev_blob_count = pc->valueint;
+                        if (ps && cJSON_IsNumber(ps))
+                            prev_stream_size = (uint64_t)ps->valuedouble;
+                        if (pb && cJSON_IsArray(pb) && prev_blob_count > 0) {
+                            prev_blobs = calloc((size_t)prev_blob_count, sizeof(blob_info_t));
+                            if (prev_blobs) {
+                                for (int i = 0; i < prev_blob_count; i++) {
+                                    cJSON *item = cJSON_GetArrayItem(pb, i);
+                                    if (!item) continue;
+                                    cJSON *ip = cJSON_GetObjectItem(item, "part");
+                                    cJSON *is = cJSON_GetObjectItem(item, "size");
+                                    cJSON *ih = cJSON_GetObjectItem(item, "sha256");
+                                    if (ip && cJSON_IsNumber(ip))
+                                        snprintf(prev_blobs[i].part, sizeof(prev_blobs[i].part),
+                                                 "%04d", ip->valueint);
+                                    if (is && cJSON_IsNumber(is))
+                                        prev_blobs[i].size = (size_t)is->valuedouble;
+                                    if (ih && cJSON_IsString(ih))
+                                        snprintf(prev_blobs[i].sha256, sizeof(prev_blobs[i].sha256),
+                                                 "%s", ih->valuestring);
+                                }
+                            }
+                        }
+                        cJSON_Delete(status_obj);
+                        is_resume = 1;
+                    }
+                }
+
+                if (is_resume) {
+                    snprintf(snap_name, sizeof(snap_name), "%s", stored_snap);
+                    snprintf(base_snap, sizeof(base_snap), "%s", stored_base);
+                    zfs_get_snapshot_guid(stored_snap, guid, sizeof(guid));
+                    zfs_get_latest_guid(fs, base_guid, sizeof(base_guid));
+                    if (base_guid[0] && strcmp(base_guid, guid) == 0)
+                        base_guid[0] = '\0';
+                    iso8601_now(created, sizeof(created));
+                    goto skip_snapshot;
+                }
+            }
+        }
+    }
+
+new_push:
     zfs_get_latest_guid(fs, base_guid, sizeof(base_guid));
 
-    err_t ret = zfs_snapshot_create(fs, label, snap_name, sizeof(snap_name));
-    if (ret != ZEP_ERR_OK) {
+    {
+        err_t ret = zfs_snapshot_create(fs, label, snap_name, sizeof(snap_name));
+        if (ret != ZEP_ERR_OK) {
         zep_log( "push: failed to create snapshot\n");
+        free(prev_blobs);
         return ret;
     }
     printf("Created snapshot: %s\n", snap_name);
@@ -157,12 +262,12 @@ err_t pipeline_push(const zep_config_t *cfg,
     if (ret != ZEP_ERR_OK) {
         zep_log( "push: failed to get snapshot guid\n");
         zfs_destroy_snapshot(snap_name);
+        free(prev_blobs);
         return ret;
     }
 
-    if (base_guid[0] && strcmp(base_guid, guid) == 0) {
+    if (base_guid[0] && strcmp(base_guid, guid) == 0)
         base_guid[0] = '\0';
-    }
 
     if (base_guid[0]) {
         ret = find_base_snapshot(fs, base_guid, base_snap, sizeof(base_snap));
@@ -172,32 +277,58 @@ err_t pipeline_push(const zep_config_t *cfg,
             base_snap[0] = '\0';
         }
     }
+    }
 
     iso8601_now(created, sizeof(created));
 
-    time_t now = time(NULL);
-    uint32_t inv = zep_invert_ts(now);
+skip_snapshot:
+    {
     char prefix[ZEP_MAX_PATH];
-    snprintf(prefix, sizeof(prefix), "%010u-%s", inv, guid);
+    if (is_resume) {
+        char state_key[320];
+        snprintf(state_key, sizeof(state_key), "push_state_%s_%s",
+                 cluster_fs ? cluster_fs : fs, label);
+        char state_buf[ZEP_MAX_LINE * 2];
+        if (db && db_config_get(db, state_key, state_buf, sizeof(state_buf)) == ZEP_ERR_OK) {
+            char *save = NULL, *st = strdup(state_buf);
+            if (st) {
+                char *tok = strtok_r(st, ":", &save);
+                if (tok) snprintf(prefix, sizeof(prefix), "%s", tok);
+                free(st);
+            }
+        }
+        if (!prefix[0]) {
+            time_t now = time(NULL);
+            uint32_t inv = zep_invert_ts(now);
+            snprintf(prefix, sizeof(prefix), "%010u-%s", inv, guid);
+        }
+    } else {
+        time_t now = time(NULL);
+        uint32_t inv = zep_invert_ts(now);
+        snprintf(prefix, sizeof(prefix), "%010u-%s", inv, guid);
+    }
 
     FILE *send_fp = NULL;
-    ret = zfs_send_open(fs, base_snap[0] ? base_snap : NULL, snap_name,
+    err_t ret = zfs_send_open(fs, base_snap[0] ? base_snap : NULL, snap_name,
                         cfg->send_all_snap,
                         cfg->send_options[0] ? cfg->send_options : NULL,
-                        cfg->push_zip_cmd, cfg->push_buf_cmd,
-                        &send_fp);
+                        NULL, cfg->push_buf_cmd,
+                        resume_token[0] ? resume_token : NULL, &send_fp);
     if (ret != ZEP_ERR_OK) {
-        zfs_destroy_snapshot(snap_name);
+        if (!is_resume) zfs_destroy_snapshot(snap_name);
+        free(prev_blobs);
         return ret;
     }
 
-    printf("Sending %s %s base...\n", snap_name, base_snap[0] ? "incremental" : "full");
+    printf("Sending %s %s base...\n", snap_name,
+           base_snap[0] ? (is_resume ? "resume" : "incremental") : "full");
 
     size_t chunk_size = cfg->chunk_size;
     unsigned char *buf = malloc(chunk_size);
     if (!buf) {
         zfs_send_close(send_fp);
-        zfs_destroy_snapshot(snap_name);
+        if (!is_resume) zfs_destroy_snapshot(snap_name);
+        free(prev_blobs);
         return ZEP_ERR_SYS;
     }
 
@@ -206,7 +337,8 @@ err_t pipeline_push(const zep_config_t *cfg,
     if (!blobs) {
         free(buf);
         zfs_send_close(send_fp);
-        zfs_destroy_snapshot(snap_name);
+        if (!is_resume) zfs_destroy_snapshot(snap_name);
+        free(prev_blobs);
         return ZEP_ERR_SYS;
     }
 
@@ -217,20 +349,69 @@ err_t pipeline_push(const zep_config_t *cfg,
         size_t nread = fread(buf, 1, chunk_size, send_fp);
         if (nread == 0) break;
 
-        sha256_hex(buf, nread, blobs[blob_count].sha256);
-        blobs[blob_count].size = nread;
-        snprintf(blobs[blob_count].part, sizeof(blobs[blob_count].part), "%04d", blob_count);
+        char tmpname[] = "/tmp/zep-push-XXXXXX";
+        int fd = mkstemp(tmpname);
+        if (fd < 0) { ret = ZEP_ERR_SYS; break; }
+        {
+            size_t wr = 0;
+            while (wr < nread) {
+                ssize_t nw = write(fd, (const char *)buf + wr, nread - wr);
+                if (nw <= 0) break;
+                wr += (size_t)nw;
+            }
+        }
+        close(fd);
+        if (ret != ZEP_ERR_OK) { unlink(tmpname); break; }
+
+        char comp_cmd[4096];
+        if (cfg->push_zip_cmd[0])
+            snprintf(comp_cmd, sizeof(comp_cmd), "%s '%s' 2>/dev/null",
+                     cfg->push_zip_cmd, tmpname);
+        else
+            snprintf(comp_cmd, sizeof(comp_cmd), "cat '%s'", tmpname);
+
+        FILE *comp_fp = popen(comp_cmd, "r");
+        if (!comp_fp) { unlink(tmpname); ret = ZEP_ERR_SYS; break; }
+
+        size_t comp_cap = nread + nread / 8 + 1024;
+        unsigned char *comp_buf = malloc(comp_cap);
+        if (!comp_buf) { pclose(comp_fp); unlink(tmpname); ret = ZEP_ERR_SYS; break; }
+        size_t comp_len = 0;
+        while (1) {
+            if (comp_len + 65536 > comp_cap) {
+                comp_cap *= 2;
+                unsigned char *nb = realloc(comp_buf, comp_cap);
+                if (!nb) { free(comp_buf); pclose(comp_fp); unlink(tmpname); ret = ZEP_ERR_SYS; break; }
+                comp_buf = nb;
+            }
+            size_t nr = fread(comp_buf + comp_len, 1,
+                              comp_cap - comp_len - 1, comp_fp);
+            if (nr == 0) break;
+            comp_len += nr;
+        }
+        int comp_rc = pclose(comp_fp);
+        unlink(tmpname);
+        if (ret != ZEP_ERR_OK) { free(comp_buf); break; }
+        if (comp_rc != 0) { free(comp_buf); zep_log( "push: compression failed\n"); ret = ZEP_ERR_ZFS; break; }
+
+        sha256_hex(comp_buf, comp_len, blobs[blob_count].sha256);
+        blobs[blob_count].size = comp_len;
+        snprintf(blobs[blob_count].part, sizeof(blobs[blob_count].part),
+                 "%04d", chunk_start + blob_count);
 
         ret = http_put_blob(http_cfg, cfg->node_name, prefix,
-                            blob_count, buf, nread);
+                            chunk_start + blob_count, comp_buf, comp_len);
+        free(comp_buf);
         if (ret != ZEP_ERR_OK) {
-            zep_log( "push: failed to upload blob %d\n", blob_count);
+            zep_log( "push: failed to upload blob %d\n", chunk_start + blob_count);
             break;
         }
 
-        stream_size += nread;
+        stream_size += comp_len;
         blob_count++;
-        printf("  blob %04d: %zu bytes  sha256=%s\n", blob_count - 1, nread, blobs[blob_count - 1].sha256);
+        printf("  blob %04d: %zu -> %zu bytes  sha256=%s\n",
+               chunk_start + blob_count - 1, nread, comp_len,
+               blobs[blob_count - 1].sha256);
 
         if (blob_count >= MAX_BLOBS) {
             zep_log( "push: max blobs exceeded\n");
@@ -243,36 +424,83 @@ err_t pipeline_push(const zep_config_t *cfg,
 
     if (ret != ZEP_ERR_OK || blob_count == 0) {
         free(blobs);
-        zfs_destroy_snapshot(snap_name);
+        if (!is_resume) zfs_destroy_snapshot(snap_name);
+        /* save push state so next cycle can resume */
+        if (cfg->resume && db) {
+            char state_key[320], state_val[ZEP_MAX_LINE * 2];
+            snprintf(state_key, sizeof(state_key), "push_state_%s_%s",
+                     cluster_fs ? cluster_fs : fs, label);
+            snprintf(state_val, sizeof(state_val), "%s:%s:%s",
+                     prefix, snap_name, base_snap);
+            db_config_set(db, state_key, state_val);
+        }
+        free(prev_blobs);
         return ret != ZEP_ERR_OK ? ret : ZEP_ERR_ZFS;
     }
 
-    snprintf(meta.snapshot, sizeof(meta.snapshot), "%s", snap_name);
-    snprintf(meta.guid, sizeof(meta.guid), "%s", guid);
-    snprintf(meta.base_guid, sizeof(meta.base_guid), "%s", base_guid);
-    snprintf(meta.label, sizeof(meta.label), "%s", label);
-    snprintf(meta.cluster_fs, sizeof(meta.cluster_fs), "%s", cluster_fs ? cluster_fs : "");
-    snprintf(meta.created, sizeof(meta.created), "%s", created);
-    snprintf(meta.host, sizeof(meta.host), "%s", cfg->node_name);
-    zep_log( "push: cluster_fs='%s' label='%s' host='%s'\n",
-            meta.cluster_fs, meta.label, meta.host);
-    meta.stream_size = stream_size;
-    meta.blob_count = blob_count;
-    meta.blobs = blobs;
+    /* merge previous session blobs with this session */
+    {
+        int total_blob_count = prev_blob_count + blob_count;
+        uint64_t total_stream_size = prev_stream_size + stream_size;
+        blob_info_t *all_blobs = calloc((size_t)total_blob_count, sizeof(blob_info_t));
+        if (!all_blobs) {
+            free(blobs);
+            if (!is_resume) zfs_destroy_snapshot(snap_name);
+            free(prev_blobs);
+            return ZEP_ERR_SYS;
+        }
+        for (int i = 0; i < prev_blob_count; i++)
+            memcpy(&all_blobs[i], &prev_blobs[i], sizeof(blob_info_t));
+        for (int i = 0; i < blob_count; i++)
+            memcpy(&all_blobs[prev_blob_count + i], &blobs[i], sizeof(blob_info_t));
 
-    ret = http_put_meta(http_cfg, cfg->node_name, prefix, &meta);
-    if (ret != ZEP_ERR_OK) {
-        zep_log( "push: failed to upload meta.json\n");
-        free(blobs);
-        zfs_destroy_snapshot(snap_name);
-        return ret;
+        snprintf(meta.snapshot, sizeof(meta.snapshot), "%s", snap_name);
+        snprintf(meta.guid, sizeof(meta.guid), "%s", guid);
+        snprintf(meta.base_guid, sizeof(meta.base_guid), "%s", base_guid);
+        snprintf(meta.label, sizeof(meta.label), "%s", label);
+        snprintf(meta.cluster_fs, sizeof(meta.cluster_fs), "%s", cluster_fs ? cluster_fs : "");
+        snprintf(meta.created, sizeof(meta.created), "%s", created);
+        snprintf(meta.host, sizeof(meta.host), "%s", cfg->node_name);
+        meta.stream_size = total_stream_size;
+        meta.blob_count = total_blob_count;
+        meta.blobs = all_blobs;
+
+        ret = http_put_meta(http_cfg, cfg->node_name, prefix, &meta);
+        if (ret != ZEP_ERR_OK) {
+            zep_log( "push: failed to upload meta.json\n");
+            free(all_blobs);
+            free(blobs);
+            free(prev_blobs);
+            /* save push state so next cycle can resume */
+            if (cfg->resume && db) {
+                char state_key[320], state_val[ZEP_MAX_LINE * 2];
+                snprintf(state_key, sizeof(state_key), "push_state_%s_%s",
+                         cluster_fs ? cluster_fs : fs, label);
+                snprintf(state_val, sizeof(state_val), "%s:%s:%s",
+                         prefix, snap_name, base_snap);
+                db_config_set(db, state_key, state_val);
+            }
+            return ret;
+        }
+
+        printf("Push complete: %s  guid=%s  blobs=%d  size=%lu  prefix=%s\n",
+               snap_name, guid, total_blob_count, (unsigned long)total_stream_size, prefix);
+
+        free(all_blobs);
     }
 
-    printf("Push complete: %s  guid=%s  blobs=%d  size=%lu  prefix=%s\n",
-           snap_name, guid, blob_count, (unsigned long)stream_size, prefix);
+    /* delete push state on success */
+    if (cfg->resume && db) {
+        char state_key[320];
+        snprintf(state_key, sizeof(state_key), "push_state_%s_%s",
+                 cluster_fs ? cluster_fs : fs, label);
+        db_config_set(db, state_key, "");
+    }
 
     free(blobs);
+    free(prev_blobs);
     return ZEP_ERR_OK;
+    }
 }
 
 err_t pipeline_pull(const zep_config_t *cfg,
@@ -400,7 +628,11 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
 
     char local_guid[ZEP_MAX_GUID_LEN] = {0};
     zfs_get_latest_guid(fs, local_guid, sizeof(local_guid));
+    zep_log( "pull_v2: local=%s fs=%s snap_count=%d\n",
+           local_guid[0] ? local_guid : "(none)", fs,
+           cJSON_GetArraySize(snapshots));
 
+    int first_guid = 1;
     cJSON *snap;
     cJSON_ArrayForEach(snap, snapshots) {
         cJSON *g = cJSON_GetObjectItem(snap, "guid");
@@ -413,6 +645,13 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
         int is_full = (!bg->valuestring[0] || strcmp(bg->valuestring, "0") == 0);
         int can_pull = (!local_guid[0] && bg && cJSON_IsString(bg) && is_full)
                      || (bg && cJSON_IsString(bg) && strcmp(local_guid, bg->valuestring) == 0);
+        if (first_guid) {
+            first_guid = 0;
+            zep_log( "pull_v2: first snap guid=%s base=%s can_pull=%d\n",
+                   g->valuestring,
+                   (bg && cJSON_IsString(bg)) ? bg->valuestring : "(none)",
+                   can_pull);
+        }
         if (!can_pull) continue;
 
         if (bg && cJSON_IsString(bg) && is_full) {
@@ -442,7 +681,9 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
                                    cfg->pull_unzip_cmd, cfg->pull_buf_cmd,
                                    &recv_fp);
         if (ret != ZEP_ERR_OK) {
-            zep_log( "pull: failed to open zfs recv\n");
+            zep_log( "pull_v2: recv_open FAILED fs=%s snap=%s unzip=%s\n",
+                   fs, snap_name,
+                   cfg->pull_unzip_cmd[0] ? cfg->pull_unzip_cmd : "(none)");
             continue;
         }
 

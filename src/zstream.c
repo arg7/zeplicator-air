@@ -73,3 +73,40 @@ err_t zstream_parse(const void *data, size_t len,
 
     return ZEP_ERR_OK;
 }
+
+err_t zstream_token_generate(const void *data, size_t len,
+                              char *token_out, size_t token_len) {
+    if (!data || !len || !token_out || !token_len)
+        return ZEP_ERR_SYS;
+
+    char tmpl[] = "/tmp/zep-token-XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return ZEP_ERR_SYS;
+
+    size_t written = 0;
+    while (written < len) {
+        ssize_t n = write(fd, (const char *)data + written, len - written);
+        if (n <= 0) { close(fd); unlink(tmpl); return ZEP_ERR_SYS; }
+        written += (size_t)n;
+    }
+    close(fd);
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "zstd -d '%s' -c 2>/dev/null | zstream token -g", tmpl);
+    FILE *p = popen(cmd, "r");
+    if (!p) { unlink(tmpl); return ZEP_ERR_ZFS; }
+
+    token_out[0] = '\0';
+    if (!fgets(token_out, (int)token_len, p)) {
+        pclose(p); unlink(tmpl); return ZEP_ERR_ZFS;
+    }
+    pclose(p);
+    unlink(tmpl);
+
+    size_t n = strlen(token_out);
+    while (n > 0 && (token_out[n - 1] == '\n' || token_out[n - 1] == '\r'))
+        token_out[--n] = '\0';
+
+    return token_out[0] ? ZEP_ERR_OK : ZEP_ERR_ZFS;
+}
