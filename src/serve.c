@@ -2310,9 +2310,12 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 }
 
                 if (has_common) {
+                    zep_log( "inventory: %s/%s has common snapshot, ok\n",
+                           ctx->node, cfs->valuestring);
                     sqlite3_stmt *up = NULL;
                     sqlite3_prepare_v2(g_db,
-                        "UPDATE auth SET last_err = '' WHERE cn = ?1",
+                        "UPDATE auth SET suspended = 0, last_err = '' "
+                        "WHERE cn = ?1",
                         -1, &up, NULL);
                     if (up) {
                         sqlite3_bind_text(up, 1, ctx->node, -1, SQLITE_STATIC);
@@ -2320,17 +2323,82 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                         sqlite3_finalize(up);
                     }
                 } else {
-                    sqlite3_stmt *up = NULL;
-                    sqlite3_prepare_v2(g_db,
-                        "UPDATE auth SET suspended = 1, "
-                        "last_err = 'no common snapshots for ' || ?1 "
-                        "WHERE cn = ?2",
-                        -1, &up, NULL);
-                    if (up) {
-                        sqlite3_bind_text(up, 1, cfs->valuestring, -1, SQLITE_STATIC);
-                        sqlite3_bind_text(up, 2, ctx->node, -1, SQLITE_STATIC);
-                        sqlite3_step(up);
-                        sqlite3_finalize(up);
+                    int snap_count = cJSON_GetArraySize(snaps);
+                    if (snap_count == 0) {
+                        sqlite3_stmt *init_st = NULL;
+                        sqlite3_prepare_v2(g_db,
+                            "SELECT 1 FROM snapshots "
+                            "WHERE cluster = ?1 AND cluster_fs = ?2 "
+                            "  AND direction = 'push' AND base_guid = '0' "
+                            "LIMIT 1",
+                            -1, &init_st, NULL);
+                        int has_initial = 0;
+                        if (init_st) {
+                            sqlite3_bind_text(init_st, 1, cl_buf, -1,
+                                              SQLITE_STATIC);
+                            sqlite3_bind_text(init_st, 2, cfs->valuestring,
+                                              -1, SQLITE_STATIC);
+                            has_initial =
+                                (sqlite3_step(init_st) == SQLITE_ROW);
+                            sqlite3_finalize(init_st);
+                        }
+                        if (has_initial) {
+                            zep_log( "inventory: %s has no snaps for %s, "
+                                   "master has initial — full sync next "
+                                   "cycle\n",
+                                   ctx->node, cfs->valuestring);
+                            sqlite3_stmt *up = NULL;
+                            sqlite3_prepare_v2(g_db,
+                                "UPDATE auth SET suspended = 0, "
+                                "last_err = '' WHERE cn = ?1",
+                                -1, &up, NULL);
+                            if (up) {
+                                sqlite3_bind_text(up, 1, ctx->node, -1,
+                                                  SQLITE_STATIC);
+                                sqlite3_step(up);
+                                sqlite3_finalize(up);
+                            }
+                            db_snapshot_insert(g_db, cl_buf, ctx->node,
+                                "", "", "", "", cfs->valuestring,
+                                0, 0, "pull", "");
+                        } else {
+                            zep_log( "inventory: %s has no snaps for %s, "
+                                   "no initial — suspending\n",
+                                   ctx->node, cfs->valuestring);
+                            sqlite3_stmt *up = NULL;
+                            sqlite3_prepare_v2(g_db,
+                                "UPDATE auth SET suspended = 1, "
+                                "last_err = 'no common snapshots for ' "
+                                "|| ?1 WHERE cn = ?2",
+                                -1, &up, NULL);
+                            if (up) {
+                                sqlite3_bind_text(up, 1, cfs->valuestring,
+                                                  -1, SQLITE_STATIC);
+                                sqlite3_bind_text(up, 2, ctx->node, -1,
+                                                  SQLITE_STATIC);
+                                sqlite3_step(up);
+                                sqlite3_finalize(up);
+                            }
+                        }
+                    } else {
+                        zep_log( "inventory: %s has %d snap(s) for %s, "
+                               "none match master — foreign data, "
+                               "suspending\n",
+                               ctx->node, snap_count, cfs->valuestring);
+                        sqlite3_stmt *up = NULL;
+                        sqlite3_prepare_v2(g_db,
+                            "UPDATE auth SET suspended = 1, "
+                            "last_err = 'no common snapshots for ' "
+                            "|| ?1 WHERE cn = ?2",
+                            -1, &up, NULL);
+                        if (up) {
+                            sqlite3_bind_text(up, 1, cfs->valuestring,
+                                              -1, SQLITE_STATIC);
+                            sqlite3_bind_text(up, 2, ctx->node, -1,
+                                              SQLITE_STATIC);
+                            sqlite3_step(up);
+                            sqlite3_finalize(up);
+                        }
                     }
                 }
             }
@@ -2432,9 +2500,6 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 "\"previous_count\":0,\"previous_size\":0}", ctx);
         }
 
-        unsigned char *concat = NULL;
-        size_t concat_len = 0;
-        size_t concat_cap = 0;
         cJSON *blobs_arr = cJSON_CreateArray();
         uint64_t total_size = 0;
 
@@ -2466,49 +2531,66 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     sprintf(sha256 + j * 2, "%02x", hash[j]);
                 sha256[64] = '\0';
             }
+            free(data);
 
             cJSON *b = cJSON_CreateObject();
             cJSON_AddNumberToObject(b, "part", i);
             cJSON_AddNumberToObject(b, "size", (double)sz);
             cJSON_AddStringToObject(b, "sha256", sha256);
             cJSON_AddItemToArray(blobs_arr, b);
-
-            if (concat_len + (size_t)sz > concat_cap) {
-                concat_cap = concat_cap ? concat_cap * 2 : 16777216;
-                while (concat_cap < concat_len + (size_t)sz)
-                    concat_cap *= 2;
-                unsigned char *nb = realloc(concat, concat_cap);
-                if (!nb) { free(data); free(concat); break; }
-                concat = nb;
-            }
-            memcpy(concat + concat_len, data, (size_t)sz);
-            concat_len += (size_t)sz;
             total_size += (uint64_t)sz;
-            free(data);
         }
 
+        int prev_count = 0;
         char resume_token[ZEP_MAX_LINE] = {0};
-        if (concat && concat_len > 0) {
-            err_t tok_ret = zstream_token_generate(concat, concat_len,
-                                                    resume_token, sizeof(resume_token));
-            if (tok_ret != ZEP_ERR_OK)
-                resume_token[0] = '\0';
+        {
+            char prev_tok[ZEP_MAX_LINE] = {0};
+            db_upload_get_prev(g_db, ctx->prefix, &prev_count,
+                               prev_tok, sizeof(prev_tok));
+
+            char cmd[8192];
+            snprintf(cmd, sizeof(cmd),
+                     "zep-stream-ff --in '%s' 2>/dev/null"
+                     " | zstream token -g 2>/dev/null", dir_path);
+            zep_log("status: count=%d prev=%d cmd=%s\n",
+                    count, prev_count, cmd);
+            fflush(stderr);
+            FILE *p = popen(cmd, "r");
+            if (p) {
+                if (fgets(resume_token, (int)sizeof(resume_token), p)) {
+                    size_t n = strlen(resume_token);
+                    while (n > 0 && (resume_token[n-1] == '\n' ||
+                                     resume_token[n-1] == '\r'))
+                        resume_token[--n] = '\0';
+                    zep_log("status: token=%s\n",
+                            resume_token[0] ? resume_token : "(empty)");
+                }
+                pclose(p);
+            }
         }
-        free(concat);
 
         db_upload_track(g_db, ctx->prefix, ctx->node, count,
                         resume_token[0] ? resume_token : "");
 
-        char *blobs_js = cJSON_PrintUnformatted(blobs_arr);
+        char *blobs_js = NULL;
+        {
+            cJSON *prev_arr = cJSON_CreateArray();
+            int n = cJSON_GetArraySize(blobs_arr);
+            for (int i = 0; i < n && i < prev_count; i++)
+                cJSON_AddItemToArray(prev_arr,
+                    cJSON_Duplicate(cJSON_GetArrayItem(blobs_arr, i), 1));
+            blobs_js = cJSON_PrintUnformatted(prev_arr);
+            cJSON_Delete(prev_arr);
+        }
         cJSON_Delete(blobs_arr);
 
         char *body = NULL;
         if (asprintf(&body,
             "{\"resume_token\":\"%s\",\"chunk_start\":%d,"
-            "\"previous_count\":%d,\"previous_size\":%llu,"
+            "\"previous_count\":%d,\"previous_size\":0,"
             "\"previous_blobs\":%s}",
-            resume_token, count, count,
-            (unsigned long long)total_size, blobs_js) < 0) {
+            resume_token, count, prev_count,
+            blobs_js) < 0) {
             free(blobs_js);
             free(dir_path);
             return send_error(conn, 500, "OOM", ctx);

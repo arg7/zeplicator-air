@@ -53,6 +53,21 @@ PID_DIR="${ZEP_BASE}/pids"
 SERVER_PIDFILE="${PID_DIR}/server.pid"
 CRON_PIDFILE="${PID_DIR}/crons.pid"
 
+SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-15}"
+NODE_START_TIMEOUT="${NODE_START_TIMEOUT:-10}"
+
+wait_for_running() {
+    local pid="$1" timeout="$2" label="$3"
+    local waited=0
+    while [[ "$waited" -lt "$timeout" ]]; do
+        if is_running "$pid" 2>/dev/null; then return 0; fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    echo -e "  ${YELLOW}${label} (PID $pid) did not start within ${timeout}s — continuing${NC}" >&2
+    return 1
+}
+
 PKI_DIR="${ZEP_BASE}/pki"
 SERVER_DB="${ZEP_BASE}/server.db"
 SERVER_STORAGE="${ZEP_BASE}/store"
@@ -152,7 +167,7 @@ do_start() {
             --ca "${PKI_DIR}/ca.crt" --db "$SERVER_DB" \
             --storage "$SERVER_STORAGE" >/tmp/zep-server.log 2>&1 &
         local new_pid=$!
-        sleep 2
+        wait_for_running "$new_pid" "$SERVER_START_TIMEOUT" "Server" || true
         if is_running "$new_pid"; then
             echo "$new_pid" > "$SERVER_PIDFILE"
             echo -e "  Server started (PID $new_pid)"
@@ -182,7 +197,7 @@ do_start() {
         fi
         local cpid=$!
         disown $cpid 2>/dev/null || true
-        sleep 1
+        ( sleep "$NODE_START_TIMEOUT" && kill -0 "$cpid" 2>/dev/null && echo -e "  ${YELLOW}$cn (PID $cpid) still starting after ${NODE_START_TIMEOUT}s — continuing${NC}" >&2 ) &
         cron_pids_file_content="${cron_pids_file_content}${cpid}\n"
         echo -e "  $cn started (PID $cpid)"
     done

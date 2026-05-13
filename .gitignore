@@ -2,6 +2,7 @@
 zep-air
 zep-air-serve
 zep-air-admin
+zep-stream-ff
 *.o
 *.a
 *.so

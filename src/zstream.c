@@ -92,8 +92,15 @@ err_t zstream_token_generate(const void *data, size_t len,
     close(fd);
 
     char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-             "zstd -d '%s' -c 2>/dev/null | zstream token -g", tmpl);
+    if (len >= 4 && ((const unsigned char *)data)[0] == 0x28 &&
+        ((const unsigned char *)data)[1] == 0xB5 &&
+        ((const unsigned char *)data)[2] == 0x2F &&
+        ((const unsigned char *)data)[3] == 0xFD)
+        snprintf(cmd, sizeof(cmd),
+                 "zstd -d '%s' -c 2>/dev/null | zstream token -g", tmpl);
+    else
+        snprintf(cmd, sizeof(cmd),
+                 "zstream token -g < '%s'", tmpl);
     FILE *p = popen(cmd, "r");
     if (!p) { unlink(tmpl); return ZEP_ERR_ZFS; }
 

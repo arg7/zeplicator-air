@@ -12,8 +12,9 @@ err_t zfs_snapshot_create_cluster(const char *fs, const char *cluster,
 err_t zfs_send_open(const char *fs, const char *from_snap, const char *to_snap,
                     int send_all, const char *extra_opts,
                     const char *zip_cmd, const char *buf_cmd,
-                    const char *resume_token, FILE **fp);
-void  zfs_send_close(FILE *fp);
+                    const char *resume_token,
+                    const char *debug_inject_cmd, FILE **fp);
+int   zfs_send_close(FILE *fp);
 err_t zfs_recv_open(const char *fs, const char *snap,
                     const char *extra_opts,
                     const char *unzip_cmd, const char *buf_cmd, FILE **fp);

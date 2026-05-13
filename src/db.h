@@ -83,5 +83,7 @@ err_t db_upload_track(sqlite3 *db, const char *prefix, const char *node,
                        int total_chunks, const char *resume_token);
 err_t db_upload_complete(sqlite3 *db, const char *prefix);
 int   db_upload_has_incomplete(sqlite3 *db, const char *node);
+err_t db_upload_get_prev(sqlite3 *db, const char *prefix,
+                          int *prev_chunks, char *prev_token, size_t tlen);
 
 #endif

@@ -62,39 +62,56 @@ err_t zfs_snapshot_create_cluster(const char *fs, const char *cluster,
 err_t zfs_send_open(const char *fs, const char *from_snap, const char *to_snap,
                     int send_all, const char *extra_opts,
                     const char *zip_cmd, const char *buf_cmd,
-                    const char *resume_token, FILE **fp) {
+                    const char *resume_token,
+                    const char *debug_inject_cmd, FILE **fp) {
     (void)fs;
     char cmd[4096];
 
     if (resume_token && resume_token[0]) {
+        (void)to_snap;
         snprintf(cmd, sizeof(cmd),
-            "zfs send %s -t '%s' '%s' 2>/dev/null%s%s%s%s",
+            "zfs send %s -t '%s' 2>/dev/null%s%s%s%s%s%s",
             extra_opts ? extra_opts : "",
-            resume_token, to_snap,
+            resume_token,
             buf_cmd && buf_cmd[0] ? " | " : "",
             buf_cmd && buf_cmd[0] ? buf_cmd : "",
             zip_cmd && zip_cmd[0] ? " | " : "",
-            zip_cmd && zip_cmd[0] ? zip_cmd : "");
+            zip_cmd && zip_cmd[0] ? zip_cmd : "",
+            debug_inject_cmd && debug_inject_cmd[0] ? " | " : "",
+            debug_inject_cmd && debug_inject_cmd[0] ? debug_inject_cmd : "");
     } else if (from_snap && from_snap[0]) {
         snprintf(cmd, sizeof(cmd),
-            "zfs send %s %s '%s' '%s' 2>/dev/null%s%s%s%s",
+            "zfs send %s %s '%s' '%s' 2>/dev/null%s%s%s%s%s%s",
             extra_opts ? extra_opts : "",
             send_all ? "-I" : "-i",
             from_snap, to_snap,
             buf_cmd && buf_cmd[0] ? " | " : "",
             buf_cmd && buf_cmd[0] ? buf_cmd : "",
             zip_cmd && zip_cmd[0] ? " | " : "",
-            zip_cmd && zip_cmd[0] ? zip_cmd : "");
+            zip_cmd && zip_cmd[0] ? zip_cmd : "",
+            debug_inject_cmd && debug_inject_cmd[0] ? " | " : "",
+            debug_inject_cmd && debug_inject_cmd[0] ? debug_inject_cmd : "");
     } else {
         snprintf(cmd, sizeof(cmd),
-            "zfs send %s '%s' 2>/dev/null%s%s%s%s",
+            "zfs send %s '%s' 2>/dev/null%s%s%s%s%s%s",
             extra_opts ? extra_opts : "", to_snap,
             buf_cmd && buf_cmd[0] ? " | " : "",
             buf_cmd && buf_cmd[0] ? buf_cmd : "",
             zip_cmd && zip_cmd[0] ? " | " : "",
-            zip_cmd && zip_cmd[0] ? zip_cmd : "");
+            zip_cmd && zip_cmd[0] ? zip_cmd : "",
+            debug_inject_cmd && debug_inject_cmd[0] ? " | " : "",
+            debug_inject_cmd && debug_inject_cmd[0] ? debug_inject_cmd : "");
     }
-    *fp = popen(cmd, "r");
+
+    char popen_cmd[8192];
+    if (debug_inject_cmd && debug_inject_cmd[0]) {
+        snprintf(popen_cmd, sizeof(popen_cmd),
+                 "bash -c 'set -o pipefail; %s'", cmd);
+    } else {
+        snprintf(popen_cmd, sizeof(popen_cmd), "%s", cmd);
+    }
+    zep_log("zfs send cmd: %s\n", popen_cmd);
+    *fp = popen(popen_cmd, "r");
     if (!*fp) {
         perror("popen zfs send");
         return ZEP_ERR_ZFS;
@@ -102,13 +119,15 @@ err_t zfs_send_open(const char *fs, const char *from_snap, const char *to_snap,
     return ZEP_ERR_OK;
 }
 
-void zfs_send_close(FILE *fp) {
+int zfs_send_close(FILE *fp) {
     if (fp) {
         int rc = pclose(fp);
         if (rc != 0) {
             zep_log( "warning: zfs send exited with code %d\n", rc);
         }
+        return rc;
     }
+    return 0;
 }
 
 err_t zfs_recv_open(const char *fs, const char *snap,

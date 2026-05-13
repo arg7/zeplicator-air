@@ -165,6 +165,7 @@ err_t db_config_load(sqlite3 *db, zep_config_t *cfg) {
     db_config_get(db, "pull_unzip_cmd", cfg->pull_unzip_cmd, sizeof(cfg->pull_unzip_cmd));
     db_config_get(db, "push_buf_cmd", cfg->push_buf_cmd, sizeof(cfg->push_buf_cmd));
     db_config_get(db, "pull_buf_cmd", cfg->pull_buf_cmd, sizeof(cfg->pull_buf_cmd));
+    db_config_get(db, "debug_inject_zfs_pipeline_cmd", cfg->debug_inject_zfs_pipeline_cmd, sizeof(cfg->debug_inject_zfs_pipeline_cmd));
     db_config_get(db, "pipe_allow", cfg->pipe_allow, sizeof(cfg->pipe_allow));
 
     if (!cfg->pipe_allow[0]) snprintf(cfg->pipe_allow, sizeof(cfg->pipe_allow), "zfs");
@@ -923,4 +924,26 @@ int db_upload_has_incomplete(sqlite3 *db, const char *node) {
     int found = (sqlite3_step(stmt) == SQLITE_ROW);
     sqlite3_finalize(stmt);
     return found;
+}
+
+err_t db_upload_get_prev(sqlite3 *db, const char *prefix,
+                          int *prev_chunks, char *prev_token, size_t tlen) {
+    if (prev_chunks) *prev_chunks = 0;
+    if (prev_token) prev_token[0] = '\0';
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT total_chunks, resume_token FROM snapshot_upload WHERE prefix = ?1",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, prefix, -1, SQLITE_STATIC);
+    int found = (sqlite3_step(stmt) == SQLITE_ROW);
+    if (found) {
+        if (prev_chunks) *prev_chunks = sqlite3_column_int(stmt, 0);
+        if (prev_token)
+            snprintf(prev_token, tlen, "%s",
+                     sqlite3_column_text(stmt, 1)
+                     ? (const char *)sqlite3_column_text(stmt, 1) : "");
+    }
+    sqlite3_finalize(stmt);
+    return found ? ZEP_ERR_OK : ZEP_ERR_NOT_FOUND;
 }

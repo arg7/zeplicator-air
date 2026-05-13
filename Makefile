@@ -4,6 +4,12 @@ CFLAGS  += $(shell pkg-config --cflags openssl libcurl sqlite3 libcjson libmicro
 LDFLAGS  = $(shell pkg-config --libs openssl libcurl sqlite3 libcjson libmicrohttpd) -lzstd -lm
 SERV_LDFLAGS = $(LDFLAGS) $(shell pkg-config --libs gnutls)
 
+ifdef SANITIZE
+  CFLAGS   += -fsanitize=address -fno-omit-frame-pointer -O1 -Wno-format-truncation
+  LDFLAGS  += -fsanitize=address
+  SERV_LDFLAGS += -fsanitize=address
+endif
+
 COMMON   = src/db.c src/zfs.c src/storage.c src/pipeline.c src/http.c
 
 all: zep-air zep-air-serve zep-air-admin zep-stream-ff

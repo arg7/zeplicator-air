@@ -142,6 +142,7 @@ err_t pipeline_push(const zep_config_t *cfg,
     uint64_t prev_stream_size = 0;
     blob_info_t *prev_blobs = NULL;
     int is_resume = 0;
+    int resume_done = 0;
     snapshot_meta_t meta;
     memset(&meta, 0, sizeof(meta));
 
@@ -313,7 +314,8 @@ skip_snapshot:
                         cfg->send_all_snap,
                         cfg->send_options[0] ? cfg->send_options : NULL,
                         NULL, cfg->push_buf_cmd,
-                        resume_token[0] ? resume_token : NULL, &send_fp);
+                        resume_token[0] ? resume_token : NULL,
+                        cfg->debug_inject_zfs_pipeline_cmd, &send_fp);
     if (ret != ZEP_ERR_OK) {
         if (!is_resume) zfs_destroy_snapshot(snap_name);
         free(prev_blobs);
@@ -420,11 +422,25 @@ skip_snapshot:
         }
     }
     free(buf);
-    zfs_send_close(send_fp);
+    {
+        int send_rc = zfs_send_close(send_fp);
+        send_fp = NULL;
+        int send_exit = WIFEXITED(send_rc) ? WEXITSTATUS(send_rc) : -1;
+        if (send_rc != 0 && ret == ZEP_ERR_OK) {
+            if (is_resume && send_exit == 255) {
+                zep_log("push: resume send complete (nothing more)\n");
+                resume_done = 1;
+            } else {
+                zep_log("push: zfs send exited with code %d\n", send_rc);
+                ret = ZEP_ERR_ZFS;
+            }
+        }
+    }
 
-    if (ret != ZEP_ERR_OK || blob_count == 0) {
+    if ((ret != ZEP_ERR_OK || blob_count == 0) && !resume_done) {
         free(blobs);
-        if (!is_resume) zfs_destroy_snapshot(snap_name);
+        if (!is_resume && !(cfg->resume && db))
+            zfs_destroy_snapshot(snap_name);
         /* save push state so next cycle can resume */
         if (cfg->resume && db) {
             char state_key[320], state_val[ZEP_MAX_LINE * 2];
