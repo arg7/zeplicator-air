@@ -2363,22 +2363,9 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                 0, 0, "pull", "");
                         } else {
                             zep_log( "inventory: %s has no snaps for %s, "
-                                   "no initial — suspending\n",
+                                   "no initial — waiting for master "
+                                   "first push\n",
                                    ctx->node, cfs->valuestring);
-                            sqlite3_stmt *up = NULL;
-                            sqlite3_prepare_v2(g_db,
-                                "UPDATE auth SET suspended = 1, "
-                                "last_err = 'no common snapshots for ' "
-                                "|| ?1 WHERE cn = ?2",
-                                -1, &up, NULL);
-                            if (up) {
-                                sqlite3_bind_text(up, 1, cfs->valuestring,
-                                                  -1, SQLITE_STATIC);
-                                sqlite3_bind_text(up, 2, ctx->node, -1,
-                                                  SQLITE_STATIC);
-                                sqlite3_step(up);
-                                sqlite3_finalize(up);
-                            }
                         }
                     } else {
                         zep_log( "inventory: %s has %d snap(s) for %s, "
