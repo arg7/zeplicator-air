@@ -947,3 +947,33 @@ err_t db_upload_get_prev(sqlite3 *db, const char *prefix,
     sqlite3_finalize(stmt);
     return found ? ZEP_ERR_OK : ZEP_ERR_NOT_FOUND;
 }
+
+err_t db_pull_state_save(sqlite3 *db, const char *key,
+                         const char *guid, int blobs_done) {
+    char val[ZEP_MAX_LINE];
+    snprintf(val, sizeof(val), "%s:%d", guid, blobs_done);
+    return db_config_set(db, key, val);
+}
+
+err_t db_pull_state_load(sqlite3 *db, const char *key,
+                         char *guid, size_t guid_len, int *blobs_done) {
+    if (guid) guid[0] = '\0';
+    if (blobs_done) *blobs_done = 0;
+    char val[ZEP_MAX_LINE];
+    if (db_config_get(db, key, val, sizeof(val)) != ZEP_ERR_OK || !val[0])
+        return ZEP_ERR_NOT_FOUND;
+
+    char *save = NULL;
+    char *s = strdup(val);
+    if (!s) return ZEP_ERR_SYS;
+    char *tok = strtok_r(s, ":", &save);
+    if (tok && guid) snprintf(guid, guid_len, "%s", tok);
+    tok = strtok_r(NULL, ":", &save);
+    if (tok && blobs_done) *blobs_done = atoi(tok);
+    free(s);
+    return ZEP_ERR_OK;
+}
+
+void db_pull_state_clear(sqlite3 *db, const char *key) {
+    db_config_set(db, key, "");
+}

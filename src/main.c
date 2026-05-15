@@ -53,6 +53,16 @@ static void daemon_signal_handler(int sig) {
 #define WS_NODE_OP_PING  0x09
 #define WS_NODE_OP_PONG  0x0A
 
+int g_resume_req_pipe[2] = {-1, -1};
+int g_resume_resp_pipe[2] = {-1, -1};
+static pthread_mutex_t g_resume_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    char guid[ZEP_MAX_GUID_LEN];
+    char token[ZEP_MAX_LINE];
+    char fs[ZEP_MAX_PATH];
+    int ready;
+} g_resume_req;
+
 struct ws_node_conn {
     int sock;
     SSL *ssl;
@@ -301,9 +311,83 @@ static void *ws_node_pipe_thread(void *arg) {
         unsigned char *out = malloc(WS_NODE_FRAME_MAX);
         if (!buf || !out) { free(buf); free(out); ws_node_disconnect(conn); sleep(5); continue; }
 
-        /* Wait for pipe task */
+        /* Wait for pipe task or resume request */
 
         for (;;) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            int ws_fd = conn->sock;
+            FD_SET(ws_fd, &rfds);
+            FD_SET(g_resume_req_pipe[0], &rfds);
+            int maxfd = ws_fd > g_resume_req_pipe[0] ? ws_fd : g_resume_req_pipe[0];
+            int ssl_pending = (conn->ssl && SSL_pending(conn->ssl) > 0);
+            struct timeval tv = { .tv_sec = ssl_pending ? 0 : 60,
+                                  .tv_usec = 0 };
+            int sel = select(maxfd + 1, &rfds, NULL, NULL,
+                             ssl_pending ? &tv : NULL);
+            if (sel < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+
+            if (sel == 0 && !ssl_pending) continue;
+
+            if (FD_ISSET(g_resume_req_pipe[0], &rfds)) {
+                char dummy;
+                (void)!read(g_resume_req_pipe[0], &dummy, 1);
+                pthread_mutex_lock(&g_resume_lock);
+                char rguid[ZEP_MAX_GUID_LEN];
+                char rtoken[ZEP_MAX_LINE];
+                snprintf(rguid, sizeof(rguid), "%s", g_resume_req.guid);
+                snprintf(rtoken, sizeof(rtoken), "%s", g_resume_req.token);
+                g_resume_req.ready = 0;
+                pthread_mutex_unlock(&g_resume_lock);
+
+                if (g_verbose)
+                    zep_log( "ws-node: pull_resume guid=%s token=%.20s...\n",
+                           rguid, rtoken);
+
+                char *req_json = NULL;
+                if (asprintf(&req_json,
+                    "{\"action\":\"pull_resume\","
+                    "\"guid\":\"%s\",\"token\":\"%s\"}",
+                    rguid, rtoken) < 0) {
+                    char res = 1;
+                    (void)!write(g_resume_resp_pipe[1], &res, 1);
+                    break;
+                }
+                ws_node_send_frame(conn, WS_NODE_OP_TEXT,
+                                  (unsigned char *)req_json, strlen(req_json));
+                free(req_json);
+
+                for (;;) {
+                    ssize_t rn = ws_node_recv_frame(conn, out,
+                        WS_NODE_FRAME_MAX, &buf[0]);
+                    if (rn < 0) break;
+                    unsigned char op = buf[0] & 0x0F;
+                    if (op == WS_NODE_OP_CLOSE) break;
+                    if (op == WS_NODE_OP_PING) {
+                        ws_node_send_frame(conn, WS_NODE_OP_PONG,
+                                          out, (size_t)rn);
+                        continue;
+                    }
+                    if (op == WS_NODE_OP_PONG) continue;
+                    if (op == WS_NODE_OP_EOF) {
+                        char res = 0;
+                        (void)!write(g_resume_resp_pipe[1], &res, 1);
+                        break;
+                    }
+                    if (op == WS_NODE_OP_EXIT) {
+                        unsigned char ex = (rn > 0) ? out[0] : 1;
+                        (void)!write(g_resume_resp_pipe[1], &ex, 1);
+                        break;
+                    }
+                }
+                break;
+            }
+
+            if (!FD_ISSET(ws_fd, &rfds) && !ssl_pending) continue;
+
             ssize_t n = ws_node_recv_frame(conn, out, WS_NODE_FRAME_MAX, &buf[0]);
             unsigned char opcode = buf[0] & 0x0F;
 
@@ -851,14 +935,14 @@ static int cmd_pull(int argc, char *argv[]) {
     int pulled = 0;
 
     if (filesystem[0]) {
-        err_t ret = pipeline_pull(&cfg, &http_cfg, filesystem, donor);
+        err_t ret = pipeline_pull(&cfg, &http_cfg, filesystem, donor, db);
         if (ret == ZEP_ERR_OK) pulled++;
     } else if (optind < argc) {
         for (int i = optind; i < argc; i++) {
             char local_fs[ZEP_MAX_SNAPSHOT_NAME];
             if (pipeline_resolve_fs(argv[i], cfg.mapping,
                                     local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
-                err_t ret = pipeline_pull(&cfg, &http_cfg, local_fs, donor);
+                err_t ret = pipeline_pull(&cfg, &http_cfg, local_fs, donor, db);
                 if (ret == ZEP_ERR_OK) pulled++;
             } else {
                 zep_log( "pull: no mapping for '%s'\n", argv[i]);
@@ -878,7 +962,7 @@ static int cmd_pull(int argc, char *argv[]) {
             if (n >= sizeof(local_fs)) n = sizeof(local_fs) - 1;
             memcpy(local_fs, start, n);
             local_fs[n] = '\0';
-            err_t ret = pipeline_pull(&cfg, &http_cfg, local_fs, donor);
+            err_t ret = pipeline_pull(&cfg, &http_cfg, local_fs, donor, db);
             if (ret == ZEP_ERR_OK) pulled++;
             const char *comma = strchr(colon, ',');
             p = comma ? comma + 1 : colon + strlen(colon);
@@ -1176,6 +1260,9 @@ static int cmd_cron(int argc, char *argv[]) {
 
     /* Start WS pipe listener in daemon mode */
     if (daemon_mode && cfg.node_name[0]) {
+        if (pipe(g_resume_req_pipe) < 0 || pipe(g_resume_resp_pipe) < 0) {
+            zep_log( "cron: failed to create resume pipes\n");
+        }
         zep_config_t *tcfg = malloc(sizeof(*tcfg));
         if (tcfg) {
             memcpy(tcfg, &cfg, sizeof(*tcfg));
@@ -1263,10 +1350,11 @@ static int cmd_cron(int argc, char *argv[]) {
                         if (snap_list && cJSON_IsArray(snap_list) && cJSON_GetArraySize(snap_list) > 0) {
                             pipeline_pull_v2(&cfg2, &http_cfg, local_fs,
                                               (donor && cJSON_IsString(donor)) ? donor->valuestring : "",
-                                              snap_list);
+                                              snap_list, db);
                         } else {
                             pipeline_pull(&cfg2, &http_cfg, local_fs,
-                                          (donor && cJSON_IsString(donor)) ? donor->valuestring : "");
+                                          (donor && cJSON_IsString(donor)) ? donor->valuestring : "",
+                                          db);
                         }
                         tasks_done++;
 
@@ -1610,5 +1698,21 @@ int main(int argc, char *argv[]) {
 
     zep_log( "Unknown command: %s\n", cmd);
     usage(argv2[0]);
+    return 1;
+}
+
+int pipeline_resume_request(const char *guid, const char *token) {
+    if (g_resume_req_pipe[1] < 0) return 1;
+    pthread_mutex_lock(&g_resume_lock);
+    snprintf(g_resume_req.guid, sizeof(g_resume_req.guid), "%s", guid);
+    snprintf(g_resume_req.token, sizeof(g_resume_req.token), "%s", token);
+    g_resume_req.ready = 1;
+    pthread_mutex_unlock(&g_resume_lock);
+
+    (void)!write(g_resume_req_pipe[1], "!", 1);
+
+    char res;
+    ssize_t r = read(g_resume_resp_pipe[0], &res, 1);
+    if (r == 1) return (int)res;
     return 1;
 }

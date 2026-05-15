@@ -719,6 +719,105 @@ static void *node_ws_thread(void *arg) {
                 nw->last_pong = time(NULL);
                 continue;
             }
+            if (opcode == WS_OP_TEXT && plen > 0) {
+                out[plen] = '\0';
+                cJSON *msg = cJSON_Parse((char *)out);
+                if (msg) {
+                    cJSON *action = cJSON_GetObjectItem(msg, "action");
+                    if (action && cJSON_IsString(action) &&
+                        strcmp(action->valuestring, "pull_resume") == 0) {
+                        cJSON *guid_j = cJSON_GetObjectItem(msg, "guid");
+                        cJSON *token_j = cJSON_GetObjectItem(msg, "token");
+                        if (guid_j && cJSON_IsString(guid_j) &&
+                            token_j && cJSON_IsString(token_j)) {
+                            sqlite3_stmt *st = NULL;
+                            sqlite3_prepare_v2(g_db,
+                                "SELECT storage_base FROM snapshots "
+                                "WHERE guid = ?1 AND direction = 'push' LIMIT 1",
+                                -1, &st, NULL);
+                            if (st) {
+                                sqlite3_bind_text(st, 1, guid_j->valuestring,
+                                                  -1, SQLITE_STATIC);
+                                if (sqlite3_step(st) == SQLITE_ROW) {
+                                    const char *base =
+                                        (const char *)sqlite3_column_text(st, 0);
+                                    if (base && base[0]) {
+                                        const char *dir =
+                                            strncmp(base, "file://", 7) == 0
+                                            ? base + 7 : base;
+                                        uint64_t offset = 0;
+                                        zstream_token_parse_offset(
+                                            token_j->valuestring, &offset);
+
+                                        char hdr_b64[256] = {0};
+                                        {
+                                            char blob0[1024];
+                                            snprintf(blob0, sizeof(blob0),
+                                                     "%s/0000", dir);
+                                            char ucmd[2048];
+                                            snprintf(ucmd, sizeof(ucmd),
+                                                     "zstd -d '%s' -c 2>/dev/null "
+                                                     "| head -c 128 | base64 -w0",
+                                                     blob0);
+                                            FILE *hp = popen(ucmd, "r");
+                                            if (hp) {
+                                                if (fgets(hdr_b64,
+                                                          sizeof(hdr_b64), hp))
+                                                {
+                                                    size_t n = strlen(hdr_b64);
+                                                    while (n > 0 &&
+                                                           (hdr_b64[n-1]=='\n'
+                                                            || hdr_b64[n-1]=='\r'))
+                                                        hdr_b64[--n]='\0';
+                                                }
+                                                pclose(hp);
+                                            }
+                                        }
+
+                                        char pipe_cmd[8192];
+                                        snprintf(pipe_cmd, sizeof(pipe_cmd),
+                                            "zep-stream-ff --in '%s' "
+                                            "--unzip-cmd 'zstd -d' "
+                                            "--skip %lu | "
+                                            "zstream resume "
+                                            "-t '%s' "
+                                            "-H 'data:;base64,%s' -S",
+                                            dir, (unsigned long)offset,
+                                            token_j->valuestring,
+                                            hdr_b64[0] ? hdr_b64 : "");
+
+                                        FILE *pp = popen(pipe_cmd, "r");
+                                        if (pp) {
+                                            unsigned char rbuf[65536];
+                                            for (;;) {
+                                                size_t nr = fread(rbuf, 1,
+                                                    sizeof(rbuf), pp);
+                                                if (nr == 0) break;
+                                                ws_send_frame_gtls(nw,
+                                                    WS_OP_BIN, rbuf, nr);
+                                            }
+                                            int rc = pclose(pp);
+                                            unsigned char ex = rc ? 1 : 0;
+                                            ws_send_frame_gtls(nw,
+                                                WS_OP_EXIT, &ex, 1);
+                                        } else {
+                                            unsigned char ex = 1;
+                                            ws_send_frame_gtls(nw,
+                                                WS_OP_EXIT, &ex, 1);
+                                        }
+                                        ws_send_frame_gtls(nw,
+                                            WS_OP_EOF, NULL, 0);
+                                    }
+                                }
+                                sqlite3_finalize(st);
+                            }
+                        }
+                        cJSON_Delete(msg);
+                        break;
+                    }
+                    cJSON_Delete(msg);
+                }
+            }
                 if (plen == 0) continue; /* empty data frame */
         }
 

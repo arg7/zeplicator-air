@@ -117,3 +117,34 @@ err_t zstream_token_generate(const void *data, size_t len,
 
     return token_out[0] ? ZEP_ERR_OK : ZEP_ERR_ZFS;
 }
+
+err_t zstream_token_parse_offset(const char *token,
+                                 uint64_t *offset_out) {
+    if (!token || !token[0] || !offset_out) return ZEP_ERR_SYS;
+    *offset_out = 0;
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "zstream token '%s' 2>/dev/null", token);
+    FILE *p = popen(cmd, "r");
+    if (!p) return ZEP_ERR_ZFS;
+
+    char line[256];
+    while (fgets(line, sizeof(line), p)) {
+        char *key_end = NULL;
+        long long val = 0;
+
+        if ((key_end = strstr(line, "stream_offset")) != NULL ||
+            (key_end = strstr(line, "offset")) != NULL) {
+            char *eq = strchr(key_end, '=');
+            if (eq) {
+                val = strtoll(eq + 1, NULL, 0);
+                *offset_out = (uint64_t)val;
+                pclose(p);
+                return ZEP_ERR_OK;
+            }
+        }
+    }
+
+    pclose(p);
+    return ZEP_ERR_NOT_FOUND;
+}

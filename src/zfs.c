@@ -132,13 +132,22 @@ int zfs_send_close(FILE *fp) {
 
 err_t zfs_recv_open(const char *fs, const char *snap,
                     const char *extra_opts,
-                    const char *unzip_cmd, const char *buf_cmd, FILE **fp) {
+                    const char *unzip_cmd, const char *buf_cmd,
+                    const char *resume_token,
+                    const char *debug_inject_cmd,
+                    int use_resumable, FILE **fp) {
     (void)snap;
     char cmd[4096];
 
-    /* build: [unzip_cmd |] [buf_cmd |] zfs recv */
     int pos = 0;
     int need_pipe = 0;
+
+    if (debug_inject_cmd && debug_inject_cmd[0]) {
+        pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos,
+                        "bash -c 'set -o pipefail; %s' | ", debug_inject_cmd);
+        need_pipe = 1;
+    }
+
     if (unzip_cmd && unzip_cmd[0]) {
         pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos, "%s", unzip_cmd);
         need_pipe = 1;
@@ -150,9 +159,16 @@ err_t zfs_recv_open(const char *fs, const char *snap,
     }
     if (need_pipe)
         pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos, " | ");
+
+    if (resume_token && resume_token[0]) {
+        pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos,
+                        "zstream resume -t '%s' -i - | ", resume_token);
+    }
+
     snprintf(cmd + pos, sizeof(cmd) - (size_t)pos,
-             "zfs recv %s -F -u '%s' 2>/dev/null",
-             extra_opts ? extra_opts : "", fs);
+             "zfs recv %s -F%s -u '%s' 2>/dev/null",
+             extra_opts ? extra_opts : "",
+             use_resumable ? " -s" : "", fs);
     *fp = popen(cmd, "w");
     if (!*fp) {
         perror("popen zfs recv");
@@ -161,13 +177,42 @@ err_t zfs_recv_open(const char *fs, const char *snap,
     return ZEP_ERR_OK;
 }
 
-void zfs_recv_close(FILE *fp) {
+int zfs_recv_close(FILE *fp) {
     if (fp) {
         int rc = pclose(fp);
         if (rc != 0) {
             zep_log( "warning: zfs recv exited with code %d\n", rc);
         }
+        return rc;
     }
+    return 0;
+}
+
+err_t zfs_recv_abort(const char *fs) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "zfs recv -A '%s' 2>/dev/null", fs);
+    int rc = system(cmd);
+    (void)rc;
+    return ZEP_ERR_OK;
+}
+
+err_t zfs_get_recv_token(const char *fs, char *token, size_t token_len) {
+    token[0] = '\0';
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "zfs get -Hp -o value receive_resume_token '%s' 2>/dev/null", fs);
+    FILE *p = popen(cmd, "r");
+    if (!p) return ZEP_ERR_ZFS;
+    if (!fgets(token, (int)token_len, p)) {
+        pclose(p);
+        return ZEP_ERR_NOT_FOUND;
+    }
+    pclose(p);
+    size_t n = strlen(token);
+    while (n > 0 && (token[n - 1] == '\n' || token[n - 1] == '\r'))
+        token[--n] = '\0';
+    if (token[0] == '-' && token[1] == '\0') token[0] = '\0';
+    return token[0] ? ZEP_ERR_OK : ZEP_ERR_NOT_FOUND;
 }
 
 err_t zfs_get_snapshot_guid(const char *snapshot, char *guid, size_t len) {

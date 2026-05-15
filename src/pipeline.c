@@ -521,7 +521,8 @@ skip_snapshot:
 
 err_t pipeline_pull(const zep_config_t *cfg,
                     const http_config_t *http_cfg,
-                    const char *fs, const char *donor_node) {
+                    const char *fs, const char *donor_node,
+                    sqlite3 *db) {
     if (!http_cfg->server_url[0]) {
         zep_log( "error: server_url not configured\n");
         return ZEP_ERR_DB;
@@ -574,11 +575,52 @@ err_t pipeline_pull(const zep_config_t *cfg,
         printf("Pulling %s  guid=%s  blobs=%d  size=%lu\n",
                meta.snapshot, meta.guid, meta.blob_count, (unsigned long)meta.stream_size);
 
+        int resume_pull = 0;
+        char state_key[320];
+        snprintf(state_key, sizeof(state_key), "pull_state_%s_%s", fs, meta.label);
+
+        if (cfg->resume && db) {
+            char stored_guid[ZEP_MAX_GUID_LEN];
+            int stored_blobs = 0;
+            if (db_pull_state_load(db, state_key, stored_guid,
+                                   sizeof(stored_guid), &stored_blobs)
+                == ZEP_ERR_OK && stored_guid[0]) {
+                if (strcmp(stored_guid, meta.guid) == 0) {
+                    char token[ZEP_MAX_LINE];
+                    if (zfs_get_recv_token(fs, token, sizeof(token))
+                        == ZEP_ERR_OK && token[0]) {
+                        zep_log("pull: resuming guid=%s blobs_done=%d token=%.20s...\n",
+                               stored_guid, stored_blobs, token);
+                        int rc = pipeline_resume_request(stored_guid, token);
+                        if (rc == 0) {
+                            db_pull_state_clear(db, state_key);
+                            zfs_get_latest_guid(fs, local_guid,
+                                                sizeof(local_guid));
+                            printf("Pull resume complete: %s\n", meta.snapshot);
+                        } else {
+                            zep_log("pull: resume failed rc=%d guid=%s\n",
+                                   rc, stored_guid);
+                        }
+                        storage_meta_free(&meta);
+                        continue;
+                    } else {
+                        db_pull_state_clear(db, state_key);
+                        zfs_recv_abort(fs);
+                    }
+                } else {
+                    db_pull_state_clear(db, state_key);
+                }
+            }
+            db_pull_state_save(db, state_key, meta.guid, 0);
+            resume_pull = 1;
+        }
+
         FILE *recv_fp = NULL;
         ret = zfs_recv_open(fs, meta.snapshot,
                             cfg->recv_options[0] ? cfg->recv_options : NULL,
                             cfg->pull_unzip_cmd, cfg->pull_buf_cmd,
-                            &recv_fp);
+                            NULL, cfg->debug_inject_zfs_pipeline_cmd,
+                            cfg->resume, &recv_fp);
         if (ret != ZEP_ERR_OK) {
             zep_log( "pull: failed to open zfs recv\n");
             storage_meta_free(&meta);
@@ -615,11 +657,17 @@ err_t pipeline_pull(const zep_config_t *cfg,
                 ok = 0;
                 break;
             }
+            if (resume_pull && db)
+                db_pull_state_save(db, state_key, meta.guid, b + 1);
         }
 
-        zfs_recv_close(recv_fp);
+        int recv_rc = zfs_recv_close(recv_fp);
+        if (recv_rc != 0 && ok) ok = 0;
+        (void)recv_rc;
 
         if (ok) {
+            if (resume_pull && db)
+                db_pull_state_clear(db, state_key);
             zfs_get_latest_guid(fs, local_guid, sizeof(local_guid));
             printf("Pull complete: %s\n", meta.snapshot);
         }
@@ -633,7 +681,7 @@ err_t pipeline_pull(const zep_config_t *cfg,
 err_t pipeline_pull_v2(const zep_config_t *cfg,
                        const http_config_t *http_cfg,
                        const char *fs, const char *donor_node,
-                       cJSON *snapshots) {
+                       cJSON *snapshots, sqlite3 *db) {
     (void)donor_node;
     if (!http_cfg->server_url[0]) {
         zep_log( "error: server_url not configured\n");
@@ -691,11 +739,56 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
 
         printf("Pulling guid=%s  blobs=%d\n", g->valuestring, blob_count);
 
+        int resume_pull = 0;
+        char state_key[320];
+        {
+            cJSON *lb = cJSON_GetObjectItem(snap, "label");
+            const char *lbl = (lb && cJSON_IsString(lb)) ? lb->valuestring : g->valuestring;
+            snprintf(state_key, sizeof(state_key), "pull_state_%s_%s", fs, lbl);
+        }
+
+        if (cfg->resume && db) {
+            char stored_guid[ZEP_MAX_GUID_LEN];
+            int stored_blobs = 0;
+            if (db_pull_state_load(db, state_key, stored_guid,
+                                   sizeof(stored_guid), &stored_blobs)
+                == ZEP_ERR_OK && stored_guid[0]) {
+                if (strcmp(stored_guid, g->valuestring) == 0) {
+                    char token[ZEP_MAX_LINE];
+                    if (zfs_get_recv_token(fs, token, sizeof(token))
+                        == ZEP_ERR_OK && token[0]) {
+                        zep_log("pull_v2: resuming guid=%s blobs_done=%d\n",
+                               stored_guid, stored_blobs);
+                        int rc = pipeline_resume_request(stored_guid, token);
+                        if (rc == 0) {
+                            db_pull_state_clear(db, state_key);
+                            zfs_get_latest_guid(fs, local_guid,
+                                                sizeof(local_guid));
+                            printf("Pull resume complete: guid=%s\n",
+                                   g->valuestring);
+                        } else {
+                            zep_log("pull_v2: resume failed rc=%d guid=%s\n",
+                                   rc, stored_guid);
+                        }
+                        continue;
+                    } else {
+                        db_pull_state_clear(db, state_key);
+                        zfs_recv_abort(fs);
+                    }
+                } else {
+                    db_pull_state_clear(db, state_key);
+                }
+            }
+            db_pull_state_save(db, state_key, g->valuestring, 0);
+            resume_pull = 1;
+        }
+
         FILE *recv_fp = NULL;
         err_t ret = zfs_recv_open(fs, snap_name,
                                    cfg->recv_options[0] ? cfg->recv_options : NULL,
                                    cfg->pull_unzip_cmd, cfg->pull_buf_cmd,
-                                   &recv_fp);
+                                   NULL, cfg->debug_inject_zfs_pipeline_cmd,
+                                   cfg->resume, &recv_fp);
         if (ret != ZEP_ERR_OK) {
             zep_log( "pull_v2: recv_open FAILED fs=%s snap=%s unzip=%s\n",
                    fs, snap_name,
@@ -739,11 +832,17 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
                 ok = 0;
                 break;
             }
+            if (resume_pull && db)
+                db_pull_state_save(db, state_key, g->valuestring, part + 1);
         }
 
-        zfs_recv_close(recv_fp);
+        int recv_rc = zfs_recv_close(recv_fp);
+        if (recv_rc != 0 && ok) ok = 0;
+        (void)recv_rc;
 
         if (ok) {
+            if (resume_pull && db)
+                db_pull_state_clear(db, state_key);
             zfs_get_latest_guid(fs, local_guid, sizeof(local_guid));
             printf("Pull complete: guid=%s\n", g->valuestring);
         }

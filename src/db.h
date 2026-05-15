@@ -84,6 +84,12 @@ err_t db_upload_track(sqlite3 *db, const char *prefix, const char *node,
 err_t db_upload_complete(sqlite3 *db, const char *prefix);
 int   db_upload_has_incomplete(sqlite3 *db, const char *node);
 err_t db_upload_get_prev(sqlite3 *db, const char *prefix,
-                          int *prev_chunks, char *prev_token, size_t tlen);
+                           int *prev_chunks, char *prev_token, size_t tlen);
+
+err_t db_pull_state_save(sqlite3 *db, const char *key,
+                         const char *guid, int blobs_done);
+err_t db_pull_state_load(sqlite3 *db, const char *key,
+                         char *guid, size_t guid_len, int *blobs_done);
+void  db_pull_state_clear(sqlite3 *db, const char *key);
 
 #endif
