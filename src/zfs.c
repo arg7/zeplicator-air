@@ -169,6 +169,7 @@ err_t zfs_recv_open(const char *fs, const char *snap,
              "zfs recv %s -F%s -u '%s' 2>/dev/null",
              extra_opts ? extra_opts : "",
              use_resumable ? " -s" : "", fs);
+    zep_log("zfs_recv_open: cmd=[%s]\n", cmd);
     *fp = popen(cmd, "w");
     if (!*fp) {
         perror("popen zfs recv");
@@ -181,7 +182,9 @@ int zfs_recv_close(FILE *fp) {
     if (fp) {
         int rc = pclose(fp);
         if (rc != 0) {
-            zep_log( "warning: zfs recv exited with code %d\n", rc);
+            int es = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+            int sig = WIFSIGNALED(rc) ? WTERMSIG(rc) : -1;
+            zep_log( "warning: zfs recv exited with raw=%d exit=%d sig=%d\n", rc, es, sig);
         }
         return rc;
     }

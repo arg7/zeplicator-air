@@ -45,6 +45,30 @@ int pipeline_has_mapping(const char *cluster_fs, const char *mapping) {
     return pipeline_resolve_fs(cluster_fs, mapping, buf, sizeof(buf)) == ZEP_ERR_OK;
 }
 
+err_t pipeline_reverse_fs(const char *mapping, const char *local_fs,
+                          char *cluster_fs, size_t len) {
+    if (!mapping || !local_fs) return ZEP_ERR_NOT_FOUND;
+    const char *p = mapping;
+    while (*p) {
+        const char *colon = strchr(p, ':');
+        if (!colon) break;
+        const char *start = colon + 1;
+        const char *comma = strchr(colon, ',');
+        const char *end = comma ? comma : start + strlen(start);
+        const char *paren = strchr(start, '(');
+        size_t n = paren ? (size_t)(paren - start) : (size_t)(end - start);
+        if (strlen(local_fs) == n && strncmp(start, local_fs, n) == 0) {
+            size_t cf_len = (size_t)(colon - p);
+            if (cf_len >= len) cf_len = len - 1;
+            memcpy(cluster_fs, p, cf_len);
+            cluster_fs[cf_len] = '\0';
+            return ZEP_ERR_OK;
+        }
+        p = comma ? comma + 1 : colon + strlen(colon);
+    }
+    return ZEP_ERR_NOT_FOUND;
+}
+
 err_t pipeline_for_each_fs(const char *mapping,
                            void (*cb)(const char *cluster_fs, const char *local_fs,
                                       void *user), void *user) {
@@ -591,7 +615,7 @@ err_t pipeline_pull(const zep_config_t *cfg,
                         == ZEP_ERR_OK && token[0]) {
                         zep_log("pull: resuming guid=%s blobs_done=%d token=%.20s...\n",
                                stored_guid, stored_blobs, token);
-                        int rc = pipeline_resume_request(stored_guid, token);
+                        int rc = pipeline_resume_request(stored_guid, token, fs);
                         if (rc == 0) {
                             db_pull_state_clear(db, state_key);
                             zfs_get_latest_guid(fs, local_guid,
@@ -663,6 +687,12 @@ err_t pipeline_pull(const zep_config_t *cfg,
 
         int recv_rc = zfs_recv_close(recv_fp);
         if (recv_rc != 0 && ok) ok = 0;
+        {
+            char tok[ZEP_MAX_LINE];
+            err_t tr = zfs_get_recv_token(fs, tok, sizeof(tok));
+            zep_log("pull: after zfs_recv_close rc=%d ok=%d token_ret=%d token=%.40s...\n",
+                   recv_rc, ok, tr, tok[0] ? tok : "(none)");
+        }
         (void)recv_rc;
 
         if (ok) {
@@ -759,7 +789,7 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
                         == ZEP_ERR_OK && token[0]) {
                         zep_log("pull_v2: resuming guid=%s blobs_done=%d\n",
                                stored_guid, stored_blobs);
-                        int rc = pipeline_resume_request(stored_guid, token);
+                        int rc = pipeline_resume_request(stored_guid, token, fs);
                         if (rc == 0) {
                             db_pull_state_clear(db, state_key);
                             zfs_get_latest_guid(fs, local_guid,
@@ -837,8 +867,8 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
         }
 
         int recv_rc = zfs_recv_close(recv_fp);
+        printf("zfs_recv_close returned %d (ok=%d)\n", recv_rc, ok);
         if (recv_rc != 0 && ok) ok = 0;
-        (void)recv_rc;
 
         if (ok) {
             if (resume_pull && db)

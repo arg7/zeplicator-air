@@ -93,7 +93,7 @@ node_join client za-client-2 "" test "za-pool-1/za-data-1:za-client-2-pool/slave
 
 echo ""
 
-# ─── tests ───
+# --- tests ---
 ZCMD="--db"
 
 # test 1

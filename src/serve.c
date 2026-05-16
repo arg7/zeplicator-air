@@ -270,10 +270,15 @@ static void verify_snapshot(const char *cluster_key, const char *prefix,
     char *cmd = NULL;
     int use_zstd = 0;
     {
-        char zip_cmd[128] = {0};
-        if (db_config_get(g_db, "push_zip_cmd", zip_cmd, sizeof(zip_cmd)) == ZEP_ERR_OK
-            && zip_cmd[0])
-            use_zstd = 1;
+        FILE *fh = fopen(zst_path, "rb");
+        if (fh) {
+            unsigned char hdr[4] = {0};
+            if (fread(hdr, 1, 4, fh) == 4 &&
+                hdr[0] == 0x28 && hdr[1] == 0xB5 &&
+                hdr[2] == 0x2F && hdr[3] == 0xFD)
+                use_zstd = 1;
+            fclose(fh);
+        }
     }
     if (use_zstd) {
         if (asprintf(&cmd, "zstd -d '%s' -o '%s' -f 2>/dev/null", zst_path, dec_path) < 0) {
@@ -528,7 +533,7 @@ static size_t ws_build_frame(unsigned char *buf, size_t buf_size,
         for (int i = 0; i < 8; i++)
             buf[2 + i] = (unsigned char)((payload_len >> (56 - i * 8)) & 0xFF);
     }
-    memcpy(buf + header_len, payload, payload_len);
+    if (payload_len > 0) memcpy(buf + header_len, payload, payload_len);
     return header_len + payload_len;
 }
 

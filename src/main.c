@@ -338,14 +338,16 @@ static void *ws_node_pipe_thread(void *arg) {
                 pthread_mutex_lock(&g_resume_lock);
                 char rguid[ZEP_MAX_GUID_LEN];
                 char rtoken[ZEP_MAX_LINE];
+                char rfs[ZEP_MAX_PATH];
                 snprintf(rguid, sizeof(rguid), "%s", g_resume_req.guid);
                 snprintf(rtoken, sizeof(rtoken), "%s", g_resume_req.token);
+                snprintf(rfs, sizeof(rfs), "%s", g_resume_req.fs);
                 g_resume_req.ready = 0;
                 pthread_mutex_unlock(&g_resume_lock);
 
                 if (g_verbose)
-                    zep_log( "ws-node: pull_resume guid=%s token=%.20s...\n",
-                           rguid, rtoken);
+                    zep_log( "ws-node: pull_resume guid=%s token=%.20s... fs=%s\n",
+                           rguid, rtoken, rfs);
 
                 char *req_json = NULL;
                 if (asprintf(&req_json,
@@ -360,29 +362,51 @@ static void *ws_node_pipe_thread(void *arg) {
                                   (unsigned char *)req_json, strlen(req_json));
                 free(req_json);
 
+                FILE *recv_fp = NULL;
+                if (rfs[0]) {
+                    char recv_cmd[2048];
+                    snprintf(recv_cmd, sizeof(recv_cmd),
+                             "zfs recv -F -s -u '%s' 2>/dev/null", rfs);
+                    recv_fp = popen(recv_cmd, "w");
+                    if (g_verbose && recv_fp)
+                        zep_log("ws-node: opened recv pipe for resume fs=%s\n", rfs);
+                }
+
+                int ws_err = 0;
                 for (;;) {
                     ssize_t rn = ws_node_recv_frame(conn, out,
                         WS_NODE_FRAME_MAX, &buf[0]);
-                    if (rn < 0) break;
+                    if (rn < 0) { ws_err = 1; break; }
                     unsigned char op = buf[0] & 0x0F;
-                    if (op == WS_NODE_OP_CLOSE) break;
+                    if (op == WS_NODE_OP_CLOSE) { ws_err = 1; break; }
                     if (op == WS_NODE_OP_PING) {
                         ws_node_send_frame(conn, WS_NODE_OP_PONG,
                                           out, (size_t)rn);
                         continue;
                     }
                     if (op == WS_NODE_OP_PONG) continue;
-                    if (op == WS_NODE_OP_EOF) {
-                        char res = 0;
-                        (void)!write(g_resume_resp_pipe[1], &res, 1);
-                        break;
+                    if (op == WS_NODE_OP_BIN && rn > 0 && recv_fp) {
+                        if (fwrite(out, 1, (size_t)rn, recv_fp) != (size_t)rn) {
+                            if (g_verbose)
+                                zep_log("ws-node: recv fwrite failed\n");
+                            ws_err = 1;
+                            break;
+                        }
+                        continue;
                     }
-                    if (op == WS_NODE_OP_EXIT) {
-                        unsigned char ex = (rn > 0) ? out[0] : 1;
-                        (void)!write(g_resume_resp_pipe[1], &ex, 1);
-                        break;
-                    }
+                    if (op == WS_NODE_OP_EOF) break;
+                    if (op == WS_NODE_OP_EXIT) break;
                 }
+
+                int recv_rc = 0;
+                if (recv_fp) {
+                    recv_rc = pclose(recv_fp);
+                    if (g_verbose)
+                        zep_log("ws-node: recv pipe closed rc=%d\n", recv_rc);
+                }
+
+                char result = (ws_err || recv_rc != 0) ? 1 : 0;
+                (void)!write(g_resume_resp_pipe[1], &result, 1);
                 break;
             }
 
@@ -841,16 +865,19 @@ static int cmd_push(int argc, char *argv[]) {
     snprintf(http_cfg.key_password, sizeof(http_cfg.key_password), "%s", cfg.key_password);
 
     int pushed = 0;
+    char cluster_fs_buf[512] = {0};
 
     if (filesystem[0]) {
-        err_t ret = pipeline_push(&cfg, &http_cfg, filesystem, label, NULL, db);
+        pipeline_reverse_fs(cfg.mapping, filesystem, cluster_fs_buf, sizeof(cluster_fs_buf));
+        err_t ret = pipeline_push(&cfg, &http_cfg, filesystem, label,
+                                  cluster_fs_buf[0] ? cluster_fs_buf : NULL, db);
         if (ret == ZEP_ERR_OK) pushed++;
     } else if (optind < argc) {
         for (int i = optind; i < argc; i++) {
             char local_fs[ZEP_MAX_SNAPSHOT_NAME];
             if (pipeline_resolve_fs(argv[i], cfg.mapping,
                                     local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
-                err_t ret = pipeline_push(&cfg, &http_cfg, local_fs, label, NULL, db);
+                err_t ret = pipeline_push(&cfg, &http_cfg, local_fs, label, argv[i], db);
                 if (ret == ZEP_ERR_OK) pushed++;
             } else {
                 zep_log( "push: no mapping for '%s'\n", argv[i]);
@@ -870,7 +897,13 @@ static int cmd_push(int argc, char *argv[]) {
             if (n >= sizeof(local_fs)) n = sizeof(local_fs) - 1;
             memcpy(local_fs, start, n);
             local_fs[n] = '\0';
-            err_t ret = pipeline_push(&cfg, &http_cfg, local_fs, label, NULL, db);            if (ret == ZEP_ERR_OK) pushed++;
+            size_t cf_len = (size_t)(colon - p);
+            if (cf_len >= sizeof(cluster_fs_buf)) cf_len = sizeof(cluster_fs_buf) - 1;
+            memcpy(cluster_fs_buf, p, cf_len);
+            cluster_fs_buf[cf_len] = '\0';
+            err_t ret = pipeline_push(&cfg, &http_cfg, local_fs, label,
+                                      cluster_fs_buf, db);
+            if (ret == ZEP_ERR_OK) pushed++;
             const char *comma = strchr(colon, ',');
             p = comma ? comma + 1 : colon + strlen(colon);
         }
@@ -1658,6 +1691,7 @@ static int cmd_status(int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
+    signal(SIGPIPE, SIG_IGN);
     const char *argv2[64];
     int argc2 = 0;
 
@@ -1701,11 +1735,12 @@ int main(int argc, char *argv[]) {
     return 1;
 }
 
-int pipeline_resume_request(const char *guid, const char *token) {
+int pipeline_resume_request(const char *guid, const char *token, const char *fs) {
     if (g_resume_req_pipe[1] < 0) return 1;
     pthread_mutex_lock(&g_resume_lock);
     snprintf(g_resume_req.guid, sizeof(g_resume_req.guid), "%s", guid);
     snprintf(g_resume_req.token, sizeof(g_resume_req.token), "%s", token);
+    snprintf(g_resume_req.fs, sizeof(g_resume_req.fs), "%s", fs ? fs : "");
     g_resume_req.ready = 1;
     pthread_mutex_unlock(&g_resume_lock);
 

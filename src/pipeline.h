@@ -38,6 +38,9 @@ err_t pipeline_build_pipe_recv(const char *command, int compress, int buffer,
                                const zep_config_t *cfg,
                                char *out, size_t out_len);
 
-int  pipeline_resume_request(const char *guid, const char *token);
+err_t pipeline_reverse_fs(const char *mapping, const char *local_fs,
+                          char *cluster_fs, size_t len);
+
+int  pipeline_resume_request(const char *guid, const char *token, const char *fs);
 
 #endif

@@ -606,7 +606,7 @@ char *db_snapshot_chain_json(sqlite3 *db, const char *cluster,
     cJSON *arr = cJSON_CreateArray();
 
     const char *sql =
-        "SELECT guid, base_guid, blob_count, blob_size "
+        "SELECT guid, base_guid, blob_count, blob_size, label, snapshot "
         "FROM snapshots "
         "WHERE node = ?1 AND cluster = ?2 AND direction = 'push' "
         "ORDER BY rowid";
@@ -629,6 +629,12 @@ char *db_snapshot_chain_json(sqlite3 *db, const char *cluster,
         cJSON_AddStringToObject(s, "guid", g);
         cJSON_AddStringToObject(s, "base_guid",
             (const char *)sqlite3_column_text(stmt, 1));
+        const char *lb = (const char *)sqlite3_column_text(stmt, 4);
+        if (lb && lb[0])
+            cJSON_AddStringToObject(s, "label", lb);
+        const char *sn = (const char *)sqlite3_column_text(stmt, 5);
+        if (sn && sn[0])
+            cJSON_AddStringToObject(s, "snapshot", sn);
 
         char *bj = db_blob_list_json(db, g);
         if (bj) {
@@ -653,6 +659,12 @@ char *db_snapshot_chain_json(sqlite3 *db, const char *cluster,
                 cJSON_AddStringToObject(s, "guid", g);
                 cJSON_AddStringToObject(s, "base_guid",
                     (const char *)sqlite3_column_text(stmt, 1));
+                const char *lb = (const char *)sqlite3_column_text(stmt, 4);
+                if (lb && lb[0])
+                    cJSON_AddStringToObject(s, "label", lb);
+                const char *sn = (const char *)sqlite3_column_text(stmt, 5);
+                if (sn && sn[0])
+                    cJSON_AddStringToObject(s, "snapshot", sn);
                 char *bj = db_blob_list_json(db, g);
                 if (bj) {
                     cJSON *blist = cJSON_Parse(bj);
