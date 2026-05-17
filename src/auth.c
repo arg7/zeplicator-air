@@ -5,7 +5,6 @@
 #include "audit.h"
 #include "common.h"
 
-extern int g_verbose;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -129,7 +128,7 @@ err_t auth_verify_client(sqlite3 *db, X509 *client_cert,
             }
             BIO_free(bio);
         }
-        if (g_verbose) zep_log( "auth: registered new cert CN=%s fp=%.4s\n", cn, fp);
+        zep_log_debug( "auth: registered new cert CN=%s fp=%.4s\n", cn, fp);
     }
 
     snprintf(node_name, len, "%s", cn);

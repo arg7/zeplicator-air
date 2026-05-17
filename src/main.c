@@ -32,7 +32,6 @@
 #include <pthread.h>
 
 static char g_db_path[ZEP_MAX_PATH] = "zep-air.db";
-static int  g_verbose = 0;
 static pthread_t g_ws_tid;
 static volatile int g_daemon_running = 1;
 
@@ -161,7 +160,7 @@ static int ws_node_send_frame(struct ws_node_conn *c, unsigned char opcode,
     size_t flen = ws_node_build_frame(frame, sizeof(frame), opcode, payload, payload_len);
     if (flen == 0) { zep_log( "ws-node: build_frame failed\n"); return -1; }
     int ret = ws_node_write(c, frame, (int)flen);
-    if (g_verbose) zep_log( "ws-node: write opcode=0x%02x flen=%zu ret=%d\n", opcode, flen, ret);
+    zep_log_debug( "ws-node: write opcode=0x%02x flen=%zu ret=%d\n", opcode, flen, ret);
     if (ret <= 0) {
         zep_log( "ws-node: write error errno=%d\n", errno);
         return -1;
@@ -298,12 +297,12 @@ static void *ws_node_pipe_thread(void *arg) {
         char ws_path[256];
         snprintf(ws_path, sizeof(ws_path), "/v1/ws/node?cn=%s", cfg->node_name);
 
-        if (g_verbose) zep_log( "ws-node: connecting to %s%s\n", cfg->server_url, ws_path);
+        zep_log_debug( "ws-node: connecting to %s%s\n", cfg->server_url, ws_path);
 
         struct ws_node_conn *conn = ws_node_connect(cfg->server_url, cfg->cert_path, cfg->key_path,
                                     cfg->ca_path, cfg->key_password, ws_path);
         if (!conn) {
-            if (g_verbose) zep_log( "ws-node: connect failed, retrying in 5s\n");
+            zep_log_debug( "ws-node: connect failed, retrying in 5s\n");
             sleep(5);
             continue;
         }
@@ -346,9 +345,8 @@ static void *ws_node_pipe_thread(void *arg) {
                 g_resume_req.ready = 0;
                 pthread_mutex_unlock(&g_resume_lock);
 
-                if (g_verbose)
-                    zep_log( "ws-node: pull_resume guid=%s token=%.20s... fs=%s\n",
-                           rguid, rtoken, rfs);
+zep_log_debug("ws-node: pull_resume guid=%s token=%.20s... fs=%s\n",
+                            rguid, rtoken, rfs);
 
                 char *req_json = NULL;
                 if (asprintf(&req_json,
@@ -369,8 +367,8 @@ static void *ws_node_pipe_thread(void *arg) {
                     snprintf(recv_cmd, sizeof(recv_cmd),
                              "zfs recv -F -s -u '%s' 2>/dev/null", rfs);
                     recv_fp = popen(recv_cmd, "w");
-                    if (g_verbose && recv_fp)
-                        zep_log("ws-node: opened recv pipe for resume fs=%s\n", rfs);
+if ((g_logging & LOG_LEVEL_DEBUG) && recv_fp)
+                         zep_log_debug("ws-node: opened recv pipe for resume fs=%s\n", rfs);
                 }
 
                 int ws_err = 0;
@@ -388,8 +386,7 @@ static void *ws_node_pipe_thread(void *arg) {
                     if (op == WS_NODE_OP_PONG) continue;
                     if (op == WS_NODE_OP_BIN && rn > 0 && recv_fp) {
                         if (fwrite(out, 1, (size_t)rn, recv_fp) != (size_t)rn) {
-                            if (g_verbose)
-                                zep_log("ws-node: recv fwrite failed\n");
+zep_log_debug("ws-node: recv fwrite failed\n");
                             ws_err = 1;
                             break;
                         }
@@ -402,8 +399,7 @@ static void *ws_node_pipe_thread(void *arg) {
                 int recv_rc = 0;
                 if (recv_fp) {
                     recv_rc = pclose(recv_fp);
-                    if (g_verbose)
-                        zep_log("ws-node: recv pipe closed rc=%d\n", recv_rc);
+zep_log_debug("ws-node: recv pipe closed rc=%d\n", recv_rc);
                 }
 
                 char result = (ws_err || recv_rc != 0) ? 1 : 0;
@@ -416,8 +412,8 @@ static void *ws_node_pipe_thread(void *arg) {
             ssize_t n = ws_node_recv_frame(conn, out, WS_NODE_FRAME_MAX, &buf[0]);
             unsigned char opcode = buf[0] & 0x0F;
 
-            if (n < 0) { if (g_verbose) zep_log( "ws-node: recv error, reconnecting\n"); break; }
-            if (opcode == WS_NODE_OP_CLOSE) { if (g_verbose) zep_log( "ws-node: close\n"); break; }
+            if (n < 0) { zep_log_debug( "ws-node: recv error, reconnecting\n"); break; }
+            if (opcode == WS_NODE_OP_CLOSE) { zep_log_debug( "ws-node: close\n"); break; }
             if (opcode == WS_NODE_OP_PING) { ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)n); continue; }
             if (opcode == WS_NODE_OP_PONG) continue;
             if (opcode == WS_NODE_OP_EOF) continue;
@@ -486,7 +482,7 @@ static void *ws_node_pipe_thread(void *arg) {
                                 int pty_alive = 1;
                                 int ws_alive = 1;
 
-                                if (g_verbose) zep_log( "ws-node: interactive pipe started: %s pid=%d\n", cmd_str, (int)pid);
+                                zep_log_debug( "ws-node: interactive pipe started: %s pid=%d\n", cmd_str, (int)pid);
 
                                 int ws_fd = conn->sock;
                                 int ws_flags = fcntl(ws_fd, F_GETFL, 0);
@@ -569,7 +565,7 @@ static void *ws_node_pipe_thread(void *arg) {
                                 close(pty_master);
                                 int status = 0;
                                 waitpid(pid, &status, 0);
-                                if (g_verbose) zep_log( "ws-node: interactive pipe done, child exit=%d\n", WEXITSTATUS(status));
+                                zep_log_debug( "ws-node: interactive pipe done, child exit=%d\n", WEXITSTATUS(status));
                                 {
                                     unsigned char exit_byte = (unsigned char)WEXITSTATUS(status);
                                     ws_node_send_frame(conn, WS_NODE_OP_EXIT, &exit_byte, 1);
@@ -632,7 +628,7 @@ static void *ws_node_pipe_thread(void *arg) {
                             unsigned char *pending_data = NULL;
                             ssize_t pending_len = 0;
 
-                            if (g_verbose) zep_log( "ws-node: pipe started: %s pid=%d\n", cmd_str, (int)pid);
+                            zep_log_debug( "ws-node: pipe started: %s pid=%d\n", cmd_str, (int)pid);
 
                             int ws_fd = conn->sock;
                             int ws_flags = fcntl(ws_fd, F_GETFL, 0);
@@ -744,7 +740,7 @@ static void *ws_node_pipe_thread(void *arg) {
 
                             int status = 0;
                             waitpid(pid, &status, 0);
-                            if (g_verbose) zep_log( "ws-node: pipe done, child exit=%d\n", WEXITSTATUS(status));
+                            zep_log_debug( "ws-node: pipe done, child exit=%d\n", WEXITSTATUS(status));
                             {
                                 unsigned char exit_byte = (unsigned char)WEXITSTATUS(status);
                                 ws_node_send_frame(conn, WS_NODE_OP_EXIT, &exit_byte, 1);
@@ -805,8 +801,9 @@ static void usage(const char *prog) {
         "  --db PATH              Database path (default: %s)\n"
         "\n"
         "Cron options:\n"
-        "  --verbose, -v    Verbose output\n"
-        "  --db PATH        Database path (default: %s)\n"
+        "  --logging LEVELS   Comma-separated log levels: DEBUG,INFO,WARN,ERROR,AUDIT (default: INFO,WARN,ERROR)\n"
+        "  --audit-log PATH   Audit log file path\n"
+        "  --db PATH          Database path (default: %s)\n"
         "  --daemon, -d     Run as daemon (for cron)\n"
         "  --interval, -i N Poll interval in seconds (default: 60)\n"
         "\n"
@@ -1302,7 +1299,7 @@ static int cmd_cron(int argc, char *argv[]) {
             memcpy(tcfg, &cfg, sizeof(*tcfg));
             pthread_create(&g_ws_tid, NULL, ws_node_pipe_thread, (void *)tcfg);
             pthread_detach(g_ws_tid);
-            if (g_verbose) zep_log( "cron: WS pipe listener started for %s\n", cfg.node_name);
+            zep_log_debug( "cron: WS pipe listener started for %s\n", cfg.node_name);
         }
     }
 
@@ -1700,8 +1697,9 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
             i++;
             snprintf(g_db_path, sizeof(g_db_path), "%s", argv[i]);
-        } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
-            g_verbose = 1;
+        } else if (strcmp(argv[i], "--logging") == 0 && i + 1 < argc) {
+            i++;
+            g_logging = zep_log_parse_mask(argv[i]);
         } else if (strcmp(argv[i], "--audit-log") == 0 && i + 1 < argc) {
             i++;
             audit_init(argv[i]);
@@ -1710,6 +1708,8 @@ int main(int argc, char *argv[]) {
         }
     }
     argv2[argc2] = NULL;
+
+    zep_log_init(g_db_path);
 
     if (argc2 < 2) {
         usage(argv2[0]);

@@ -41,7 +41,6 @@ static char g_key_path[ZEP_MAX_PATH] = "";
 static char g_ca_path[ZEP_MAX_PATH] = "";
 static char g_admin_cert_path[ZEP_MAX_PATH] = "";
 static char g_key_password[128] = "";
-int g_verbose = 0;
 static int  g_setup_mode = 0;
 static int  g_no_tls = 0;
 static int  g_resume = 0;
@@ -208,11 +207,11 @@ static void verify_snapshot(const char *cluster_key, const char *prefix,
 
     err_t ret = storage_read_meta(g_storage_root, cluster_key, prefix, &meta);
     if (ret != ZEP_ERR_OK) {
-        if (g_verbose) zep_log( "verify: read_meta failed (%d) node=%s prefix=%s\n",
+        zep_log_debug( "verify: read_meta failed (%d) node=%s prefix=%s\n",
                               ret, cluster_key, prefix);
         return;
     }
-    if (g_verbose) zep_log( "verify: meta loaded snapshot=%s label='%s' cluster_fs='%s'\n",
+    zep_log_debug( "verify: meta loaded snapshot=%s label='%s' cluster_fs='%s'\n",
                           meta.snapshot, meta.label, meta.cluster_fs);
 
     char *dir_path = NULL;
@@ -234,7 +233,7 @@ static void verify_snapshot(const char *cluster_key, const char *prefix,
     }
 
     if (found < meta.blob_count) {
-        if (g_verbose) zep_log( "verify: blob check found=%d/%d\n", found, meta.blob_count);
+        zep_log_debug( "verify: blob check found=%d/%d\n", found, meta.blob_count);
         free(dir_path);
         storage_meta_free(&meta);
         return;
@@ -292,7 +291,7 @@ static void verify_snapshot(const char *cluster_key, const char *prefix,
         audit_log(AUDIT_EVT_EXEC, "serve", cmd, rc < 0 ? -127 : WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
         free(cmd);
         if (rc != 0) {
-            if (g_verbose) zep_log( "verify: zstd -d failed rc=%d, trying raw\n", rc);
+            zep_log_debug( "verify: zstd -d failed rc=%d, trying raw\n", rc);
             unlink(dec_path);
             free(dec_path);
             dec_path = zst_path;
@@ -329,7 +328,7 @@ static void verify_snapshot(const char *cluster_key, const char *prefix,
     free(decomp);
 
     if (ret != ZEP_ERR_OK) {
-        if (g_verbose) zep_log( "verify: zstream_parse failed for %s/%s rc=%d\n",
+        zep_log_debug( "verify: zstream_parse failed for %s/%s rc=%d\n",
                 cluster_key, prefix, (int)ret);
         storage_meta_free(&meta);
         return;
@@ -337,7 +336,7 @@ static void verify_snapshot(const char *cluster_key, const char *prefix,
 
     sqlite3 *db = NULL;
     if (db_open(g_db_path, &db) != ZEP_ERR_OK) {
-        if (g_verbose) zep_log( "verify: db_open failed for %s\n", g_db_path);
+        zep_log_debug( "verify: db_open failed for %s\n", g_db_path);
         storage_meta_free(&meta);
         return;
     }
@@ -379,7 +378,7 @@ static void verify_snapshot(const char *cluster_key, const char *prefix,
         struct tm tm;
         gmtime_r(&tnow, &tm);
         strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
-        if (g_verbose) zep_log( "verify: set %s = %s\n", cron_key, now_str);
+        zep_log_debug( "verify: set %s = %s\n", cron_key, now_str);
         db_config_set(db, cron_key, now_str);
     }
 
@@ -430,8 +429,7 @@ static struct node_ws *node_ws_register(const char *cn, int sock) {
     pthread_mutex_init(&nw->lock, NULL);
     nw->next = g_node_ws;
     g_node_ws = nw;
-    if (g_verbose)
-        zep_log( "ws: node %s registered sock=%d\n", cn, sock);
+    zep_log_debug("ws: node %s registered sock=%d\n", cn, sock);
     pthread_mutex_unlock(&g_node_ws_lock);
     return nw;
 }
@@ -443,8 +441,7 @@ static void node_ws_unregister(struct node_ws *target) {
         if (nw == target) {
             if (prev) prev->next = nw->next;
             else g_node_ws = nw->next;
-            if (g_verbose)
-                zep_log( "ws: node %s unregistered\n", nw->cn);
+zep_log_debug("ws: node %s unregistered\n", nw->cn);
             pthread_mutex_destroy(&nw->lock);
             free(nw);
             break;
@@ -585,8 +582,8 @@ static ssize_t ws_recv_node(struct node_ws *nw, unsigned char *buf, size_t buf_s
             if (select(raw_fd + 1, &rfds, NULL, NULL, &tv) <= 0) return -1;
             return gnutls_record_recv(nw->gnutls_session, buf, buf_size);
         }
-        if (g_verbose && n <= 0) zep_log( "ws: recv TLS result=%d cn=%s\n",
-                                         (int)n, nw->cn);
+if ((g_logging & LOG_LEVEL_DEBUG) && n <= 0) zep_log_debug("ws: recv TLS result=%d cn=%s\n",
+                                          (int)n, nw->cn);
         return n;
     }
     return recv(nw ? nw->sock : -1, buf, buf_size, 0);
@@ -669,10 +666,9 @@ static void *node_ws_thread(void *arg) {
     unsigned char *out = malloc(WS_SUBCHUNK);
     if (!buf || !out) { free(buf); free(out); MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return NULL; }
 
-    if (g_verbose) {
-        zep_log( "ws: node %s listening sock=%d\n", nw->cn, sock);
-        fflush(stderr);
-    }
+if (g_logging & LOG_LEVEL_DEBUG) {
+         zep_log_debug("ws: node %s listening sock=%d\n", nw->cn, sock);
+     }
 
     time_t last_ping = time(NULL);
     for (;;) {
@@ -681,18 +677,16 @@ static void *node_ws_thread(void *arg) {
         int exiting = nw->pipe_starting;
         int closed = nw->ws_closed;
         pthread_mutex_unlock(&nw->lock);
-        if (closed) {
-            if (g_verbose) {
-                zep_log( "ws: node %s closed by new connection\n", nw->cn);
-                fflush(stderr);
-            }
-            break;
-        }
-        if (exiting) {
-            if (g_verbose) {
-                zep_log( "ws: node %s exiting for pipe bridge\n", nw->cn);
-                fflush(stderr);
-            }
+if (closed) {
+             if (g_logging & LOG_LEVEL_DEBUG) {
+                 zep_log_debug("ws: node %s closed by new connection\n", nw->cn);
+             }
+             break;
+         }
+         if (exiting) {
+             if (g_logging & LOG_LEVEL_DEBUG) {
+                 zep_log_debug("ws: node %s exiting for pipe bridge\n", nw->cn);
+             }
             break;
         }
 
@@ -705,7 +699,7 @@ static void *node_ws_thread(void *arg) {
         time_t now = time(NULL);
         if (now - last_ping >= 60) {
             ws_send_frame_gtls(nw, WS_OP_PING, NULL, 0);
-            if (g_verbose) zep_log( "ws: -> PING  cn=%s\n", nw->cn);
+            zep_log_debug( "ws: -> PING  cn=%s\n", nw->cn);
             last_ping = now;
         }
 
@@ -713,7 +707,7 @@ static void *node_ws_thread(void *arg) {
                 ssize_t plen = ws_recv_frame_full(nw, buf, WS_SUBCHUNK, out, WS_SUBCHUNK, &buf[0]);
                 unsigned char opcode = buf[0] & 0x0F;
                 if (plen < 0) {
-                    if (g_verbose) zep_log( "ws: recv_frame_full failed plen=%zd cn=%s\n", plen, nw->cn);
+                    zep_log_debug( "ws: recv_frame_full failed plen=%zd cn=%s\n", plen, nw->cn);
                     break;
                 }
 
@@ -834,10 +828,9 @@ static void *node_ws_thread(void *arg) {
         if (time(NULL) - nw->last_pong > 180) break;
     }
 
-    if (g_verbose) {
-        zep_log( "ws: node %s disconnected\n", nw->cn);
-        fflush(stderr);
-    }
+if (g_logging & LOG_LEVEL_DEBUG) {
+         zep_log_debug("ws: node %s disconnected\n", nw->cn);
+     }
 
     free(buf); free(out);
 
@@ -1093,8 +1086,7 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
         MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
         return;
     }
-    if (g_verbose)
-        zep_log( "ws: pipe found node %s sock=%d\n", node_cn, nw->sock);
+zep_log_debug("ws: pipe found node %s sock=%d\n", node_cn, nw->sock);
 
     /* Check pipe_allow before taking over node thread */
     const char *command = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "command");
@@ -1130,8 +1122,7 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
 
     /* Wait for node thread to exit */
     usleep(200000);
-    if (g_verbose)
-        zep_log( "ws: pipe taking over node %s\n", node_cn);
+zep_log_debug("ws: pipe taking over node %s\n", node_cn);
 
     /* Get raw TCP fd for select */
     int node_raw_fd = nw->sock;
@@ -1148,8 +1139,7 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
         if (is_interactive) cJSON_AddBoolToObject(task, "interactive", 1);
         char *task_json = cJSON_PrintUnformatted(task);
         if (task_json) {
-            if (g_verbose)
-                zep_log( "ws: sending task to node: %s\n", task_json);
+zep_log_debug("ws: sending task to node: %s\n", task_json);
             ws_send_frame_gtls(nw, WS_OP_TEXT, (unsigned char *)task_json, strlen(task_json));
             free(task_json);
         }
@@ -1271,8 +1261,7 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
         if (!admin_alive || !node_alive) break;
     }
 
-    if (g_verbose)
-        zep_log( "ws: pipe bridge ended admin=%d node=%d\n", admin_alive, node_alive);
+zep_log_debug("ws: pipe bridge ended admin=%d node=%d\n", admin_alive, node_alive);
 
     {
         unsigned char cbuf[14];
@@ -1288,8 +1277,7 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
 
 static enum MHD_Result ws_handle_node(struct MHD_Connection *conn,
                                        const char *cn) {
-    if (g_verbose)
-        zep_log( "ws: node upgrade request for %s\n", cn);
+zep_log_debug("ws: node upgrade request for %s\n", cn);
 
     const char *upgrade = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Upgrade");
     const char *ws_key = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Sec-WebSocket-Key");
@@ -1320,8 +1308,7 @@ static enum MHD_Result ws_handle_node(struct MHD_Connection *conn,
 
 static enum MHD_Result ws_handle_pipe(struct MHD_Connection *conn,
                                        const char *node_cn) {
-    if (g_verbose) zep_log( "ws: pipe upgrade request for node %s\n", node_cn);
-    if (g_verbose) fflush(stderr);
+   zep_log_debug("ws: pipe upgrade request for node %s\n", node_cn);
 
     const char *upgrade = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Upgrade");
     const char *ws_key = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Sec-WebSocket-Key");
@@ -1492,7 +1479,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 char *js = cJSON_PrintUnformatted(json);
                 cJSON_Delete(json);
                 db_config_set(g_db, cfg_key, js);
-                if (g_verbose) zep_log( "cluster set: key=%s len=%zu\n", cfg_key, strlen(js));
+                zep_log_debug( "cluster set: key=%s len=%zu\n", cfg_key, strlen(js));
                 free(js);
                 return send_json(conn, 200, "{\"ok\":true}", ctx);
             }
@@ -1674,21 +1661,19 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             if (strncmp(rest, "config/", 7) == 0) {
                 const char *key = rest + 7;
                 if (!key[0]) return send_error(conn, 400, "Missing key", ctx);
-                if (g_verbose)
-                    zep_log( "config set: key=%s body_len=%zu body=%.*s\n",
-                            key, ctx->body_len, (int)ctx->body_len, ctx->body);
-                cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
-                if (json) {
-                    cJSON *val = cJSON_GetObjectItem(json, "value");
-                    if (val && cJSON_IsString(val)) {
-                        err_t ret = db_config_set(g_db, key, val->valuestring);
-                        if (g_verbose)
-                            zep_log( "config set: db_config_set returned %d\n", ret);
+zep_log_debug("config set: key=%s body_len=%zu body=%.*s\n",
+                             key, ctx->body_len, (int)ctx->body_len, ctx->body);
+                 cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
+                 if (json) {
+                     cJSON *val = cJSON_GetObjectItem(json, "value");
+                     if (val && cJSON_IsString(val)) {
+                         err_t ret = db_config_set(g_db, key, val->valuestring);
+                         zep_log_debug("config set: db_config_set returned %d\n", ret);
                     }
-                    cJSON_Delete(json);
-                } else if (g_verbose) {
-                    zep_log( "config set: JSON parse failed\n");
-                }
+                 cJSON_Delete(json);
+                 } else {
+                     zep_log_debug("config set: JSON parse failed\n");
+                 }
                 return send_json(conn, 200, "{\"ok\":true}", ctx);
             }
 
@@ -1918,7 +1903,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                         char last_str[32] = {0};
                                         db_config_get(g_db, cron_key, last_str,
                                                       sizeof(last_str));
-                                        if (g_verbose) zep_log( "cron/sync: %s = '%s'\n", cron_key, last_str);
+                                        zep_log_debug( "cron/sync: %s = '%s'\n", cron_key, last_str);
                                         time_t last = 0;
                                         if (last_str[0]) {
                                             struct tm tm = {0};
@@ -2023,7 +2008,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
     if (strcmp(ctx->method, "POST") == 0 &&
         strcmp(ctx->target_url, "/v1/cron/ack") == 0) {
-        if (g_verbose) zep_log( "cron/ack: body=%.*s\n", (int)ctx->body_len, (const char *)ctx->body);
+        zep_log_debug( "cron/ack: body=%.*s\n", (int)ctx->body_len, (const char *)ctx->body);
         cJSON *json = cJSON_ParseWithLength((const char *)ctx->body, ctx->body_len);
         if (json) {
             cJSON *guid = cJSON_GetObjectItem(json, "guid");
@@ -2073,7 +2058,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     struct tm tm;
                     gmtime_r(&tnow, &tm);
                     strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
-                    if (g_verbose) zep_log( "cron/ack: set %s = %s\n", cron_key, now_str);
+                    zep_log_debug( "cron/ack: set %s = %s\n", cron_key, now_str);
                     db_config_set(g_db, cron_key, now_str);
                 }
             }
@@ -2773,7 +2758,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 if (f) {
                     fwrite(ctx->body, 1, ctx->body_len, f);
                     fclose(f);
-                    if (g_verbose) zep_log( "PUT meta: %s/%s (%zu bytes) body=%.*s\n",
+                    zep_log_debug( "PUT meta: %s/%s (%zu bytes) body=%.*s\n",
                                           ctx->prefix, "meta.json", ctx->body_len,
                                           (int)ctx->body_len, (const char *)ctx->body);
                     free(path);
@@ -2806,17 +2791,17 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                                     struct tm tm;
                                     gmtime_r(&tnow, &tm);
                                     strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
-                                    if (g_verbose) zep_log( "PUT meta: set %s = %s\n", cron_key, now_str);
-                                    db_config_set(g_db, cron_key, now_str);
-                                } else if (g_verbose) {
-                                    printf("PUT meta: no cluster for node '%s'\n", ctx->node);
-                                }
+                                zep_log_debug("PUT meta: set %s = %s\n", cron_key, now_str);
+                                     db_config_set(g_db, cron_key, now_str);
+                                 } else {
+                                     zep_log_debug("PUT meta: no cluster for node '%s'\n", ctx->node);
+                                 }
                             }
                             cJSON_Delete(mj);
                         }
                     }
 
-                    if (g_verbose) zep_log( "PUT meta: calling verify_snapshot(%s, %s)\n",
+                    zep_log_debug( "PUT meta: calling verify_snapshot(%s, %s)\n",
                                           ctx->node, ctx->prefix);
                     {
                         char base[ZEP_MAX_PATH * 2 + 128];
@@ -2839,7 +2824,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
             if (f) {
                 fwrite(ctx->body, 1, ctx->body_len, f);
                 fclose(f);
-                if (g_verbose) zep_log( "PUT blob: %s/%04d (%zu bytes)\n",
+                zep_log_debug( "PUT blob: %s/%04d (%zu bytes)\n",
                                        ctx->prefix, part, ctx->body_len);
                 free(path);
                 {
@@ -2979,7 +2964,9 @@ static void usage_serve(const char *prog) {
     zep_log( "  -A, --admin-cert      Admin client certificate for setup mode (PEM)\n");
     zep_log( "  -P, --password PASS   Password for encrypted private keys\n");
     zep_log( "  -N, --no-tls          Disable TLS (plain HTTP, for WS debugging)\n");
-    zep_log( "  -v, --verbose         Verbose output\n");
+    zep_log( "  --logging LEVELS      Comma-separated log levels: DEBUG,INFO,WARN,ERROR,AUDIT (default: INFO,WARN,ERROR)\n");
+    zep_log( "  --audit-log PATH      Audit log file path\n");
+    zep_log( "  -v                    Verbose (all levels, backwards compat)\n");
     zep_log( "  -h, --help            This help\n");
 }
 
@@ -3012,9 +2999,9 @@ int serve_main(int argc, char *argv[]) {
             case 'D': snprintf(g_db_path, sizeof(g_db_path), "%s", optarg); break;
             case 'A': snprintf(g_admin_cert_path, sizeof(g_admin_cert_path), "%s", optarg); break;
             case 'P': snprintf(g_key_password, sizeof(g_key_password), "%s", optarg); break;
-            case 'S': g_setup_mode = 1; break;
-            case 'v': g_verbose = 1; break;
-            case 'N': g_no_tls = 1; break;
+case 'v': g_logging = LOG_LEVEL_ALL; break;  /* -v for backwards compat: show all */
+             case 'S': g_setup_mode = 1; break;
+             case 'N': g_no_tls = 1; break;
             case 'l': audit_init(optarg); break;
             case 'h': usage_serve(argv[0]); audit_close(); return 0;
             default:  usage_serve(argv[0]); audit_close(); return 1;
@@ -3132,6 +3119,7 @@ int serve_main(int argc, char *argv[]) {
         return 1;
     }
     db_init_tables(g_db);
+    zep_log_init(g_db_path);
 
     {
         char buf[32];

@@ -32,7 +32,6 @@ static char g_ca_path[ZEP_MAX_PATH];
 static char g_key_password[128];
 static char g_db_path[ZEP_MAX_PATH];
 static int  g_has_server = 0;
-static int  g_verbose = 0;
 
 struct curl_buf {
     char *data;
@@ -65,7 +64,7 @@ static CURL *curl_init(struct curl_buf *resp) {
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     if (g_key_password[0])
         curl_easy_setopt(curl, CURLOPT_KEYPASSWD, g_key_password);
-    if (g_verbose) curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+    if (g_logging & LOG_LEVEL_DEBUG) curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
     return curl;
 }
 
@@ -113,7 +112,7 @@ static size_t ws_build_frame(unsigned char *buf, size_t buf_size,
 static ssize_t ws_ssl_read(ws_conn_t *wc, void *buf, size_t len) {
     if (wc->ssl) {
         int n = SSL_read(wc->ssl, buf, (int)len);
-        if (n <= 0 && g_verbose) {
+        if (n <= 0 && (g_logging & LOG_LEVEL_DEBUG)) {
             int err = SSL_get_error(wc->ssl, n);
             fprintf(stderr, "ws: SSL_read error=%d\n", err);
         }
@@ -149,8 +148,7 @@ static ssize_t ws_recv_frame(ws_conn_t *wc, unsigned char *out, size_t out_size,
                               unsigned char *opcode_out) {
     unsigned char hdr[14];
     ssize_t n = ws_ssl_read(wc, hdr, 2);
-    if (g_verbose)
-        fprintf(stderr, "ws: recv hdr n=%zd\n", n);
+    zep_log_debug("ws: recv hdr n=%zd\n", n);
     if (n < 2) return -1;
 
     uint64_t payload_len = hdr[1] & 0x7F;
@@ -170,8 +168,7 @@ static ssize_t ws_recv_frame(ws_conn_t *wc, unsigned char *out, size_t out_size,
         }
     }
 
-    if (g_verbose)
-        fprintf(stderr, "ws: recv payload_len=%lu\n", (unsigned long)payload_len);
+    zep_log_debug("ws: recv payload_len=%lu\n", (unsigned long)payload_len);
     if (payload_len > out_size) return -1;
     if (payload_len == 0) {
         *opcode_out = hdr[0] & 0x0F;
@@ -222,8 +219,7 @@ static ws_conn_t *ws_connect(const char *server_url, const char *path) {
         memcpy(host, scheme, sl);
     }
 
-    if (g_verbose)
-        fprintf(stderr, "ws: connecting to %s:%d%s (%s)\n", host, port, path,
+    zep_log_debug("ws: connecting to %s:%d%s (%s)\n", host, port, path,
                 use_tls ? "TLS" : "plain");
 
     /* Resolve host */
@@ -241,7 +237,7 @@ static ws_conn_t *ws_connect(const char *server_url, const char *path) {
     if (sock < 0) { freeaddrinfo(res); return NULL; }
 
     if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-        if (g_verbose) fprintf(stderr, "ws: connect failed\n");
+        zep_log_debug( "ws: connect failed\n");
         close(sock); freeaddrinfo(res); return NULL;
     }
     freeaddrinfo(res);
@@ -264,10 +260,10 @@ static ws_conn_t *ws_connect(const char *server_url, const char *path) {
         ssl = SSL_new(ctx);
         SSL_set_fd(ssl, sock);
         if (SSL_connect(ssl) <= 0) {
-            if (g_verbose) fprintf(stderr, "ws: SSL_connect failed\n");
+            zep_log_debug( "ws: SSL_connect failed\n");
             SSL_free(ssl); SSL_CTX_free(ctx); close(sock); return NULL;
         }
-        if (g_verbose) fprintf(stderr, "ws: TLS connected\n");
+        zep_log_debug( "ws: TLS connected\n");
     }
 
     /* WebSocket handshake */
@@ -299,7 +295,7 @@ static ws_conn_t *ws_connect(const char *server_url, const char *path) {
         SSL_write(ssl, req, (int)strlen(req));
     else
         send(sock, req, strlen(req), MSG_NOSIGNAL);
-    if (g_verbose) fprintf(stderr, "ws: sent handshake request\n");
+    zep_log_debug( "ws: sent handshake request\n");
 
     /* Read response */
     char resp_buf[1024];
@@ -310,9 +306,9 @@ static ws_conn_t *ws_connect(const char *server_url, const char *path) {
             n = SSL_read(ssl, resp_buf + resp_len, sizeof(resp_buf) - resp_len - 1);
         else
             n = (int)recv(sock, resp_buf + resp_len, sizeof(resp_buf) - resp_len - 1, 0);
-        if (g_verbose) fprintf(stderr, "ws: read returned %d\n", n);
+        zep_log_debug( "ws: read returned %d\n", n);
         if (n <= 0) {
-            if (g_verbose) fprintf(stderr, "ws: read error\n");
+            zep_log_debug( "ws: read error\n");
             if (ssl) { SSL_free(ssl); SSL_CTX_free(ctx); }
             close(sock); return NULL;
         }
@@ -321,7 +317,7 @@ static ws_conn_t *ws_connect(const char *server_url, const char *path) {
         if (strstr(resp_buf, "\r\n\r\n")) break;
         if (resp_len >= (int)sizeof(resp_buf) - 1) break;
     }
-    if (g_verbose) fprintf(stderr, "ws: got response: %.*s\n", resp_len, resp_buf);
+    zep_log_debug( "ws: got response: %.*s\n", resp_len, resp_buf);
 
     if (strstr(resp_buf, "101") == NULL) {
         fprintf(stderr, "ws: handshake failed: %.*s\n", resp_len, resp_buf);
@@ -807,8 +803,7 @@ static int cmd_pipe(int argc, char *argv[]) {
              target_node, cmd_encoded,
              interactive ? "&interactive=1" : "");
 
-    if (g_verbose)
-        fprintf(stderr, "pipe: opening WebSocket to %s\n", target_node);
+    zep_log_debug("pipe: opening WebSocket to %s\n", target_node);
 
     ws_conn_t *wc = ws_connect(g_server, ws_path);
     if (!wc) {
@@ -888,7 +883,7 @@ static int cmd_pipe(int argc, char *argv[]) {
         }
 
         if (stdin_done && !ws_done && time(NULL) - start_time > 30) {
-            if (g_verbose) fprintf(stderr, "pipe: timeout waiting for remote response\n");
+            zep_log_debug( "pipe: timeout waiting for remote response\n");
             break;
         }
         if (!stdin_done) start_time = time(NULL);
@@ -934,7 +929,7 @@ static int cmd_pipe(int argc, char *argv[]) {
             }
         }
 
-        if (g_verbose && !interactive_tty && isatty(STDERR_FILENO)) {
+        if ((g_logging & LOG_LEVEL_DEBUG) && !interactive_tty && isatty(STDERR_FILENO)) {
             time_t now = time(NULL);
             if (now > tick_prev) {
                 double dt = difftime(now, tick_prev);
@@ -969,7 +964,7 @@ static int cmd_pipe(int argc, char *argv[]) {
     }
     ws_close(wc);
 
-    if (g_verbose) {
+    if (g_logging & LOG_LEVEL_DEBUG) {
         double elapsed = difftime(time(NULL), pipe_start);
         if (elapsed < 0.1) elapsed = 0.1;
         uint64_t cur_in = sent + rcvd_stderr;
@@ -1033,7 +1028,9 @@ static void usage(const char *prog) {
         "  --ca, -C FILE      CA certificate (PEM)\n"
         "  --db, -d FILE      Local config DB (reads server/cert/key/ca defaults)\n"
         "  --password, -P PASS  Password for encrypted key\n"
-        "  --verbose, -v      Verbose output\n"
+        "  --logging LEVELS   Comma-separated log levels: DEBUG,INFO,WARN,ERROR,AUDIT (default: INFO,WARN,ERROR)\n"
+        "  --audit-log PATH   Audit log file path\n"
+        "  -v                 Verbose (all levels, backwards compat)\n"
         "\n"
         "Join options:\n"
         "  --role master|client  Node role\n"
@@ -1086,7 +1083,10 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "-P") == 0 && i + 1 < argc) {
             snprintf(g_key_password, sizeof(g_key_password), "%s", argv[++i]);
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
-            g_verbose = 1;
+            g_logging = LOG_LEVEL_ALL;
+        } else if (strcmp(argv[i], "--logging") == 0 && i + 1 < argc) {
+            i++;
+            g_logging = zep_log_parse_mask(argv[i]);
         } else if (strcmp(argv[i], "--audit-log") == 0 && i + 1 < argc) {
             i++;
             audit_init(argv[i]);
@@ -1149,6 +1149,7 @@ int main(int argc, char *argv[]) {
     else if (strcmp(cmd, "remove-node") == 0) rc = cmd_remove_node(sub_argc, sub_argv);
     else { fprintf(stderr, "Unknown command: %s\n", cmd); usage(argv2[0]); }
 
+    zep_log_init(g_db_path);
     curl_global_cleanup();
     audit_close();
     return rc;
