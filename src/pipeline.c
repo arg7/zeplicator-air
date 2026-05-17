@@ -5,6 +5,7 @@
 #include "zfs.h"
 #include "http.h"
 #include "db.h"
+#include "audit.h"
 #include "common.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,7 @@
 #include <openssl/evp.h>
 #include <sqlite3.h>
 #include <cjson/cJSON.h>
+#include <sys/wait.h>
 
 err_t pipeline_resolve_fs(const char *cluster_fs, const char *mapping,
                           char *local_fs, size_t len) {
@@ -127,7 +129,7 @@ static err_t find_base_snapshot(const char *fs, const char *base_guid, char *sna
     snprintf(cmd, sizeof(cmd), "zfs list -Hp -t snapshot -o name,guid '%s' 2>/dev/null", fs);
 
     FILE *p = popen(cmd, "r");
-    if (!p) return ZEP_ERR_ZFS;
+    if (!p) { audit_log(AUDIT_EVT_EXEC, "zfs", cmd, -127); return ZEP_ERR_ZFS; }
 
     char line[1024];
     while (fgets(line, sizeof(line), p)) {
@@ -143,11 +145,13 @@ static err_t find_base_snapshot(const char *fs, const char *base_guid, char *sna
             if (sl >= len) sl = len - 1;
             memcpy(snap_name, line, sl);
             snap_name[sl] = '\0';
-            pclose(p);
+            int rc = pclose(p);
+            audit_log(AUDIT_EVT_EXEC, "zfs", cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
             return ZEP_ERR_OK;
         }
     }
-    pclose(p);
+    int rc = pclose(p);
+    audit_log(AUDIT_EVT_EXEC, "zfs", cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
     return ZEP_ERR_NOT_FOUND;
 }
 
@@ -397,7 +401,10 @@ skip_snapshot:
             snprintf(comp_cmd, sizeof(comp_cmd), "cat '%s'", tmpname);
 
         FILE *comp_fp = popen(comp_cmd, "r");
-        if (!comp_fp) { unlink(tmpname); ret = ZEP_ERR_SYS; break; }
+        if (!comp_fp) {
+            audit_log(AUDIT_EVT_EXEC, "pipeline", comp_cmd, -127);
+            unlink(tmpname); ret = ZEP_ERR_SYS; break;
+        }
 
         size_t comp_cap = nread + nread / 8 + 1024;
         unsigned char *comp_buf = malloc(comp_cap);
@@ -416,6 +423,7 @@ skip_snapshot:
             comp_len += nr;
         }
         int comp_rc = pclose(comp_fp);
+        audit_log(AUDIT_EVT_EXEC, "pipeline", comp_cmd, WIFEXITED(comp_rc) ? WEXITSTATUS(comp_rc) : -1);
         unlink(tmpname);
         if (ret != ZEP_ERR_OK) { free(comp_buf); break; }
         if (comp_rc != 0) { free(comp_buf); zep_log( "push: compression failed\n"); ret = ZEP_ERR_ZFS; break; }
@@ -593,7 +601,9 @@ err_t pipeline_pull(const zep_config_t *cfg,
         if (!meta.base_guid[0]) {
             char cmd[ZEP_MAX_PATH];
             snprintf(cmd, sizeof(cmd), "zfs set mountpoint=none '%s' 2>/dev/null", fs);
-            if (system(cmd) == -1) {}
+            int _rc = system(cmd);
+            audit_log(AUDIT_EVT_EXEC, "zfs", cmd, _rc < 0 ? -127 : WIFEXITED(_rc) ? WEXITSTATUS(_rc) : -1);
+            if (_rc == -1) {}
         }
 
         printf("Pulling %s  guid=%s  blobs=%d  size=%lu\n",
@@ -751,7 +761,9 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
         if (bg && cJSON_IsString(bg) && is_full) {
             char cmd[ZEP_MAX_PATH];
             snprintf(cmd, sizeof(cmd), "zfs set mountpoint=none '%s' 2>/dev/null", fs);
-            if (system(cmd) == -1) {}
+            int _rc = system(cmd);
+            audit_log(AUDIT_EVT_EXEC, "zfs", cmd, _rc < 0 ? -127 : WIFEXITED(_rc) ? WEXITSTATUS(_rc) : -1);
+            if (_rc == -1) {}
         }
 
         cJSON *blobs = cJSON_GetObjectItem(snap, "blobs");

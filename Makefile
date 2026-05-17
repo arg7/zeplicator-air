@@ -10,20 +10,20 @@ ifdef SANITIZE
   SERV_LDFLAGS += -fsanitize=address
 endif
 
-COMMON   = src/db.c src/zfs.c src/storage.c src/pipeline.c src/http.c
+COMMON   = src/db.c src/zfs.c src/storage.c src/pipeline.c src/http.c src/audit.c
 
 all: zep-air zep-air-serve zep-air-admin zep-stream-ff
 
 zep-air: src/main.c $(COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lutil
 
-zep-air-serve: src/serve.c src/storage.c src/db.c src/zstream.c src/auth.c
+zep-air-serve: src/serve.c src/storage.c src/db.c src/zstream.c src/auth.c src/audit.c
 	$(CC) $(CFLAGS) -o $@ $^ $(SERV_LDFLAGS)
 
-zep-air-admin: src/admin.c src/db.c
+zep-air-admin: src/admin.c src/db.c src/audit.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-zep-stream-ff: src/stream-ff.c
+zep-stream-ff: src/stream-ff.c src/audit.c
 	$(CC) -Wall -Wextra -Werror -g -O2 -std=c11 -D_GNU_SOURCE -o $@ $^
 
 clean:

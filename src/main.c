@@ -6,6 +6,7 @@
 #include "pipeline.h"
 #include "storage.h"
 #include "http.h"
+#include "audit.h"
 #include <cjson/cJSON.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1701,6 +1702,9 @@ int main(int argc, char *argv[]) {
             snprintf(g_db_path, sizeof(g_db_path), "%s", argv[i]);
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
             g_verbose = 1;
+        } else if (strcmp(argv[i], "--audit-log") == 0 && i + 1 < argc) {
+            i++;
+            audit_init(argv[i]);
         } else {
             argv2[argc2++] = argv[i];
         }
@@ -1721,18 +1725,22 @@ int main(int argc, char *argv[]) {
 
     char **sub_argv = (char **)argv2 + 1;
     int sub_argc = argc2 - 1;
+    int rc = 1;
 
-    if (strcmp(cmd, "rotate") == 0) return cmd_rotate(sub_argc, sub_argv);
-    if (strcmp(cmd, "snap") == 0)   return cmd_snap(sub_argc, sub_argv);
-    if (strcmp(cmd, "cron") == 0)   return cmd_cron(sub_argc, sub_argv);
-    if (strcmp(cmd, "push") == 0)   return cmd_push(sub_argc, sub_argv);
-    if (strcmp(cmd, "pull") == 0)   return cmd_pull(sub_argc, sub_argv);
-    if (strcmp(cmd, "config") == 0) return cmd_config(sub_argc, sub_argv);
-    if (strcmp(cmd, "status") == 0) return cmd_status(sub_argc, sub_argv);
+    if (strcmp(cmd, "rotate") == 0) rc = cmd_rotate(sub_argc, sub_argv);
+    else if (strcmp(cmd, "snap") == 0)   rc = cmd_snap(sub_argc, sub_argv);
+    else if (strcmp(cmd, "cron") == 0)   rc = cmd_cron(sub_argc, sub_argv);
+    else if (strcmp(cmd, "push") == 0)   rc = cmd_push(sub_argc, sub_argv);
+    else if (strcmp(cmd, "pull") == 0)   rc = cmd_pull(sub_argc, sub_argv);
+    else if (strcmp(cmd, "config") == 0) rc = cmd_config(sub_argc, sub_argv);
+    else if (strcmp(cmd, "status") == 0) rc = cmd_status(sub_argc, sub_argv);
+    else {
+        zep_log( "Unknown command: %s\n", cmd);
+        usage(argv2[0]);
+    }
 
-    zep_log( "Unknown command: %s\n", cmd);
-    usage(argv2[0]);
-    return 1;
+    audit_close();
+    return rc;
 }
 
 int pipeline_resume_request(const char *guid, const char *token, const char *fs) {

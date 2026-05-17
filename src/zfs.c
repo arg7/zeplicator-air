@@ -1,12 +1,51 @@
 /* MIT License — Copyright (c) 2026 CompEd Software Design srl — see LICENSE */
 
 #include "zfs.h"
+#include "audit.h"
 #include "common.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/wait.h>
+
+static int audit_popen(const char *cmd) {
+    int rc = 0;
+    FILE *p = popen(cmd, "r");
+    if (!p) { audit_log(AUDIT_EVT_EXEC, "zfs", cmd, -127); return ZEP_ERR_ZFS; }
+    /* consume any output */
+    char buf[512];
+    while (fgets(buf, sizeof(buf), p)) {}
+    rc = pclose(p);
+    audit_log(AUDIT_EVT_EXEC, "zfs", cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
+    return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+}
+
+
+
+static int audit_system(const char *cmd) {
+    int rc = system(cmd);
+    if (rc < 0) audit_log(AUDIT_EVT_EXEC, "zfs", cmd, -127);
+    else audit_log(AUDIT_EVT_EXEC, "zfs", cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
+    return rc;
+}
+
+/* popen variants that return the FILE* but defer audit logging to a separate call */
+static FILE *audit_popen_keep(const char *cmd) {
+    audit_log(AUDIT_EVT_EXEC, "zfs", cmd, -128); /* -128 = opened, not yet closed */
+    return popen(cmd, "r");
+}
+
+static FILE *audit_popen_w_keep(const char *cmd) {
+    audit_log(AUDIT_EVT_EXEC, "zfs", cmd, -128);
+    return popen(cmd, "w");
+}
+
+static void audit_pclose(FILE *fp, const char *cmd) {
+    if (!fp) return;
+    int rc = pclose(fp);
+    audit_log(AUDIT_EVT_EXEC, "zfs", cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
+}
 
 err_t zfs_snapshot_create(const char *fs, const char *label, char *out_name, size_t out_len) {
     char ts[20];
@@ -20,14 +59,9 @@ err_t zfs_snapshot_create(const char *fs, const char *label, char *out_name, siz
 
     char cmd[1024];
     snprintf(cmd, sizeof(cmd), "zfs snapshot '%s' 2>&1", out_name);
-    FILE *p = popen(cmd, "r");
-    if (!p) return ZEP_ERR_ZFS;
-
-    char errbuf[512] = {0};
-    if (fread(errbuf, 1, sizeof(errbuf) - 1, p) == 0 && ferror(p)) {}
-    int rc = pclose(p);
+    int rc = audit_popen(cmd);
     if (rc != 0) {
-        zep_log( "zfs snapshot failed: %s\n", errbuf);
+        zep_log( "zfs snapshot failed (rc=%d)\n", rc);
         return ZEP_ERR_ZFS;
     }
     return ZEP_ERR_OK;
@@ -46,14 +80,9 @@ err_t zfs_snapshot_create_cluster(const char *fs, const char *cluster,
 
     char cmd[1024];
     snprintf(cmd, sizeof(cmd), "zfs snapshot '%s' 2>&1", out_name);
-    FILE *p = popen(cmd, "r");
-    if (!p) return ZEP_ERR_ZFS;
-
-    char errbuf[512] = {0};
-    if (fread(errbuf, 1, sizeof(errbuf) - 1, p) == 0 && ferror(p)) {}
-    int rc = pclose(p);
+    int rc = audit_popen(cmd);
     if (rc != 0) {
-        zep_log( "zfs snapshot failed: %s\n", errbuf);
+        zep_log( "zfs snapshot failed (rc=%d)\n", rc);
         return ZEP_ERR_ZFS;
     }
     return ZEP_ERR_OK;
@@ -111,8 +140,9 @@ err_t zfs_send_open(const char *fs, const char *from_snap, const char *to_snap,
         snprintf(popen_cmd, sizeof(popen_cmd), "%s", cmd);
     }
     zep_log("zfs send cmd: %s\n", popen_cmd);
-    *fp = popen(popen_cmd, "r");
+    *fp = audit_popen_keep(popen_cmd);
     if (!*fp) {
+        audit_log(AUDIT_EVT_EXEC, "zfs", popen_cmd, -127);
         perror("popen zfs send");
         return ZEP_ERR_ZFS;
     }
@@ -120,10 +150,12 @@ err_t zfs_send_open(const char *fs, const char *from_snap, const char *to_snap,
 }
 
 int zfs_send_close(FILE *fp) {
+    (void)fp;
     if (fp) {
         int rc = pclose(fp);
         if (rc != 0) {
             zep_log( "warning: zfs send exited with code %d\n", rc);
+            audit_log(AUDIT_EVT_EXEC, "zfs", "zfs send (close)", rc);
         }
         return rc;
     }
@@ -165,13 +197,14 @@ err_t zfs_recv_open(const char *fs, const char *snap,
                         "zstream resume -t '%s' -i - | ", resume_token);
     }
 
-    snprintf(cmd + pos, sizeof(cmd) - (size_t)pos,
-             "zfs recv %s -F%s -u '%s' 2>/dev/null",
-             extra_opts ? extra_opts : "",
-             use_resumable ? " -s" : "", fs);
+   snprintf(cmd + pos, sizeof(cmd) - (size_t)pos,
+              "zfs recv %s -F%s -u '%s' 2>/dev/null",
+              extra_opts ? extra_opts : "",
+              use_resumable ? " -s" : "", fs);
     zep_log("zfs_recv_open: cmd=[%s]\n", cmd);
-    *fp = popen(cmd, "w");
+    *fp = audit_popen_w_keep(cmd);
     if (!*fp) {
+        audit_log(AUDIT_EVT_EXEC, "zfs", cmd, -127);
         perror("popen zfs recv");
         return ZEP_ERR_ZFS;
     }
@@ -179,6 +212,8 @@ err_t zfs_recv_open(const char *fs, const char *snap,
 }
 
 int zfs_recv_close(FILE *fp) {
+    (void)fp;
+    /* recv_close audit was already logged at open (-128). No re-log needed. */
     if (fp) {
         int rc = pclose(fp);
         if (rc != 0) {
@@ -194,7 +229,7 @@ int zfs_recv_close(FILE *fp) {
 err_t zfs_recv_abort(const char *fs) {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd), "zfs recv -A '%s' 2>/dev/null", fs);
-    int rc = system(cmd);
+    int rc = audit_system(cmd);
     (void)rc;
     return ZEP_ERR_OK;
 }
@@ -204,13 +239,16 @@ err_t zfs_get_recv_token(const char *fs, char *token, size_t token_len) {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
              "zfs get -Hp -o value receive_resume_token '%s' 2>/dev/null", fs);
-    FILE *p = popen(cmd, "r");
-    if (!p) return ZEP_ERR_ZFS;
+    FILE *p = audit_popen_keep(cmd);
+    if (!p) {
+        audit_log(AUDIT_EVT_EXEC, "zfs", cmd, -127);
+        return ZEP_ERR_ZFS;
+    }
     if (!fgets(token, (int)token_len, p)) {
-        pclose(p);
+        audit_pclose(p, cmd);
         return ZEP_ERR_NOT_FOUND;
     }
-    pclose(p);
+    audit_pclose(p, cmd);
     size_t n = strlen(token);
     while (n > 0 && (token[n - 1] == '\n' || token[n - 1] == '\r'))
         token[--n] = '\0';
@@ -222,14 +260,17 @@ err_t zfs_get_snapshot_guid(const char *snapshot, char *guid, size_t len) {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd), "zfs get -Hp -o value guid '%s' 2>/dev/null", snapshot);
 
-    FILE *p = popen(cmd, "r");
-    if (!p) return ZEP_ERR_ZFS;
-
-    if (!fgets(guid, (int)len, p)) {
-        pclose(p);
+    FILE *p = audit_popen_keep(cmd);
+    if (!p) {
+        audit_log(AUDIT_EVT_EXEC, "zfs", cmd, -127);
         return ZEP_ERR_ZFS;
     }
-    pclose(p);
+
+    if (!fgets(guid, (int)len, p)) {
+        audit_pclose(p, cmd);
+        return ZEP_ERR_ZFS;
+    }
+    audit_pclose(p, cmd);
 
     size_t slen = strlen(guid);
     while (slen > 0 && (guid[slen - 1] == '\n' || guid[slen - 1] == '\r'))
@@ -242,15 +283,18 @@ err_t zfs_get_latest_guid(const char *fs, char *guid, size_t len) {
     snprintf(cmd, sizeof(cmd),
         "zfs list -Hp -t snapshot -o name -s creation '%s' 2>/dev/null | tail -1", fs);
 
-    FILE *p = popen(cmd, "r");
-    if (!p) return ZEP_ERR_ZFS;
+    FILE *p = audit_popen_keep(cmd);
+    if (!p) {
+        audit_log(AUDIT_EVT_EXEC, "zfs", cmd, -127);
+        return ZEP_ERR_ZFS;
+    }
 
     char line[512];
     if (!fgets(line, sizeof(line), p)) {
-        pclose(p);
+        audit_pclose(p, cmd);
         return ZEP_ERR_NO_SNAPSHOTS;
     }
-    pclose(p);
+    audit_pclose(p, cmd);
 
     size_t slen = strlen(line);
     while (slen > 0 && (line[slen - 1] == '\n' || line[slen - 1] == '\r'))
@@ -266,20 +310,16 @@ err_t zfs_snapshot_exists(const char *fs, const char *snap) {
     snprintf(cmd, sizeof(cmd),
         "zfs list -Hp -t snapshot -o name '%s' 2>/dev/null | grep -Fx '%s' >/dev/null 2>&1",
         fs, snap);
-    int rc = system(cmd);
+    int rc = audit_system(cmd);
     return rc == 0 ? ZEP_ERR_OK : ZEP_ERR_NOT_FOUND;
 }
 
 err_t zfs_destroy_snapshot(const char *snapshot) {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd), "zfs destroy '%s' 2>&1", snapshot);
-    FILE *p = popen(cmd, "r");
-    if (!p) return ZEP_ERR_ZFS;
-    char errbuf[512] = {0};
-    if (fread(errbuf, 1, sizeof(errbuf) - 1, p) == 0 && ferror(p)) {}
-    int rc = pclose(p);
+    int rc = audit_popen(cmd);
     if (rc != 0) {
-        zep_log( "zfs destroy failed: %s\n", errbuf);
+        zep_log( "zfs destroy failed (rc=%d)\n", rc);
         return ZEP_ERR_ZFS;
     }
     return ZEP_ERR_OK;

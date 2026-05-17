@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "db.h"
+#include "audit.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -361,7 +362,10 @@ static int do_post(const char *path, const char *json_body) {
 
     CURLcode rc = curl_easy_perform(curl);
     long http_code = 0;
+    char *ad_eff_url = NULL;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &ad_eff_url);
+    audit_log(AUDIT_EVT_HTTP, "admin", ad_eff_url ? ad_eff_url : url, (int)http_code);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     free(url);
@@ -392,7 +396,10 @@ static int do_get(const char *path) {
 
     CURLcode rc = curl_easy_perform(curl);
     long http_code = 0;
+    char *ad_eff_url = NULL;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &ad_eff_url);
+    audit_log(AUDIT_EVT_HTTP, "admin", ad_eff_url ? ad_eff_url : url, (int)http_code);
     free(url);
     curl_easy_cleanup(curl);
 
@@ -423,7 +430,10 @@ static int do_delete(const char *path) {
 
     CURLcode rc = curl_easy_perform(curl);
     long http_code = 0;
+    char *ad_eff_url = NULL;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &ad_eff_url);
+    audit_log(AUDIT_EVT_HTTP, "admin", ad_eff_url ? ad_eff_url : url, (int)http_code);
     free(url);
     curl_easy_cleanup(curl);
 
@@ -1077,6 +1087,9 @@ int main(int argc, char *argv[]) {
             snprintf(g_key_password, sizeof(g_key_password), "%s", argv[++i]);
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             g_verbose = 1;
+        } else if (strcmp(argv[i], "--audit-log") == 0 && i + 1 < argc) {
+            i++;
+            audit_init(argv[i]);
         } else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
             snprintf(g_db_path, sizeof(g_db_path), "%s", argv[++i]);
         } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
@@ -1137,5 +1150,6 @@ int main(int argc, char *argv[]) {
     else { fprintf(stderr, "Unknown command: %s\n", cmd); usage(argv2[0]); }
 
     curl_global_cleanup();
+    audit_close();
     return rc;
 }

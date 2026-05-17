@@ -1,6 +1,7 @@
 /* MIT License — Copyright (c) 2026 CompEd Software Design srl — see LICENSE */
 
 #include "zstream.h"
+#include "audit.h"
 #include "common.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,7 +32,7 @@ err_t zstream_parse(const void *data, size_t len,
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "zstream dump -v '%s' 2>/dev/null", tmpl);
     FILE *zp = popen(cmd, "r");
-    if (!zp) { unlink(tmpl); perror("popen"); return ZEP_ERR_ZFS; }
+    if (!zp) { unlink(tmpl); audit_log(AUDIT_EVT_EXEC, "zstream", cmd, -127); return ZEP_ERR_ZFS; }
 
     char line[256];
     int has_begin = 0;
@@ -54,6 +55,7 @@ err_t zstream_parse(const void *data, size_t len,
 
     int rc = pclose(zp);
     unlink(tmpl);
+    audit_log(AUDIT_EVT_EXEC, "zstream", cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
 
     if (!toguid[0]) {
         if (!has_begin) {
@@ -102,14 +104,15 @@ err_t zstream_token_generate(const void *data, size_t len,
         snprintf(cmd, sizeof(cmd),
                  "zstream token -g < '%s'", tmpl);
     FILE *p = popen(cmd, "r");
-    if (!p) { unlink(tmpl); return ZEP_ERR_ZFS; }
+    if (!p) { unlink(tmpl); audit_log(AUDIT_EVT_EXEC, "zstream", cmd, -127); return ZEP_ERR_ZFS; }
 
     token_out[0] = '\0';
     if (!fgets(token_out, (int)token_len, p)) {
-        pclose(p); unlink(tmpl); return ZEP_ERR_ZFS;
+        pclose(p); unlink(tmpl); audit_log(AUDIT_EVT_EXEC, "zstream", cmd, -1); return ZEP_ERR_ZFS;
     }
-    pclose(p);
+    int rc = pclose(p);
     unlink(tmpl);
+    audit_log(AUDIT_EVT_EXEC, "zstream", cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
 
     size_t n = strlen(token_out);
     while (n > 0 && (token_out[n - 1] == '\n' || token_out[n - 1] == '\r'))
@@ -126,7 +129,7 @@ err_t zstream_token_parse_offset(const char *token,
     char cmd[1024];
     snprintf(cmd, sizeof(cmd), "zstream token '%s' 2>/dev/null", token);
     FILE *p = popen(cmd, "r");
-    if (!p) return ZEP_ERR_ZFS;
+    if (!p) { audit_log(AUDIT_EVT_EXEC, "zstream", cmd, -127); return ZEP_ERR_ZFS; }
 
     char line[256];
     while (fgets(line, sizeof(line), p)) {
@@ -139,12 +142,14 @@ err_t zstream_token_parse_offset(const char *token,
             if (eq) {
                 val = strtoll(eq + 1, NULL, 0);
                 *offset_out = (uint64_t)val;
-                pclose(p);
+                int rc = pclose(p);
+                audit_log(AUDIT_EVT_EXEC, "zstream", cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
                 return ZEP_ERR_OK;
             }
         }
     }
 
-    pclose(p);
+    int rc = pclose(p);
+    audit_log(AUDIT_EVT_EXEC, "zstream", cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
     return ZEP_ERR_NOT_FOUND;
 }

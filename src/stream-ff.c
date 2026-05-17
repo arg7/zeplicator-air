@@ -8,7 +8,8 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <sys/stat.h>
-#include <errno.h>
+#include <sys/wait.h>
+#include "audit.h"
 
 static int name_cmp(const void *a, const void *b) {
     return strcmp(*(const char **)a, *(const char **)b);
@@ -28,31 +29,37 @@ static void usage(const char *prog) {
 }
 
 int main(int argc, char *argv[]) {
+    /* parse args first to get --in dir, then init audit log */
     const char *in_dir = NULL;
     const char *unzip_cmd = NULL;
     uint64_t skip = 0, cut = 0;
     int has_skip = 0, has_cut = 0;
+    const char *audit_log_path = NULL;
 
     static struct option opts[] = {
         {"in",        required_argument, 0, 'i'},
         {"unzip_cmd", required_argument, 0, 'u'},
         {"skip",      required_argument, 0, 's'},
         {"cut",       required_argument, 0, 'c'},
+        {"audit-log", required_argument, 0, 'a'},
         {"help",      no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:u:s:c:h", opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:u:s:c:a:h", opts, NULL)) != -1) {
         switch (opt) {
             case 'i': in_dir = optarg; break;
             case 'u': unzip_cmd = optarg; break;
             case 's': skip = (uint64_t)strtoull(optarg, NULL, 10); has_skip = 1; break;
             case 'c': cut  = (uint64_t)strtoull(optarg, NULL, 10); has_cut  = 1; break;
+            case 'a': audit_log_path = optarg; break;
             case 'h': usage(argv[0]); return 0;
             default:  return 1;
         }
     }
+
+    audit_init(audit_log_path);
 
     if (!in_dir) {
         usage(argv[0]);
@@ -103,7 +110,8 @@ int main(int argc, char *argv[]) {
                             unc_size = (uint64_t)strtoull(lparen + 1, NULL, 10);
                         }
                     }
-                    pclose(lp);
+                    int rc = pclose(lp);
+                    audit_log(AUDIT_EVT_EXEC, "stream-ff", lcmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
                 }
             }
 
@@ -116,7 +124,10 @@ int main(int argc, char *argv[]) {
             snprintf(cmd, sizeof(cmd), "%s < '%s' 2>/dev/null",
                      unzip_cmd, path);
             FILE *fp = popen(cmd, "r");
-            if (!fp) continue;
+            if (!fp) {
+                audit_log(AUDIT_EVT_EXEC, "stream-ff", cmd, -127);
+                continue;
+            }
 
             if (unc_size > 0 && has_skip && skipped < skip) {
                 uint64_t discard = skip - skipped;
@@ -153,24 +164,28 @@ int main(int argc, char *argv[]) {
                     if (has_cut && written + (uint64_t)tow > cut)
                         tow = (size_t)(cut - written);
                     if (tow == 0) {
-                        pclose(fp);
+                        int rc = pclose(fp);
+                        audit_log(AUDIT_EVT_EXEC, "stream-ff", cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
                         goto done;
                     }
 
                     if (fwrite(buf + off, 1, tow, stdout) != tow) {
-                        pclose(fp);
+                        int rc = pclose(fp);
+                        audit_log(AUDIT_EVT_EXEC, "stream-ff", cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
                         goto done;
                     }
                     written += (uint64_t)tow;
                     off = 0;
 
                     if (has_cut && written >= cut) {
-                        pclose(fp);
+                        int rc = pclose(fp);
+                        audit_log(AUDIT_EVT_EXEC, "stream-ff", cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
                         goto done;
                     }
                 }
             }
-            pclose(fp);
+            int rc = pclose(fp);
+            audit_log(AUDIT_EVT_EXEC, "stream-ff", cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
         }
     } else {
         uint64_t skipped = 0, written = 0;
@@ -222,5 +237,6 @@ int main(int argc, char *argv[]) {
 done:
     fflush(stdout);
     for (int i = 0; i < nfiles; i++) free(files[i]);
+    audit_close();
     return 0;
 }

@@ -2,6 +2,7 @@
 
 #include "auth.h"
 #include "db.h"
+#include "audit.h"
 #include "common.h"
 
 extern int g_verbose;
@@ -94,18 +95,22 @@ err_t auth_verify_client(sqlite3 *db, X509 *client_cert,
     char *cn = auth_extract_cn(client_cert);
     if (!cn) {
         zep_log( "auth: failed to extract CN from client cert\n");
+        audit_log(AUDIT_EVT_CERT, "auth", "extract_cn", -1);
         return ZEP_ERR_CERT;
     }
 
     char *fp = auth_cert_fingerprint(client_cert);
     if (!fp) {
         zep_log( "auth: failed to compute fingerprint\n");
+        audit_log(AUDIT_EVT_CERT, "auth", "fingerprint", -1);
         free(cn);
         return ZEP_ERR_CERT;
     }
 
     char stored_fp[96] = {0};
     err_t ret = db_cert_lookup(db, cn, stored_fp, sizeof(stored_fp));
+
+    audit_log(AUDIT_EVT_CERT, "auth", cn, ret == ZEP_ERR_OK ? 1 : 0);
 
     if (ret == ZEP_ERR_OK) {
         if (strcasecmp(fp, stored_fp) != 0) {

@@ -5,6 +5,7 @@
 #include "db.h"
 #include "zstream.h"
 #include "auth.h"
+#include "audit.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -288,6 +289,7 @@ static void verify_snapshot(const char *cluster_key, const char *prefix,
             return;
         }
         int rc = system(cmd);
+        audit_log(AUDIT_EVT_EXEC, "serve", cmd, rc < 0 ? -127 : WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
         free(cmd);
         if (rc != 0) {
             if (g_verbose) zep_log( "verify: zstd -d failed rc=%d, trying raw\n", rc);
@@ -765,18 +767,19 @@ static void *node_ws_thread(void *arg) {
                                                      "| head -c 128 | base64 -w0",
                                                      blob0);
                                             FILE *hp = popen(ucmd, "r");
-                                            if (hp) {
-                                                if (fgets(hdr_b64,
-                                                          sizeof(hdr_b64), hp))
-                                                {
-                                                    size_t n = strlen(hdr_b64);
-                                                    while (n > 0 &&
-                                                           (hdr_b64[n-1]=='\n'
-                                                            || hdr_b64[n-1]=='\r'))
-                                                        hdr_b64[--n]='\0';
-                                                }
-                                                pclose(hp);
-                                            }
+                                             if (hp) {
+                                                 if (fgets(hdr_b64,
+                                                           sizeof(hdr_b64), hp))
+                                                 {
+                                                     size_t n = strlen(hdr_b64);
+                                                     while (n > 0 &&
+                                                            (hdr_b64[n-1]=='\n'
+                                                             || hdr_b64[n-1]=='\r'))
+                                                         hdr_b64[--n]='\0';
+                                                 }
+                                                 int _hp_rc = pclose(hp);
+                                                 audit_log(AUDIT_EVT_EXEC, "serve", ucmd, WIFEXITED(_hp_rc) ? WEXITSTATUS(_hp_rc) : -1);
+                                             }
                                         }
 
                                         char pipe_cmd[8192];
@@ -791,21 +794,23 @@ static void *node_ws_thread(void *arg) {
                                             token_j->valuestring,
                                             hdr_b64[0] ? hdr_b64 : "");
 
-                                        FILE *pp = popen(pipe_cmd, "r");
-                                        if (pp) {
-                                            unsigned char rbuf[65536];
-                                            for (;;) {
-                                                size_t nr = fread(rbuf, 1,
-                                                    sizeof(rbuf), pp);
-                                                if (nr == 0) break;
-                                                ws_send_frame_gtls(nw,
-                                                    WS_OP_BIN, rbuf, nr);
-                                            }
-                                            int rc = pclose(pp);
-                                            unsigned char ex = rc ? 1 : 0;
-                                            ws_send_frame_gtls(nw,
-                                                WS_OP_EXIT, &ex, 1);
-                                        } else {
+                                      FILE *pp = popen(pipe_cmd, "r");
+                                         audit_log(AUDIT_EVT_EXEC, "serve", pipe_cmd, pp ? -128 : -127);
+                                         if (pp) {
+                                             unsigned char rbuf[65536];
+                                             for (;;) {
+                                                 size_t nr = fread(rbuf, 1,
+                                                     sizeof(rbuf), pp);
+                                                 if (nr == 0) break;
+                                                 ws_send_frame_gtls(nw,
+                                                     WS_OP_BIN, rbuf, nr);
+                                             }
+                                             int rc = pclose(pp);
+                                             audit_log(AUDIT_EVT_EXEC, "serve", pipe_cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
+                                             unsigned char ex = rc ? 1 : 0;
+                                             ws_send_frame_gtls(nw,
+                                                 WS_OP_EXIT, &ex, 1);
+                                         } else {
                                             unsigned char ex = 1;
                                             ws_send_frame_gtls(nw,
                                                 WS_OP_EXIT, &ex, 1);
@@ -2656,7 +2661,8 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                     zep_log("status: token=%s\n",
                             resume_token[0] ? resume_token : "(empty)");
                 }
-                pclose(p);
+                int _p_rc = pclose(p);
+                audit_log(AUDIT_EVT_EXEC, "serve", cmd, WIFEXITED(_p_rc) ? WEXITSTATUS(_p_rc) : -1);
             }
         }
 
@@ -2936,10 +2942,12 @@ static int load_pem(const char *path, char **data) {
         snprintf(tmp_out, sizeof(tmp_out), "/tmp/zep-key-out-%d", getpid());
         FILE *tf = fopen(tmp_in, "w");
         if (tf) { fwrite(*data, 1, r, tf); fclose(tf); }
-        snprintf(cmd, sizeof(cmd),
-            "openssl rsa -in '%s' -passin pass:'%s' -out '%s' 2>/dev/null",
-            tmp_in, g_key_password, tmp_out);
-        if (system(cmd) == 0) {
+      snprintf(cmd, sizeof(cmd),
+             "openssl rsa -in '%s' -passin pass:'%s' -out '%s' 2>/dev/null",
+             tmp_in, g_key_password, tmp_out);
+        int _ossl_rc = system(cmd);
+        audit_log(AUDIT_EVT_EXEC, "serve", cmd, _ossl_rc < 0 ? -127 : WIFEXITED(_ossl_rc) ? WEXITSTATUS(_ossl_rc) : -1);
+        if (_ossl_rc == 0) {
             FILE *of = fopen(tmp_out, "r");
             if (of) {
                 fseek(of, 0, SEEK_END);
@@ -2988,12 +2996,13 @@ int serve_main(int argc, char *argv[]) {
         {"no-tls",    no_argument,       0, 'N'},
         {"setup",      no_argument,       0, 'S'},
         {"verbose", no_argument,       0, 'v'},
+        {"audit-log", required_argument, 0, 'l'},
         {"help",    no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:A:D:P:SvNh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:A:D:P:Svhl:", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'p': g_port = atoi(optarg); break;
             case 's': snprintf(g_storage_root, sizeof(g_storage_root), "%s", optarg); break;
@@ -3006,8 +3015,9 @@ int serve_main(int argc, char *argv[]) {
             case 'S': g_setup_mode = 1; break;
             case 'v': g_verbose = 1; break;
             case 'N': g_no_tls = 1; break;
-            case 'h': usage_serve(argv[0]); return 0;
-            default:  usage_serve(argv[0]); return 1;
+            case 'l': audit_init(optarg); break;
+            case 'h': usage_serve(argv[0]); audit_close(); return 0;
+            default:  usage_serve(argv[0]); audit_close(); return 1;
         }
     }
 
@@ -3188,6 +3198,7 @@ int serve_main(int argc, char *argv[]) {
 
     printf("\nServer stopped.\n");
     db_close(g_db);
+    audit_close();
     return 0;
 }
 

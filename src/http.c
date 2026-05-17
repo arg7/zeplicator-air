@@ -2,6 +2,7 @@
 
 #include "http.h"
 #include "storage.h"
+#include "audit.h"
 #include "common.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,13 +53,19 @@ static CURL *http_init(const http_config_t *cfg, const char *url,
     return curl;
 }
 
-static int http_do(CURL *curl, int keep) {
+static int http_do(CURL *curl, int keep, const char *method) {
     CURLcode rc = curl_easy_perform(curl);
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     char *eff_url = NULL;
     curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &eff_url);
     zep_log("http: %ld %s\n", http_code, eff_url ? eff_url : "?");
+
+    /* audit the HTTP call */
+    if (eff_url) {
+        audit_log(AUDIT_EVT_HTTP, method ? method : "http", eff_url, (int)http_code);
+    }
+
     if (!keep) curl_easy_cleanup(curl);
     if (rc != CURLE_OK) {
         zep_log( "http: %s\n", curl_easy_strerror(rc));
@@ -134,7 +141,7 @@ err_t http_put_blob(const http_config_t *cfg, const char *node,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)len);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
 
-    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0, "PUT");
     free(rb.data);
     return rc;
 }
@@ -182,7 +189,7 @@ err_t http_put_meta(const http_config_t *cfg, const char *node,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, js_str);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
 
-    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0, "PUT");
     free(js_str);
     free(rb.data);
     return rc;
@@ -203,7 +210,7 @@ err_t http_get_meta(const http_config_t *cfg, const char *node,
     }
     free(url);
 
-    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0, "GET");
     if (rc != ZEP_ERR_OK) { free(rb.data); return rc; }
 
     /* parse JSON in the same way storage_read_meta does */
@@ -270,7 +277,7 @@ err_t http_get_blob(const http_config_t *cfg, const char *node,
     }
     free(url);
 
-    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0, "GET");
     if (rc != ZEP_ERR_OK || !rb.data) {
         free(rb.data);
         return rc != ZEP_ERR_OK ? rc : ZEP_ERR_STORAGE;
@@ -296,7 +303,7 @@ err_t http_get_blob_by_guid(const http_config_t *cfg, const char *guid,
     }
     free(url);
 
-    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0, "GET");
     if (rc != ZEP_ERR_OK || !rb.data) {
         free(rb.data);
         return rc != ZEP_ERR_OK ? rc : ZEP_ERR_STORAGE;
@@ -322,7 +329,7 @@ err_t http_list_snapshots(const http_config_t *cfg, const char *node,
     }
     free(url);
 
-    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0, "GET");
     if (rc != ZEP_ERR_OK || !rb.data) {
         free(rb.data);
         *count = 0;
@@ -376,7 +383,7 @@ char *http_get_json(const http_config_t *cfg, const char *path) {
     }
     free(url);
 
-    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0, "GET");
     if (rc != ZEP_ERR_OK || !rb.data) {
         free(rb.data);
         return NULL;
@@ -400,7 +407,7 @@ err_t http_post_json(const http_config_t *cfg, const char *path, const char *bod
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
 
-    int rc = http_do(curl, curl == cfg->curl ? 1 : 0);
+    int rc = http_do(curl, curl == cfg->curl ? 1 : 0, "POST");
     free(rb.data);
     return rc;
 }
@@ -423,9 +430,12 @@ err_t http_put_pipe_chunk(const http_config_t *cfg, const char *session,
 
         CURLcode crc = curl_easy_perform(curl);
         long http_code = 0;
+        char *pipe_eff_url = NULL;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &pipe_eff_url);
         curl_easy_cleanup(curl);
         free(rb.data);
+        audit_log(AUDIT_EVT_HTTP, "pipe", pipe_eff_url ? pipe_eff_url : url, (int)http_code);
 
         if (crc != CURLE_OK) {
             zep_log( "http_put_chunk: %s\n", curl_easy_strerror(crc));
@@ -469,7 +479,7 @@ err_t http_put_pipe_meta(const http_config_t *cfg, const char *session,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
 
-    int rc = http_do(curl, 0);
+    int rc = http_do(curl, 0, "PUT");
     free(body);
     free(rb.data);
     return rc;
@@ -486,7 +496,7 @@ err_t http_post_pipe_done(const http_config_t *cfg, const char *session) {
     if (!curl) return ZEP_ERR_NETWORK;
 
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "POST");
-    int rc = http_do(curl, 0);
+    int rc = http_do(curl, 0, "POST");
     free(rb.data);
     return rc;
 }
@@ -508,7 +518,10 @@ err_t http_get_pipe_chunk(const http_config_t *cfg, const char *session,
 
     CURLcode crc = curl_easy_perform(curl);
     long http_code = 0;
+    char *pg_eff_url = NULL;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &pg_eff_url);
+    audit_log(AUDIT_EVT_HTTP, "pipe", pg_eff_url ? pg_eff_url : url, (int)http_code);
     curl_easy_cleanup(curl);
 
     if (crc != CURLE_OK) {
