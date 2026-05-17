@@ -162,10 +162,17 @@ do_start() {
         echo -e "${YELLOW}Server already running (PID $spid)${NC}"
     else
         say "Starting server on port $SERVER_PORT ..."
-        "$SERV" ${VERB:+-v} --port "$SERVER_PORT" \
-            --cert "${PKI_DIR}/server.crt" --key "${PKI_DIR}/server.key" \
-            --ca "${PKI_DIR}/ca.crt" --db "$SERVER_DB" \
-            --storage "$SERVER_STORAGE" >/tmp/zep-server.log 2>&1 &
+        if [[ -n "$VERB" ]]; then
+            "$SERV" --logging DEBUG,INFO,WARN,ERROR,AUDIT --port "$SERVER_PORT" \
+                --cert "${PKI_DIR}/server.crt" --key "${PKI_DIR}/server.key" \
+                --ca "${PKI_DIR}/ca.crt" --db "$SERVER_DB" \
+                --storage "$SERVER_STORAGE" >/tmp/zep-server.log 2>&1 &
+        else
+            "$SERV" --port "$SERVER_PORT" \
+                --cert "${PKI_DIR}/server.crt" --key "${PKI_DIR}/server.key" \
+                --ca "${PKI_DIR}/ca.crt" --db "$SERVER_DB" \
+                --storage "$SERVER_STORAGE" >/tmp/zep-server.log 2>&1 &
+        fi
         local new_pid=$!
         wait_for_running "$new_pid" "$SERVER_START_TIMEOUT" "Server" || true
         if is_running "$new_pid"; then
@@ -187,13 +194,21 @@ do_start() {
                 echo -e "  ${YELLOW}No DB for $cn ($node_db) — skipping${NC}"
                 continue
             }
-            sudo -u "$cn" sh -c "\"$ZEP\" ${VERB:+-v} --db \"$node_db\" cron --daemon --interval \"$CRON_INTERVAL\" > /tmp/zep-${cn}.log 2>&1" &
+            if [[ -n "$VERB" ]]; then
+                sudo -u "$cn" sh -c "\"$ZEP\" --logging DEBUG,INFO,WARN,ERROR,AUDIT --db \"$node_db\" cron --daemon --interval \"$CRON_INTERVAL\" > /tmp/zep-${cn}.log 2>&1" &
+            else
+                sudo -u "$cn" sh -c "\"$ZEP\" --db \"$node_db\" cron --daemon --interval \"$CRON_INTERVAL\" > /tmp/zep-${cn}.log 2>&1" &
+            fi
         else
             [[ -f "$node_db" ]] || {
                 echo -e "  ${YELLOW}No DB for $cn ($node_db) — skipping${NC}"
                 continue
             }
-            "$ZEP" ${VERB:+-v} --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" >/tmp/zep-${cn}.log 2>&1 &
+            if [[ -n "$VERB" ]]; then
+                "$ZEP" --logging DEBUG,INFO,WARN,ERROR,AUDIT --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" >/tmp/zep-${cn}.log 2>&1 &
+            else
+                "$ZEP" --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" >/tmp/zep-${cn}.log 2>&1 &
+            fi
         fi
         local cpid=$!
         disown $cpid 2>/dev/null || true

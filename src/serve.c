@@ -57,12 +57,14 @@ struct node_ws {
     pthread_mutex_t lock;
     time_t last_ping;
     time_t last_pong;
-    /* Pipe coordination: bridge thread sets these, node thread reads them */
+    /* Pipe coordination: bridge sets these, node thread reads them */
     char pipe_cmd[4096];
     int pipe_cmd_ready;
     int pipe_done;
     int pipe_recv_mode;
     int pipe_starting;
+    int pipe_thread_exited;
+    pthread_cond_t pipe_ready;
     struct MHD_Connection *mhd_conn;
     gnutls_session_t gnutls_session;
     /* Pipes for inter-thread data transfer */
@@ -427,6 +429,8 @@ static struct node_ws *node_ws_register(const char *cn, int sock) {
     nw->pipe_node_to_admin[0] = -1;
     nw->pipe_node_to_admin[1] = -1;
     pthread_mutex_init(&nw->lock, NULL);
+    pthread_cond_init(&nw->pipe_ready, NULL);
+    nw->pipe_thread_exited = 0;
     nw->next = g_node_ws;
     g_node_ws = nw;
     zep_log_debug("ws: node %s registered sock=%d\n", cn, sock);
@@ -443,6 +447,7 @@ static void node_ws_unregister(struct node_ws *target) {
             else g_node_ws = nw->next;
 zep_log_debug("ws: node %s unregistered\n", nw->cn);
             pthread_mutex_destroy(&nw->lock);
+            pthread_cond_destroy(&nw->pipe_ready);
             free(nw);
             break;
         }
@@ -540,7 +545,7 @@ static size_t ws_build_frame(unsigned char *buf, size_t buf_size,
 #define WS_ADMIN_BUF (WS_SUBCHUNK + 256)
 
 static ssize_t ws_send_frame_gtls(struct node_ws *nw, unsigned char opcode,
-                                   const unsigned char *payload, size_t payload_len) {
+                                    const unsigned char *payload, size_t payload_len) {
     unsigned char *frame = malloc(payload_len + 14);
     if (!frame) return -1;
     size_t flen = ws_build_frame(frame, payload_len + 14, opcode, payload, payload_len);
@@ -548,23 +553,29 @@ static ssize_t ws_send_frame_gtls(struct node_ws *nw, unsigned char opcode,
         free(frame);
         return -1;
     }
-    if (nw && nw->gnutls_session) {
-        ssize_t sent = 0;
-        while ((size_t)sent < flen) {
-            ssize_t n = gnutls_record_send(nw->gnutls_session, frame + sent, flen - (size_t)sent);
-            if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
-                int raw_fd = (int)(intptr_t)gnutls_transport_get_ptr(nw->gnutls_session);
-                if (raw_fd < 0) { free(frame); return -1; }
-                fd_set wfds; FD_ZERO(&wfds); FD_SET(raw_fd, &wfds);
-                struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
-                if (select(raw_fd + 1, NULL, &wfds, NULL, &tv) <= 0) { free(frame); return -1; }
-                continue;
+    if (nw) {
+        gnutls_session_t tls = NULL;
+        pthread_mutex_lock(&nw->lock);
+        tls = nw->gnutls_session;
+        pthread_mutex_unlock(&nw->lock);
+        if (tls) {
+            ssize_t sent = 0;
+            while ((size_t)sent < flen) {
+                ssize_t n = gnutls_record_send(tls, frame + sent, flen - (size_t)sent);
+                if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
+                    int raw_fd = (int)(intptr_t)gnutls_transport_get_ptr(tls);
+                    if (raw_fd < 0) { free(frame); return -1; }
+                    fd_set wfds; FD_ZERO(&wfds); FD_SET(raw_fd, &wfds);
+                    struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
+                    if (select(raw_fd + 1, NULL, &wfds, NULL, &tv) <= 0) { free(frame); return -1; }
+                    continue;
+                }
+                if (n <= 0) { free(frame); return -1; }
+                sent += n;
             }
-            if (n <= 0) { free(frame); return -1; }
-            sent += n;
+            free(frame);
+            return (ssize_t)flen;
         }
-        free(frame);
-        return (ssize_t)flen;
     }
     ssize_t sent = send(nw ? nw->sock : -1, frame, flen, MSG_NOSIGNAL);
     free(frame);
@@ -572,19 +583,25 @@ static ssize_t ws_send_frame_gtls(struct node_ws *nw, unsigned char opcode,
 }
 
 static ssize_t ws_recv_node(struct node_ws *nw, unsigned char *buf, size_t buf_size) {
-    if (nw && nw->gnutls_session) {
-        ssize_t n = gnutls_record_recv(nw->gnutls_session, buf, buf_size);
-        if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
-            int raw_fd = (int)(intptr_t)gnutls_transport_get_ptr(nw->gnutls_session);
-            if (raw_fd < 0) return -1;
-            fd_set rfds; FD_ZERO(&rfds); FD_SET(raw_fd, &rfds);
-            struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
-            if (select(raw_fd + 1, &rfds, NULL, NULL, &tv) <= 0) return -1;
-            return gnutls_record_recv(nw->gnutls_session, buf, buf_size);
-        }
+    if (nw) {
+        gnutls_session_t tls = NULL;
+        pthread_mutex_lock(&nw->lock);
+        tls = nw->gnutls_session;
+        pthread_mutex_unlock(&nw->lock);
+        if (tls) {
+            ssize_t n = gnutls_record_recv(tls, buf, buf_size);
+            if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
+                int raw_fd = (int)(intptr_t)gnutls_transport_get_ptr(tls);
+                if (raw_fd < 0) return -1;
+                fd_set rfds; FD_ZERO(&rfds); FD_SET(raw_fd, &rfds);
+                struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
+                if (select(raw_fd + 1, &rfds, NULL, NULL, &tv) <= 0) return -1;
+                return gnutls_record_recv(tls, buf, buf_size);
+            }
 if ((g_logging & LOG_LEVEL_DEBUG) && n <= 0) zep_log_debug("ws: recv TLS result=%d cn=%s\n",
                                           (int)n, nw->cn);
-        return n;
+            return n;
+        }
     }
     return recv(nw ? nw->sock : -1, buf, buf_size, 0);
 }
@@ -684,11 +701,15 @@ if (closed) {
              break;
          }
          if (exiting) {
-             if (g_logging & LOG_LEVEL_DEBUG) {
-                 zep_log_debug("ws: node %s exiting for pipe bridge\n", nw->cn);
-             }
-            break;
-        }
+              if (g_logging & LOG_LEVEL_DEBUG) {
+                  zep_log_debug("ws: node %s exiting for pipe bridge\n", nw->cn);
+              }
+              pthread_mutex_lock(&nw->lock);
+              nw->pipe_thread_exited = 1;
+              pthread_cond_signal(&nw->pipe_ready);
+              pthread_mutex_unlock(&nw->lock);
+             break;
+         }
 
         struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
         fd_set rfds;
@@ -834,15 +855,17 @@ if (g_logging & LOG_LEVEL_DEBUG) {
 
     free(buf); free(out);
 
-    /* If exiting for pipe, don't close socket — bridge thread will handle it */
+    /* Signal bridge that thread has fully exited (if not already done) */
     pthread_mutex_lock(&nw->lock);
-    int for_pipe = nw->pipe_starting;
+    if (nw->pipe_starting && !nw->pipe_thread_exited) {
+        nw->pipe_thread_exited = 1;
+        pthread_cond_signal(&nw->pipe_ready);
+    }
     pthread_mutex_unlock(&nw->lock);
 
-    if (!for_pipe) {
-        node_ws_unregister(nw);
-        MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
-    }
+    /* Always clean up our nw entry */
+    node_ws_unregister(nw);
+    MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
     return NULL;
 }
 
@@ -1120,9 +1143,22 @@ zep_log_debug("ws: pipe found node %s sock=%d\n", node_cn, nw->sock);
     nw->pipe_starting = 1;
     pthread_mutex_unlock(&nw->lock);
 
-    /* Wait for node thread to exit */
-    usleep(200000);
-zep_log_debug("ws: pipe taking over node %s\n", node_cn);
+    /* Wait for node thread to signal it has exited */
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 5;
+        pthread_mutex_lock(&nw->lock);
+        while (!nw->pipe_thread_exited) {
+            pthread_cond_timedwait(&nw->pipe_ready, &nw->lock, &ts);
+        }
+        pthread_mutex_unlock(&nw->lock);
+    }
+
+    /* Join the node thread to ensure it is fully dead */
+    pthread_join(nw->thread, NULL);
+
+zep_log_debug("ws: node %s thread joined, pipe taking over\n", node_cn);
 
     /* Get raw TCP fd for select */
     int node_raw_fd = nw->sock;
@@ -2983,13 +3019,14 @@ int serve_main(int argc, char *argv[]) {
         {"no-tls",    no_argument,       0, 'N'},
         {"setup",      no_argument,       0, 'S'},
         {"verbose", no_argument,       0, 'v'},
+        {"logging", required_argument, 0, 'L'},
         {"audit-log", required_argument, 0, 'l'},
         {"help",    no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:A:D:P:Svhl:", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:A:D:P:Svhl:L:", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'p': g_port = atoi(optarg); break;
             case 's': snprintf(g_storage_root, sizeof(g_storage_root), "%s", optarg); break;
@@ -3003,6 +3040,13 @@ case 'v': g_logging = LOG_LEVEL_ALL; break;  /* -v for backwards compat: show al
              case 'S': g_setup_mode = 1; break;
              case 'N': g_no_tls = 1; break;
             case 'l': audit_init(optarg); break;
+            case 'L':
+                g_logging = zep_log_parse_mask(optarg);
+                if (g_logging == 0) {
+                    zep_log("error: invalid logging levels '%s'\n", optarg);
+                    usage_serve(argv[0]); audit_close(); return 1;
+                }
+                break;
             case 'h': usage_serve(argv[0]); audit_close(); return 0;
             default:  usage_serve(argv[0]); audit_close(); return 1;
         }
