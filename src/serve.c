@@ -948,7 +948,7 @@ static void ws_node_upgrade_handler(void *cls, struct MHD_Connection *conn,
     pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED);
     pthread_create(&nw->thread, &attr, node_ws_thread, ctx);
     pthread_attr_destroy(&attr);
-    pthread_detach(nw->thread);
+    // thread not detached — MHD must join it during cleanup
 }
 
 static int pipe_allowed_check(char *const *cmd_tokens, int cmd_n, const char *allowlist) {
@@ -2715,7 +2715,6 @@ static void usage_serve(const char *prog) {
     zep_log( "  -P, --password PASS   Password for encrypted private keys\n");
     zep_log( "  -N, --no-tls          Disable TLS (plain HTTP, for WS debugging)\n");
     zep_log( "  --logging LEVELS      Comma-separated log levels: DEBUG,INFO,WARN,ERROR,AUDIT (default: INFO,WARN,ERROR)\n");
-    zep_log( "  --audit-log PATH      Audit log file path\n");
     zep_log( "  -v                    Verbose (all levels, backwards compat)\n");
     zep_log( "  -h, --help            This help\n");
 }
@@ -2734,13 +2733,12 @@ int serve_main(int argc, char *argv[]) {
         {"setup",      no_argument,       0, 'S'},
         {"verbose", no_argument,       0, 'v'},
         {"logging", required_argument, 0, 'L'},
-        {"audit-log", required_argument, 0, 'l'},
         {"help",    no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:A:D:P:Svhl:L:", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:s:c:k:a:A:D:P:SvL:L:", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'p': g_port = atoi(optarg); break;
             case 's': snprintf(g_storage_root, sizeof(g_storage_root), "%s", optarg); break;
@@ -2753,16 +2751,15 @@ int serve_main(int argc, char *argv[]) {
 case 'v': g_logging = LOG_LEVEL_ALL; break;  /* -v for backwards compat: show all */
              case 'S': g_setup_mode = 1; break;
              case 'N': g_no_tls = 1; break;
-            case 'l': audit_init(optarg); break;
             case 'L':
                 g_logging = zep_log_parse_mask(optarg);
                 if (g_logging == 0) {
                     zep_log("error: invalid logging levels '%s'\n", optarg);
-                    usage_serve(argv[0]); audit_close(); return 1;
+                    usage_serve(argv[0]);; return 1;
                 }
                 break;
-            case 'h': usage_serve(argv[0]); audit_close(); return 0;
-            default:  usage_serve(argv[0]); audit_close(); return 1;
+            case 'h': usage_serve(argv[0]);; return 0;
+            default:  usage_serve(argv[0]);; return 1;
         }
     }
 
@@ -2944,7 +2941,7 @@ case 'v': g_logging = LOG_LEVEL_ALL; break;  /* -v for backwards compat: show al
 
     printf("\nServer stopped.\n");
     db_close(g_db);
-    audit_close();
+   ;
     return 0;
 }
 

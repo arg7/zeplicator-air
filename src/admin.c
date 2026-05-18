@@ -1029,7 +1029,6 @@ static void usage(const char *prog) {
         "  --db, -d FILE      Local config DB (reads server/cert/key/ca defaults)\n"
         "  --password, -P PASS  Password for encrypted key\n"
         "  --logging LEVELS   Comma-separated log levels: DEBUG,INFO,WARN,ERROR,AUDIT (default: INFO,WARN,ERROR)\n"
-        "  --audit-log PATH   Audit log file path\n"
         "  -v                 Verbose (all levels, backwards compat)\n"
         "\n"
         "Join options:\n"

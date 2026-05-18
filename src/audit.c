@@ -70,23 +70,20 @@ void zep_air_log(int level, const char *fmt, ...) {
     va_end(ap);
 }
 
-/* --- Audit log file (JSON-lines, separate from --logging mask) --- */
-
-static FILE *audit_fp = NULL;
-
-static char *audit_timestamp(char *buf, size_t bufsz) {
-    time_t t = time(NULL);
-    struct tm tm;
-    localtime_r(&t, &tm);
-    strftime(buf, bufsz, "%Y-%m-%dT%H:%M:%S%z", &tm);
-    return buf;
+int audit_log_init(const char *path) {
+    (void)path;
+    return 0;
 }
 
-static void audit_escape(const char *src, char *dst, size_t dlen) {
+void audit_log_close(void) {
+}
+
+/* Escape a string for safe inclusion in JSON */
+static void audit_escape_str(const char *src, char *dst, size_t dlen) {
     size_t j = 0;
-    for (size_t i = 0; src[i] && j < dlen - 2; i++) {
+    for (size_t i = 0; src[i] && j < dlen - 4; i++) {
         unsigned char c = (unsigned char)src[i];
-        if (c == '"'  || c == '\\' || c < 0x20) {
+        if (c == '"' || c == '\\' || c < 0x20) {
             if (j + 4 >= dlen) break;
             dst[j++] = '\\';
             if (c == '"')  { dst[j++] = '"'; continue; }
@@ -99,39 +96,75 @@ static void audit_escape(const char *src, char *dst, size_t dlen) {
     dst[j] = '\0';
 }
 
-int audit_log_init(const char *path) {
-    if (!path || !path[0]) return 0;
-    audit_fp = fopen(path, "a");
-    if (!audit_fp) {
-        perror("audit-log: failed to open");
-        return -1;
-    }
-    setvbuf(audit_fp, NULL, _IOLBF, 0);
-    return 0;
-}
-
-void audit_log_close(void) {
-    if (audit_fp) {
-        fclose(audit_fp);
-        audit_fp = NULL;
-    }
-}
-
 int audit_log_write(const char *event, const char *type,
                     const char *cmd, int exit_code) {
-    if (!audit_fp) return 0;
+    return audit_log_write2(event, type, cmd, exit_code, "");
+}
 
-    char ts[32];
-    char esc_cmd[8192];
+int audit_log_write2(const char *event, const char *type,
+                     const char *cmd, int exit_code,
+                     const char *stderr_output) {
+    char esc_cmd[8192], esc_stderr[2048];
+    audit_escape_str(cmd, esc_cmd, sizeof(esc_cmd));
+    audit_escape_str(stderr_output, esc_stderr, sizeof(esc_stderr));
 
-    audit_escape(cmd, esc_cmd, sizeof(esc_cmd));
-
-    fprintf(audit_fp, "{\"event\":\"%s\",\"ts\":\"%s\",\"type\":\"%s\",\"cmd\":\"%s\",\"rc\":%d}\n",
-            event ? event : "unknown",
-            audit_timestamp(ts, sizeof(ts)),
-            type ? type : "unknown",
-            esc_cmd,
-            exit_code);
-
+    zep_log_audit("event=%s type=%s cmd=\"%s\" rc=%d stderr=\"%s\"",
+                  event ? event : "unknown",
+                  type ? type : "unknown",
+                  esc_cmd, exit_code, esc_stderr);
     return 0;
+}
+
+/* Global thread-local temp file path for audit_popen pairing */
+static char g_audit_tmp[512] = {0};
+
+FILE *audit_popen(const char *cmd) {
+    if (!cmd) return NULL;
+    g_audit_tmp[0] = '\0';
+
+    char tmp_path[512];
+    int tmp_fd = mkstemp(tmp_path);
+    if (tmp_fd < 0) {
+        return popen(cmd, "r");
+    }
+    close(tmp_fd);
+    snprintf(g_audit_tmp, sizeof(g_audit_tmp), "%s", tmp_path);
+
+    /* Replace 2>/dev/null with 2>/tmp_path, or append 2>/tmp_path */
+    char pipe_cmd[8192];
+    size_t cmd_len = strlen(cmd);
+    if (cmd_len >= 11 && strcmp(cmd + cmd_len - 11, " 2>/dev/null") == 0) {
+        snprintf(pipe_cmd, sizeof(pipe_cmd), "%.*s 2>%s",
+                 (int)(cmd_len - 11), cmd, tmp_path);
+    } else {
+        snprintf(pipe_cmd, sizeof(pipe_cmd), "%s 2>%s", cmd, tmp_path);
+    }
+    return popen(pipe_cmd, "r");
+}
+
+int audit_popen_result(FILE *fp, char *stderr_buf, size_t bufsz) {
+    if (bufsz > 0) stderr_buf[0] = '\0';
+    if (!fp) return -128;
+
+    int rc = pclose(fp);
+    if (!WIFEXITED(rc)) {
+        /* Clean up temp file */
+        if (g_audit_tmp[0]) { unlink(g_audit_tmp); g_audit_tmp[0] = '\0'; }
+        return -128;
+    }
+    rc = WEXITSTATUS(rc);
+
+    if (stderr_buf && bufsz > 0 && g_audit_tmp[0]) {
+        FILE *sf = fopen(g_audit_tmp, "r");
+        if (sf) {
+            size_t n = fread(stderr_buf, 1, bufsz - 1, sf);
+            stderr_buf[n] = '\0';
+            while (n > 0 && (stderr_buf[n-1] == '\n' || stderr_buf[n-1] == '\r'))
+                stderr_buf[--n] = '\0';
+            fclose(sf);
+        }
+        unlink(g_audit_tmp);
+        g_audit_tmp[0] = '\0';
+    }
+    return rc;
 }

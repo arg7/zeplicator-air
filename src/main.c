@@ -420,12 +420,14 @@ zep_log_debug("ws-node: pull_resume guid=%s token=%.20s... fs=%s\n",
                                   (unsigned char *)req_json, strlen(req_json));
                 free(req_json);
 
-                FILE *recv_fp = NULL;
+             FILE *recv_fp = NULL;
+                char _rrecv_cmd[2048] = {0};
                 if (rfs[0]) {
-                    char recv_cmd[2048];
-                    snprintf(recv_cmd, sizeof(recv_cmd),
+                    char rcmd2[2048];
+                    snprintf(rcmd2, sizeof(rcmd2),
                              "zfs recv -F -s -u '%s' 2>/dev/null", rfs);
-                    recv_fp = popen(recv_cmd, "w");
+                    snprintf(_rrecv_cmd, sizeof(_rrecv_cmd), "%s", rcmd2);
+                    recv_fp = popen(rcmd2, "w");
 if ((g_logging & LOG_LEVEL_DEBUG) && recv_fp)
                          zep_log_debug("ws-node: opened recv pipe for resume fs=%s\n", rfs);
                 }
@@ -459,7 +461,8 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                 int recv_rc = 0;
                 if (recv_fp) {
                     recv_rc = pclose(recv_fp);
-zep_log_debug("ws-node: recv pipe closed rc=%d\n", recv_rc);
+                    audit_log("recv", "zfs", _rrecv_cmd, WIFEXITED(recv_rc) ? WEXITSTATUS(recv_rc) : -128);
+ zep_log_debug("ws-node: recv pipe closed rc=%d\n", recv_rc);
                 }
 
                 char result = (ws_err || recv_rc != 0) ? 1 : 0;
@@ -502,10 +505,12 @@ zep_log_debug("ws-node: recv pipe closed rc=%d\n", recv_rc);
                 free(req_json);
 
                 FILE *recv_fp = NULL;
+                char _prcmd[2048] = {0};
                 if (pfs[0]) {
-                    char rcmd[2048];
-                    snprintf(rcmd, sizeof(rcmd), "zfs recv -F -u '%s' 2>/dev/null", pfs);
-                    recv_fp = popen(rcmd, "w");
+                    char rcmd2[2048];
+                    snprintf(rcmd2, sizeof(rcmd2), "zfs recv -F -u '%s' 2>/dev/null", pfs);
+                    snprintf(_prcmd, sizeof(_prcmd), "%s", rcmd2);
+                    recv_fp = popen(rcmd2, "w");
                     zep_log_debug("ws-node: pull_ws opened recv pipe fs=%s\n", pfs);
                 }
 
@@ -533,9 +538,10 @@ zep_log_debug("ws-node: recv pipe closed rc=%d\n", recv_rc);
                     if (op == WS_NODE_OP_EXIT) break;
                 }
 
-                int recv_rc = 0;
+             int recv_rc = 0;
                 if (recv_fp) {
                     recv_rc = pclose(recv_fp);
+                    audit_log("recv", "zfs", _prcmd, WIFEXITED(recv_rc) ? WEXITSTATUS(recv_rc) : -128);
                     zep_log_debug("ws-node: pull_ws recv pipe closed rc=%d\n", recv_rc);
                 }
 
@@ -565,6 +571,7 @@ zep_log_debug("ws-node: recv pipe closed rc=%d\n", recv_rc);
 
                 /* Open zfs send pipe */
                 FILE *send_fp = NULL;
+                char _pscmd[8192];
                 {
                     char scmd[8192];
                   if (prt[0]) {
@@ -590,8 +597,9 @@ zep_log_debug("ws-node: recv pipe closed rc=%d\n", recv_rc);
                              cfg->debug_inject_zfs_pipeline_cmd[0] ? " | " : "",
                              cfg->debug_inject_zfs_pipeline_cmd[0] ? cfg->debug_inject_zfs_pipeline_cmd : "");
                      }
-                    send_fp = popen(scmd, "r");
-                    zep_log_debug("ws-node: push_ws opened send pipe cmd=%s\n", scmd);
+                  send_fp = popen(scmd, "r");
+                     zep_log_debug("ws-node: push_ws opened send pipe cmd=%s\n", scmd);
+                     snprintf(_pscmd, sizeof(_pscmd), "%s", scmd);
                 }
 
               /* Send push request metadata */
@@ -668,9 +676,10 @@ zep_log_debug("ws-node: recv pipe closed rc=%d\n", recv_rc);
                     if (op == WS_NODE_OP_EXIT || op == WS_NODE_OP_EOF) break;
                 }
 
-                int send_rc = 0;
+               int send_rc = 0;
                 if (send_fp) {
                     send_rc = pclose(send_fp);
+                    audit_log("push_send", "zfs", _pscmd, WIFEXITED(send_rc) ? WEXITSTATUS(send_rc) : -128);
                     zep_log_debug("ws-node: push_ws send pipe closed rc=%d\n", send_rc);
                 }
 
@@ -1072,7 +1081,6 @@ static void usage(const char *prog) {
         "\n"
         "Cron options:\n"
         "  --logging LEVELS   Comma-separated log levels: DEBUG,INFO,WARN,ERROR,AUDIT (default: INFO,WARN,ERROR)\n"
-        "  --audit-log PATH   Audit log file path\n"
         "  --db PATH          Database path (default: %s)\n"
         "  --daemon, -d     Run as daemon (for cron)\n"
         "  --interval, -i N Poll interval in seconds (default: 60)\n"
@@ -1361,16 +1369,14 @@ static int cmd_cron(int argc, char *argv[]) {
                             char snap_label[128];
                             snprintf(snap_label, sizeof(snap_label), "%s-%s-%s",
                                      cfg2.cluster, label->valuestring, ts_buf);
-                            char snap_cmd[2048];
-                            snprintf(snap_cmd, sizeof(snap_cmd),
-                                     "zfs snapshot '%s@%s'", local_fs, snap_label);
-                            zep_log("cron: creating snapshot '%s'\n", snap_label);
-                            FILE *sp = popen(snap_cmd, "r");
-                            if (sp) {
-                                char sline[256];
-                                while (fgets(sline, sizeof(sline), sp));
-                                pclose(sp);
-                            }
+                           char snap_cmd[2048];
+                             snprintf(snap_cmd, sizeof(snap_cmd),
+                                      "zfs snapshot '%s@%s'", local_fs, snap_label);
+                             zep_log("cron: creating snapshot '%s'\n", snap_label);
+                             char _snap_err[512];
+                              FILE *_snap_fp = audit_popen(snap_cmd);
+                              int _snap_rc = _snap_fp ? audit_popen_result(_snap_fp, _snap_err, sizeof(_snap_err)) : -128;
+                              audit_log_err("snapshot", "zfs", snap_cmd, _snap_rc, _snap_err);
                         }
                        pipeline_push_ws(&cfg2, local_fs, label->valuestring,
                                           cfs->valuestring, db);
@@ -1445,6 +1451,7 @@ static int cmd_cron(int argc, char *argv[]) {
                             "zfs list -Hp -t snapshot -o name '%s' 2>/dev/null",
                             local_fs);
                         FILE *fp = popen(cmd, "r");
+                        audit_log("inventory", "zfs", cmd, fp ? -128 : -127);
                         if (fp) {
                             char line[ZEP_MAX_SNAPSHOT_NAME];
                             while (fgets(line, sizeof(line), fp)) {
@@ -1465,18 +1472,17 @@ static int cmd_cron(int argc, char *argv[]) {
                                     }
                                 }
                                 char gbuf[ZEP_MAX_GUID_LEN] = {0};
-                                snprintf(cmd, sizeof(cmd),
-                                    "zfs get -Hp -o value guid '%s' 2>/dev/null",
-                                    line);
-                                FILE *gp = popen(cmd, "r");
-                                if (gp) {
-                                    if (fgets(gbuf, sizeof(gbuf), gp)) {
-                                        size_t gl = strlen(gbuf);
-                                        while (gl > 0 && (gbuf[gl-1] == '\n' || gbuf[gl-1] == '\r'))
-                                            gbuf[--gl] = '\0';
-                                    }
-                                    pclose(gp);
-                                }
+                             char _guid_err[512];
+                                 FILE *gp = audit_popen(cmd);
+                                 if (gp) {
+                                     if (fgets(gbuf, sizeof(gbuf), gp)) {
+                                         size_t gl = strlen(gbuf);
+                                         while (gl > 0 && (gbuf[gl-1] == '\n' || gbuf[gl-1] == '\r'))
+                                             gbuf[--gl] = '\0';
+                                     }
+                                     int _guid_rc = audit_popen_result(gp, _guid_err, sizeof(_guid_err));
+                                     audit_log_err("inventory_guid", "zfs", cmd, _guid_rc, _guid_err);
+                                 }
                                 cJSON *sn = cJSON_CreateObject();
                                 cJSON_AddStringToObject(sn, "guid", gbuf);
                                 cJSON_AddStringToObject(sn, "snapshot", line);
@@ -1548,7 +1554,11 @@ static int cmd_cron(int argc, char *argv[]) {
                                     char dcmd[1024];
                                     snprintf(dcmd, sizeof(dcmd),
                                         "zfs destroy '%s' 2>/dev/null", sid->valuestring);
-                                    int rc = system(dcmd);
+                                    char _dest_err[512];
+                                    FILE *_dest_fp = audit_popen(dcmd);
+                                    int _dest_rc = _dest_fp ? audit_popen_result(_dest_fp, _dest_err, sizeof(_dest_err)) : -128;
+                                    audit_log_err("destroy", "zfs", dcmd, _dest_rc, _dest_err);
+                                    int rc = _dest_rc;
                                     if (rc == 0) {
                                         cJSON_AddItemToArray(deleted,
                                             cJSON_CreateString(sg->valuestring));
@@ -1764,7 +1774,6 @@ int main(int argc, char *argv[]) {
         usage(argv2[0]);
     }
 
-    audit_close();
     return rc;
 }
 
