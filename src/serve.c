@@ -720,6 +720,7 @@ static void *node_ws_thread(void *arg) {
             }
             if (opcode == WS_OP_PONG) {
                 nw->last_pong = time(NULL);
+                zep_log_debug( "ws: <- PONG  cn=%s\n", nw->cn);
                 continue;
             }
             if (opcode == WS_OP_TEXT && plen > 0) {

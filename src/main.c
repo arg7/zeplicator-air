@@ -115,6 +115,19 @@ static size_t ws_node_build_frame(unsigned char *buf, size_t buf_size,
     return header_len + payload_len;
 }
 
+static const char *ws_opname(unsigned char op) {
+    switch (op) {
+        case WS_NODE_OP_PING: return "PING";
+        case WS_NODE_OP_PONG: return "PONG";
+        case WS_NODE_OP_CLOSE: return "CLOSE";
+        case WS_NODE_OP_TEXT: return "TEXT";
+        case WS_NODE_OP_BIN:  return "BIN";
+        case WS_NODE_OP_EOF:  return "EOF";
+        case WS_NODE_OP_EXIT: return "EXIT";
+        default: return "???";
+    }
+}
+
 static ssize_t ws_node_recv_frame(struct ws_node_conn *c, unsigned char *out, size_t out_size,
                                    unsigned char *opcode_out) {
     unsigned char hdr[14];
@@ -141,6 +154,9 @@ static ssize_t ws_node_recv_frame(struct ws_node_conn *c, unsigned char *out, si
     if (payload_len > out_size) return -1;
     if (payload_len == 0) {
         *opcode_out = hdr[0] & 0x0F;
+        if ((*opcode_out) == WS_NODE_OP_PING || (*opcode_out) == WS_NODE_OP_PONG) {
+            zep_log_debug( "ws-node: RX %s (%02x) 0B\n", ws_opname(*opcode_out), *opcode_out);
+        }
         return 0;
     }
 
@@ -151,6 +167,9 @@ static ssize_t ws_node_recv_frame(struct ws_node_conn *c, unsigned char *out, si
         total += n;
     }
     *opcode_out = hdr[0] & 0x0F;
+    if ((*opcode_out) == WS_NODE_OP_PING || (*opcode_out) == WS_NODE_OP_PONG) {
+        zep_log_debug( "ws-node: RX %s (%02x) %zuB\n", ws_opname(*opcode_out), *opcode_out, (size_t)payload_len);
+    }
     return (ssize_t)payload_len;
 }
 
@@ -160,7 +179,8 @@ static int ws_node_send_frame(struct ws_node_conn *c, unsigned char opcode,
     size_t flen = ws_node_build_frame(frame, sizeof(frame), opcode, payload, payload_len);
     if (flen == 0) { zep_log( "ws-node: build_frame failed\n"); return -1; }
     int ret = ws_node_write(c, frame, (int)flen);
-    zep_log_debug( "ws-node: write opcode=0x%02x flen=%zu ret=%d\n", opcode, flen, ret);
+    zep_log_debug( "ws-node: TX %s (%02x) %zuB\n",
+        ws_opname(opcode), opcode, flen);
     if (ret <= 0) {
         zep_log( "ws-node: write error errno=%d\n", errno);
         return -1;
@@ -379,6 +399,7 @@ if ((g_logging & LOG_LEVEL_DEBUG) && recv_fp)
                     unsigned char op = buf[0] & 0x0F;
                     if (op == WS_NODE_OP_CLOSE) { ws_err = 1; break; }
                     if (op == WS_NODE_OP_PING) {
+                        zep_log_debug( "ws-node: <- PING\n");
                         ws_node_send_frame(conn, WS_NODE_OP_PONG,
                                           out, (size_t)rn);
                         continue;
@@ -414,7 +435,7 @@ zep_log_debug("ws-node: recv pipe closed rc=%d\n", recv_rc);
 
             if (n < 0) { zep_log_debug( "ws-node: recv error, reconnecting\n"); break; }
             if (opcode == WS_NODE_OP_CLOSE) { zep_log_debug( "ws-node: close\n"); break; }
-            if (opcode == WS_NODE_OP_PING) { ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)n); continue; }
+            if (opcode == WS_NODE_OP_PING) { zep_log_debug( "ws-node: <- PING\n"); ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)n); continue; }
             if (opcode == WS_NODE_OP_PONG) continue;
             if (opcode == WS_NODE_OP_EOF) continue;
             if (opcode == WS_NODE_OP_EXIT) continue;
@@ -524,7 +545,7 @@ zep_log_debug("ws-node: recv pipe closed rc=%d\n", recv_rc);
                                                 unsigned char op = buf[0] & 0x0F;
 
                                                 if (op == WS_NODE_OP_CLOSE) { ws_alive = 0; break; }
-                                                if (op == WS_NODE_OP_PING) { ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)rn); continue; }
+                                                if (op == WS_NODE_OP_PING) { zep_log_debug( "ws-node: <- PING\n"); ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)rn); continue; }
                                                 if (op == WS_NODE_OP_PONG) continue;
                                                 if (op == WS_NODE_OP_EOF) continue;
 
@@ -680,7 +701,7 @@ zep_log_debug("ws-node: recv pipe closed rc=%d\n", recv_rc);
                                                 continue;
                                             }
                                             if (op == WS_NODE_OP_EXIT) continue;
-                                            if (op == WS_NODE_OP_PING) { ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)rn); continue; }
+                                            if (op == WS_NODE_OP_PING) { zep_log_debug( "ws-node: <- PING\n"); ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)rn); continue; }
                                             if (op == WS_NODE_OP_PONG) continue;
                                             if (op == WS_NODE_OP_BIN && child_stdin_open) {
                                                 ssize_t w = write(child_stdin, out, (size_t)rn);
