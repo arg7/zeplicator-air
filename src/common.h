@@ -47,24 +47,6 @@ typedef int8_t err_t;
 extern int g_logging;
 
 typedef struct {
-    size_t size;
-    char sha256[65];
-} blob_info_t;
-
-typedef struct {
-    char snapshot[ZEP_MAX_SNAPSHOT_NAME];
-    char guid[ZEP_MAX_GUID_LEN];
-    char base_guid[ZEP_MAX_GUID_LEN];
-    char label[64];
-    char cluster_fs[256];
-    char created[32];
-    char host[64];
-    uint64_t stream_size;
-    int blob_count;
-    blob_info_t *blobs;
-} snapshot_meta_t;
-
-typedef struct {
     char cluster[64];
     char mapping[2048];
     char storage_root[ZEP_MAX_PATH];

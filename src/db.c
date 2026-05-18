@@ -92,19 +92,14 @@ err_t db_init_tables(sqlite3 *db) {
         "CREATE TABLE IF NOT EXISTS blobs ("
         "  snapshot_guid TEXT NOT NULL,"
         "  part          INTEGER NOT NULL,"
-        "  size          INTEGER NOT NULL,"
-        "  sha256        TEXT NOT NULL,"
-        "  storage_ref   TEXT NOT NULL,"
-        "  UNIQUE(snapshot_guid, part)"
-        ");"
         "CREATE TABLE IF NOT EXISTS snapshot_upload ("
-        "  prefix        TEXT PRIMARY KEY,"
-        "  node          TEXT NOT NULL,"
-        "  total_chunks  INTEGER NOT NULL DEFAULT 0,"
-        "  resume_token  TEXT NOT NULL DEFAULT '',"
-        "  complete      INTEGER NOT NULL DEFAULT 0,"
-        "  created_at    TEXT NOT NULL DEFAULT (datetime('now'))"
-        ");";
+         "  guid          TEXT PRIMARY KEY,"
+         "  node          TEXT NOT NULL DEFAULT '',"
+         "  bytes_received BIGINT NOT NULL DEFAULT 0,"
+         "  resume_token  TEXT NOT NULL DEFAULT '',"
+         "  complete      INTEGER NOT NULL DEFAULT 0,"
+         "  created_at    TEXT NOT NULL DEFAULT (datetime('now'))"
+         ");";
     char *err = NULL;
     int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
     if (rc != SQLITE_OK) {
@@ -355,61 +350,13 @@ err_t db_snapshot_latest_guid(sqlite3 *db, const char *node,
     return ret;
 }
 
-err_t db_snapshot_push_meta(sqlite3 *db, const char *guid,
-                             char *snapshot, size_t sn_len,
-                             char *label, size_t lbl_len,
-                             char *cluster_fs, size_t cfs_len) {
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db,
-            "SELECT snapshot, label, cluster_fs FROM snapshots "
-            "WHERE guid = ?1 AND direction = 'push' LIMIT 1",
-            -1, &stmt, NULL) != SQLITE_OK)
-        return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
-    err_t ret = ZEP_ERR_NOT_FOUND;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        snprintf(snapshot, sn_len, "%s",
-            sqlite3_column_text(stmt, 0));
-        snprintf(label, lbl_len, "%s",
-            sqlite3_column_text(stmt, 1));
-        snprintf(cluster_fs, cfs_len, "%s",
-            sqlite3_column_text(stmt, 2));
-        ret = ZEP_ERR_OK;
-    }
-    sqlite3_finalize(stmt);
-    return ret;
-}
-
-char *db_blob_list_json(sqlite3 *db, const char *snapshot_guid) {
-    const char *sql =
-        "SELECT part, size, sha256 FROM blobs "
-        "WHERE snapshot_guid = ?1 ORDER BY part";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return NULL;
-    sqlite3_bind_text(stmt, 1, snapshot_guid, -1, SQLITE_STATIC);
-    cJSON *arr = cJSON_CreateArray();
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        cJSON *b = cJSON_CreateObject();
-        cJSON_AddNumberToObject(b, "part", sqlite3_column_int(stmt, 0));
-        cJSON_AddNumberToObject(b, "size", sqlite3_column_int(stmt, 1));
-        cJSON_AddStringToObject(b, "sha256",
-            (const char *)sqlite3_column_text(stmt, 2));
-        cJSON_AddItemToArray(arr, b);
-    }
-    sqlite3_finalize(stmt);
-    char *js = cJSON_PrintUnformatted(arr);
-    cJSON_Delete(arr);
-    return js;
-}
-
 char *db_snapshot_chain_json(sqlite3 *db, const char *cluster,
                               const char *master_cn,
                               const char *client_guid) {
     cJSON *arr = cJSON_CreateArray();
 
     const char *sql =
-        "SELECT guid, base_guid, blob_count, blob_size, label, snapshot "
+        "SELECT guid, base_guid, label, snapshot "
         "FROM snapshots "
         "WHERE node = ?1 AND cluster = ?2 AND direction = 'push' "
         "ORDER BY rowid";
@@ -432,19 +379,12 @@ char *db_snapshot_chain_json(sqlite3 *db, const char *cluster,
         cJSON_AddStringToObject(s, "guid", g);
         cJSON_AddStringToObject(s, "base_guid",
             (const char *)sqlite3_column_text(stmt, 1));
-        const char *lb = (const char *)sqlite3_column_text(stmt, 4);
+        const char *lb = (const char *)sqlite3_column_text(stmt, 2);
         if (lb && lb[0])
             cJSON_AddStringToObject(s, "label", lb);
-        const char *sn = (const char *)sqlite3_column_text(stmt, 5);
+        const char *sn = (const char *)sqlite3_column_text(stmt, 3);
         if (sn && sn[0])
             cJSON_AddStringToObject(s, "snapshot", sn);
-
-        char *bj = db_blob_list_json(db, g);
-        if (bj) {
-            cJSON *blist = cJSON_Parse(bj);
-            if (blist) { cJSON_AddItemToObject(s, "blobs", blist); }
-            free(bj);
-        }
         cJSON_AddItemToArray(arr, s);
     }
     sqlite3_finalize(stmt);
@@ -459,42 +399,6 @@ char *db_snapshot_chain_json(sqlite3 *db, const char *cluster,
     return js;
 }
 
-err_t db_blob_upsert(sqlite3 *db, const char *snapshot_guid, int part,
-                     size_t size, const char *sha256,
-                     const char *storage_ref) {
-    const char *sql =
-        "INSERT OR REPLACE INTO blobs (snapshot_guid, part, size, sha256, storage_ref) "
-        "VALUES (?, ?, ?, ?, ?)";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, snapshot_guid, -1, SQLITE_STATIC);
-    sqlite3_bind_int(stmt, 2, part);
-    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)size);
-    sqlite3_bind_text(stmt, 4, sha256, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 5, storage_ref, -1, SQLITE_STATIC);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
-}
-
-err_t db_blob_lookup(sqlite3 *db, const char *snapshot_guid, int part,
-                     char *storage_ref, size_t ref_len) {
-    const char *sql =
-        "SELECT storage_ref FROM blobs WHERE snapshot_guid = ?1 AND part = ?2";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, snapshot_guid, -1, SQLITE_STATIC);
-    sqlite3_bind_int(stmt, 2, part);
-    err_t ret = ZEP_ERR_NOT_FOUND;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        snprintf(storage_ref, ref_len, "%s", sqlite3_column_text(stmt, 0));
-        ret = ZEP_ERR_OK;
-    }
-    sqlite3_finalize(stmt);
-    return ret;
-}
 
 err_t db_common_ancestor(sqlite3 *db, const char *cluster,
                          char *guid, size_t len) {
@@ -668,31 +572,50 @@ err_t db_rotation_candidates(sqlite3 *db, const char *cluster,
     return ZEP_ERR_OK;
 }
 
-err_t db_upload_track(sqlite3 *db, const char *prefix, const char *node,
-                       int total_chunks, const char *resume_token) {
-    const char *sql =
-        "INSERT OR REPLACE INTO snapshot_upload "
-        "(prefix, node, total_chunks, resume_token, complete) "
-        "VALUES (?, ?, ?, ?, 0)";
+err_t db_upload_get_offset(sqlite3 *db, const char *guid,
+                            char *offset_buf, size_t len) {
+    if (!offset_buf || !len) return ZEP_ERR_NOT_FOUND;
+    offset_buf[0] = '\0';
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db,
+            "SELECT bytes_received FROM snapshot_upload WHERE guid = ?1 AND complete = 0",
+            -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, prefix, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, node, -1, SQLITE_STATIC);
-    sqlite3_bind_int(stmt, 3, total_chunks);
-    sqlite3_bind_text(stmt, 4, resume_token ? resume_token : "", -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
+    int found = (sqlite3_step(stmt) == SQLITE_ROW);
+    if (found) {
+        int64_t bytes = sqlite3_column_int64(stmt, 0);
+        snprintf(offset_buf, len, "%ld", (long)bytes);
+    }
+    sqlite3_finalize(stmt);
+    return found ? ZEP_ERR_OK : ZEP_ERR_NOT_FOUND;
+}
+
+err_t db_upload_save_token(sqlite3 *db, const char *guid,
+                            const char *node, const char *token, int64_t bytes) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO snapshot_upload "
+            "(guid, node, bytes_received, resume_token, complete) "
+            "VALUES (?1, ?2, ?3, ?4, 0)",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, node ? node : "", -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 3, bytes);
+    sqlite3_bind_text(stmt, 4, token ? token : "", -1, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
 }
 
-err_t db_upload_complete(sqlite3 *db, const char *prefix) {
+err_t db_upload_complete(sqlite3 *db, const char *guid) {
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db,
-            "DELETE FROM snapshot_upload WHERE prefix = ?1",
+            "DELETE FROM snapshot_upload WHERE guid = ?1",
             -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, prefix, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
@@ -708,28 +631,6 @@ int db_upload_has_incomplete(sqlite3 *db, const char *node) {
     int found = (sqlite3_step(stmt) == SQLITE_ROW);
     sqlite3_finalize(stmt);
     return found;
-}
-
-err_t db_upload_get_prev(sqlite3 *db, const char *prefix,
-                          int *prev_chunks, char *prev_token, size_t tlen) {
-    if (prev_chunks) *prev_chunks = 0;
-    if (prev_token) prev_token[0] = '\0';
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db,
-            "SELECT total_chunks, resume_token FROM snapshot_upload WHERE prefix = ?1",
-            -1, &stmt, NULL) != SQLITE_OK)
-        return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, prefix, -1, SQLITE_STATIC);
-    int found = (sqlite3_step(stmt) == SQLITE_ROW);
-    if (found) {
-        if (prev_chunks) *prev_chunks = sqlite3_column_int(stmt, 0);
-        if (prev_token)
-            snprintf(prev_token, tlen, "%s",
-                     sqlite3_column_text(stmt, 1)
-                     ? (const char *)sqlite3_column_text(stmt, 1) : "");
-    }
-    sqlite3_finalize(stmt);
-    return found ? ZEP_ERR_OK : ZEP_ERR_NOT_FOUND;
 }
 
 err_t db_pull_state_save(sqlite3 *db, const char *key,
