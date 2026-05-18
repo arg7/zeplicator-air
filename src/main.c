@@ -63,6 +63,16 @@ static struct {
     int ready;
 } g_resume_req;
 
+int g_pull_ws_req_pipe[2] = {-1, -1};
+int g_pull_ws_resp_pipe[2] = {-1, -1};
+static pthread_mutex_t g_pull_ws_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    char guid[ZEP_MAX_GUID_LEN];
+    char local_guid[ZEP_MAX_GUID_LEN];
+    char fs[ZEP_MAX_PATH];
+    int ready;
+} g_pull_ws_req;
+
 struct ws_node_conn {
     int sock;
     SSL *ssl;
@@ -306,6 +316,12 @@ static struct ws_node_conn *ws_node_connect(const char *server_url, const char *
     return c;
 }
 
+static void *ws_node_pipe_thread(void *arg);
+int pipeline_pull_ws(const zep_config_t *cfg, const http_config_t *http_cfg,
+                     const char *fs, const char *donor,
+                     const char *remote_guid, const char *local_guid,
+                     sqlite3 *db);
+
 static void *ws_node_pipe_thread(void *arg) {
     zep_config_t *cfg = (zep_config_t *)arg;
     if (!cfg) return NULL;
@@ -339,6 +355,10 @@ static void *ws_node_pipe_thread(void *arg) {
             FD_SET(ws_fd, &rfds);
             FD_SET(g_resume_req_pipe[0], &rfds);
             int maxfd = ws_fd > g_resume_req_pipe[0] ? ws_fd : g_resume_req_pipe[0];
+            if (g_pull_ws_req_pipe[0] >= 0) {
+                FD_SET(g_pull_ws_req_pipe[0], &rfds);
+                if (g_pull_ws_req_pipe[0] > maxfd) maxfd = g_pull_ws_req_pipe[0];
+            }
             int ssl_pending = (conn->ssl && SSL_pending(conn->ssl) > 0);
             struct timeval tv = { .tv_sec = ssl_pending ? 0 : 60,
                                   .tv_usec = 0 };
@@ -425,6 +445,83 @@ zep_log_debug("ws-node: recv pipe closed rc=%d\n", recv_rc);
                 char result = (ws_err || recv_rc != 0) ? 1 : 0;
                 (void)!write(g_resume_resp_pipe[1], &result, 1);
                 break;
+            }
+
+            if (g_pull_ws_req_pipe[0] >= 0 && FD_ISSET(g_pull_ws_req_pipe[0], &rfds)) {
+                char dummy;
+                (void)!read(g_pull_ws_req_pipe[0], &dummy, 1);
+                pthread_mutex_lock(&g_pull_ws_lock);
+                char pguid[ZEP_MAX_GUID_LEN];
+                char plguid[ZEP_MAX_GUID_LEN];
+                char pfs[ZEP_MAX_PATH];
+                snprintf(pguid, sizeof(pguid), "%s", g_pull_ws_req.guid);
+                snprintf(plguid, sizeof(plguid), "%s", g_pull_ws_req.local_guid);
+                snprintf(pfs, sizeof(pfs), "%s", g_pull_ws_req.fs);
+                g_pull_ws_req.ready = 0;
+                pthread_mutex_unlock(&g_pull_ws_lock);
+
+                zep_log("ws-node: pull_ws guid=%s local_guid=%s fs=%s\n",
+                    pguid, plguid, pfs);
+
+                char *req_json = NULL;
+                if (asprintf(&req_json,
+                    "{\"action\":\"pull\",\"guid\":\"%s\",\"local_guid\":\"%s\"}",
+                    pguid, plguid) < 0) {
+                    char res = 1;
+                    (void)!write(g_pull_ws_resp_pipe[1], &res, 1);
+                    continue;
+                }
+                if (ws_node_send_frame(conn, WS_NODE_OP_TEXT,
+                                       (unsigned char *)req_json, strlen(req_json)) < 0) {
+                    zep_log("ws-node: pull_ws send failed\n");
+                    free(req_json);
+                    char res = 1;
+                    (void)!write(g_pull_ws_resp_pipe[1], &res, 1);
+                    continue;
+                }
+                free(req_json);
+
+                FILE *recv_fp = NULL;
+                if (pfs[0]) {
+                    char rcmd[2048];
+                    snprintf(rcmd, sizeof(rcmd), "zfs recv -F -u '%s' 2>/dev/null", pfs);
+                    recv_fp = popen(rcmd, "w");
+                    zep_log_debug("ws-node: pull_ws opened recv pipe fs=%s\n", pfs);
+                }
+
+                int p_ws_err = 0;
+                for (;;) {
+                    ssize_t rn = ws_node_recv_frame(conn, out,
+                        WS_NODE_FRAME_MAX, &buf[0]);
+                    if (rn < 0) { p_ws_err = 1; break; }
+                    unsigned char op = buf[0] & 0x0F;
+                    if (op == WS_NODE_OP_CLOSE) { p_ws_err = 1; break; }
+                    if (op == WS_NODE_OP_PING) {
+                        ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)rn);
+                        continue;
+                    }
+                    if (op == WS_NODE_OP_PONG) continue;
+                    if (op == WS_NODE_OP_BIN && rn > 0 && recv_fp) {
+                        if (fwrite(out, 1, (size_t)rn, recv_fp) != (size_t)rn) {
+                            zep_log("ws-node: pull_ws fwrite failed\n");
+                            p_ws_err = 1;
+                            break;
+                        }
+                        continue;
+                    }
+                    if (op == WS_NODE_OP_EOF) break;
+                    if (op == WS_NODE_OP_EXIT) break;
+                }
+
+                int recv_rc = 0;
+                if (recv_fp) {
+                    recv_rc = pclose(recv_fp);
+                    zep_log_debug("ws-node: pull_ws recv pipe closed rc=%d\n", recv_rc);
+                }
+
+                char pres = (p_ws_err || recv_rc != 0) ? 1 : 0;
+                (void)!write(g_pull_ws_resp_pipe[1], &pres, 1);
+                continue;
             }
 
             if (!FD_ISSET(ws_fd, &rfds) && !ssl_pending) continue;
@@ -1314,6 +1411,9 @@ static int cmd_cron(int argc, char *argv[]) {
         if (pipe(g_resume_req_pipe) < 0 || pipe(g_resume_resp_pipe) < 0) {
             zep_log( "cron: failed to create resume pipes\n");
         }
+        if (pipe(g_pull_ws_req_pipe) < 0 || pipe(g_pull_ws_resp_pipe) < 0) {
+            zep_log( "cron: failed to create pull_ws pipes\n");
+        }
         zep_config_t *tcfg = malloc(sizeof(*tcfg));
         if (tcfg) {
             memcpy(tcfg, &cfg, sizeof(*tcfg));
@@ -1399,13 +1499,18 @@ static int cmd_cron(int argc, char *argv[]) {
                                (donor && cJSON_IsString(donor)) ? donor->valuestring : "",
                                nsnaps);
                         if (snap_list && cJSON_IsArray(snap_list) && cJSON_GetArraySize(snap_list) > 0) {
-                            pipeline_pull_v2(&cfg2, &http_cfg, local_fs,
-                                              (donor && cJSON_IsString(donor)) ? donor->valuestring : "",
-                                              snap_list, db);
-                        } else {
-                            pipeline_pull(&cfg2, &http_cfg, local_fs,
-                                          (donor && cJSON_IsString(donor)) ? donor->valuestring : "",
-                                          db);
+                            char local_guid[ZEP_MAX_GUID_LEN] = {0};
+                            zfs_get_latest_guid(local_fs, local_guid, sizeof(local_guid));
+                            cJSON *snap;
+                            cJSON_ArrayForEach(snap, snap_list) {
+                                cJSON *g = cJSON_GetObjectItem(snap, "guid");
+                                if (!g || !cJSON_IsString(g)) continue;
+                                zep_log("pull_ws: pulling guid=%s\n", g->valuestring);
+                                pipeline_pull_ws(&cfg2, &http_cfg, local_fs,
+                                    (donor && cJSON_IsString(donor)) ? donor->valuestring : "",
+                                    g->valuestring, local_guid[0] ? local_guid : "", db);
+                                zfs_get_latest_guid(local_fs, local_guid, sizeof(local_guid));
+                            }
                         }
                         tasks_done++;
 
@@ -1761,6 +1866,27 @@ int main(int argc, char *argv[]) {
 
     audit_close();
     return rc;
+}
+
+int pipeline_pull_ws(const zep_config_t *cfg, const http_config_t *http_cfg,
+                     const char *fs, const char *donor,
+                     const char *remote_guid, const char *local_guid,
+                     sqlite3 *db) {
+    (void)cfg; (void)http_cfg; (void)donor; (void)db;
+    if (g_pull_ws_req_pipe[1] < 0) return 1;
+    pthread_mutex_lock(&g_pull_ws_lock);
+    snprintf(g_pull_ws_req.guid, sizeof(g_pull_ws_req.guid), "%s", remote_guid);
+    snprintf(g_pull_ws_req.local_guid, sizeof(g_pull_ws_req.local_guid), "%s", local_guid ? local_guid : "");
+    snprintf(g_pull_ws_req.fs, sizeof(g_pull_ws_req.fs), "%s", fs ? fs : "");
+    g_pull_ws_req.ready = 1;
+    pthread_mutex_unlock(&g_pull_ws_lock);
+
+    (void)!write(g_pull_ws_req_pipe[1], "!", 1);
+
+    char res;
+    ssize_t r = read(g_pull_ws_resp_pipe[0], &res, 1);
+    if (r == 1) return (int)res;
+    return 1;
 }
 
 int pipeline_resume_request(const char *guid, const char *token, const char *fs) {

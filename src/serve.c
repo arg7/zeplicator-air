@@ -809,9 +809,115 @@ static void *node_ws_thread(void *arg) {
                             }
                         }
                         cJSON_Delete(msg);
-                        break;
-                    }
-                    cJSON_Delete(msg);
+                         break;
+                     }
+                     if (action && cJSON_IsString(action) &&
+                         strcmp(action->valuestring, "pull") == 0) {
+                         cJSON *guid_j = cJSON_GetObjectItem(msg, "guid");
+                         cJSON *lguid_j = cJSON_GetObjectItem(msg, "local_guid");
+                         if (guid_j && cJSON_IsString(guid_j)) {
+                             sqlite3_stmt *st = NULL;
+                             sqlite3_prepare_v2(g_db,
+                                 "SELECT guid, base_guid, snapshot FROM snapshots "
+                                 "WHERE guid = ?1 AND direction = 'push' LIMIT 1",
+                                 -1, &st, NULL);
+                             if (st) {
+                                 sqlite3_bind_text(st, 1, guid_j->valuestring,
+                                                   -1, SQLITE_STATIC);
+                             if (sqlite3_step(st) == SQLITE_ROW) {
+                                      const char *remote_base =
+                                          (const char *)sqlite3_column_text(st, 1);
+                                      const char *snap =
+                                         (const char *)sqlite3_column_text(st, 2);
+                                     if (snap && snap[0]) {
+                                         const char *local_guid =
+                                             lguid_j && cJSON_IsString(lguid_j)
+                                             ? lguid_j->valuestring : "";
+                                         char pipe_cmd[4096];
+                                         /* If remote_base is empty/zero, full send.
+                                          * Else if local_guid matches remote_base,
+                                          * incremental. */
+                                         int is_full = (!remote_base[0] ||
+                                             strcmp(remote_base, "0") == 0);
+                                         int is_inc = !is_full && local_guid[0] &&
+                                             strcmp(local_guid, remote_base) == 0;
+                                         if (is_full) {
+                                             snprintf(pipe_cmd, sizeof(pipe_cmd),
+                                                 "zfs send '%s' 2>/dev/null", snap);
+                                         } else if (is_inc) {
+                                             /* Need to resolve from_snap from its guid.
+                                              * Query the snapshots table for the base guid. */
+                                             sqlite3_stmt *bst = NULL;
+                                             sqlite3_prepare_v2(g_db,
+                                                 "SELECT snapshot FROM snapshots "
+                                                 "WHERE guid = ?1 AND direction = 'push' LIMIT 1",
+                                                 -1, &bst, NULL);
+                                             if (bst) {
+                                                 sqlite3_bind_text(bst, 1, remote_base, -1, SQLITE_STATIC);
+                                                 if (sqlite3_step(bst) == SQLITE_ROW) {
+                                                     const char *from_snap =
+                                                         (const char *)sqlite3_column_text(bst, 0);
+                                                     if (from_snap && from_snap[0]) {
+                                                         snprintf(pipe_cmd, sizeof(pipe_cmd),
+                                                             "zfs send -i '%s' '%s' 2>/dev/null",
+                                                             from_snap, snap);
+                                                     } else {
+                                                         snprintf(pipe_cmd, sizeof(pipe_cmd),
+                                                             "echo 'base snap not found' >&2; exit 1");
+                                                     }
+                                                 } else {
+                                                     snprintf(pipe_cmd, sizeof(pipe_cmd),
+                                                         "echo 'base snap not found' >&2; exit 1");
+                                                 }
+                                                 sqlite3_finalize(bst);
+                                             } else {
+                                                 snprintf(pipe_cmd, sizeof(pipe_cmd),
+                                                     "echo 'base snap not found' >&2; exit 1");
+                                             }
+                                         } else {
+                                              /* Client guid doesn't match any base in chain
+                                               * (old pulls, different clients). Fall back
+                                               * to full send. */
+                                              zep_log_debug("ws: pull snap=%s base_mismatch full_send\n", snap);
+                                              snprintf(pipe_cmd, sizeof(pipe_cmd),
+                                                  "zfs send '%s' 2>/dev/null", snap);
+                                          }
+                                         zep_log_debug("ws: pull snap=%s full=%d inc=%d\n",
+                                             snap, is_full, is_inc);
+                                         FILE *pp = popen(pipe_cmd, "r");
+                                          zep_log_debug("ws: popen pipe_cmd=%s pp=%p\n", pipe_cmd, (void*)pp);
+                                          audit_log(AUDIT_EVT_EXEC, "serve", pipe_cmd, pp ? -128 : -127);
+                                          if (pp) {
+                                              unsigned char rbuf[65536];
+                                              for (;;) {
+                                                  size_t nr = fread(rbuf, 1,
+                                                      sizeof(rbuf), pp);
+                                                  zep_log_debug("ws: fread nr=%zu\n", nr);
+                                                  if (nr == 0) break;
+                                                  ws_send_frame_gtls(nw,
+                                                     WS_OP_BIN, rbuf, nr);
+                                             }
+                                             int rc = pclose(pp);
+                                             audit_log(AUDIT_EVT_EXEC, "serve", pipe_cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
+                                             unsigned char ex = rc ? 1 : 0;
+                                             ws_send_frame_gtls(nw,
+                                                 WS_OP_EXIT, &ex, 1);
+                                         } else {
+                                             unsigned char ex = 1;
+                                             ws_send_frame_gtls(nw,
+                                                 WS_OP_EXIT, &ex, 1);
+                                         }
+                                         ws_send_frame_gtls(nw,
+                                             WS_OP_EOF, NULL, 0);
+                                     }
+                                 }
+                                 sqlite3_finalize(st);
+                             }
+                         }
+                         cJSON_Delete(msg);
+                         break;
+                     }
+                     cJSON_Delete(msg);
                 }
             }
                 if (plen == 0) continue; /* empty data frame */
@@ -1848,12 +1954,8 @@ zep_log_debug("config set: key=%s body_len=%zu body=%.*s\n",
                     cJSON_Delete(cj);
                 }
             }
-            char *js = cJSON_PrintUnformatted(tasks);
-            cJSON_Delete(tasks);
-            enum MHD_Result ret = send_json(conn, 200, js, ctx);
-            free(js);
-            return ret;
         }
+        /* fall through to normal cron sync logic below */
 
         if (suspended) {
             cJSON_AddItemToArray(tasks, cJSON_CreateObject());
@@ -1934,23 +2036,13 @@ zep_log_debug("config set: key=%s body_len=%zu body=%.*s\n",
                 if (cj) {
                     cJSON *pools = cJSON_GetObjectItem(cj, "pools");
                     if (pools) {
-                        int no_records = (db_node_pull_count(g_db, cluster_name,
-                                             ctx->node) == 0);
-                        cJSON *pool;
+                       cJSON *pool;
                         cJSON_ArrayForEach(pool, pools) {
                             cJSON *fs;
                             cJSON_ArrayForEach(fs, pool) {
                                 char cluster_fs[512];
                                 snprintf(cluster_fs, sizeof(cluster_fs),
                                          "%s/%s", pool->string, fs->string);
-
-                                if (no_records) {
-                                    cJSON *t = cJSON_CreateObject();
-                                    cJSON_AddStringToObject(t, "action", "inventory");
-                                    cJSON_AddStringToObject(t, "cluster_fs", cluster_fs);
-                                    cJSON_AddItemToArray(tasks, t);
-                                    continue;
-                                }
 
                                 sqlite3_stmt *st2 = NULL;
                                 sqlite3_prepare_v2(g_db,
@@ -1973,6 +2065,8 @@ zep_log_debug("config set: key=%s body_len=%zu body=%.*s\n",
                                 char client_guid[ZEP_MAX_GUID_LEN] = {0};
                                 db_snapshot_latest_guid(g_db, ctx->node,
                                     "pull", client_guid, sizeof(client_guid));
+                                zep_log_debug("cron/sync: client=%s cguid=%s\n",
+                                    ctx->node, client_guid[0] ? client_guid : "(none)");
 
                                 char *chain_js = db_snapshot_chain_json(g_db,
                                     cluster_name, donor,

@@ -449,37 +449,6 @@ char *db_snapshot_chain_json(sqlite3 *db, const char *cluster,
     }
     sqlite3_finalize(stmt);
 
-    /* if client guid not found in chain, reset and return everything */
-    if (!found && client_guid && client_guid[0]) {
-        cJSON_Delete(arr);
-        arr = cJSON_CreateArray();
-        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, master_cn, -1, SQLITE_STATIC);
-            sqlite3_bind_text(stmt, 2, cluster, -1, SQLITE_STATIC);
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                const char *g = (const char *)sqlite3_column_text(stmt, 0);
-                cJSON *s = cJSON_CreateObject();
-                cJSON_AddStringToObject(s, "guid", g);
-                cJSON_AddStringToObject(s, "base_guid",
-                    (const char *)sqlite3_column_text(stmt, 1));
-                const char *lb = (const char *)sqlite3_column_text(stmt, 4);
-                if (lb && lb[0])
-                    cJSON_AddStringToObject(s, "label", lb);
-                const char *sn = (const char *)sqlite3_column_text(stmt, 5);
-                if (sn && sn[0])
-                    cJSON_AddStringToObject(s, "snapshot", sn);
-                char *bj = db_blob_list_json(db, g);
-                if (bj) {
-                    cJSON *blist = cJSON_Parse(bj);
-                    if (blist) { cJSON_AddItemToObject(s, "blobs", blist); }
-                    free(bj);
-                }
-                cJSON_AddItemToArray(arr, s);
-            }
-            sqlite3_finalize(stmt);
-        }
-    }
-
     int count = cJSON_GetArraySize(arr);
     if (count == 0) {
         cJSON_Delete(arr);
