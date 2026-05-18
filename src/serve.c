@@ -66,7 +66,6 @@ struct node_ws {
     int pipe_thread_exited;
     pthread_cond_t pipe_ready;
     struct MHD_Connection *mhd_conn;
-    gnutls_session_t gnutls_session;
     /* Pipes for inter-thread data transfer */
     int pipe_admin_to_node[2];  /* bridge→node: admin data */
     int pipe_node_to_admin[2];  /* node→bridge: node data */
@@ -553,57 +552,45 @@ static ssize_t ws_send_frame_gtls(struct node_ws *nw, unsigned char opcode,
         free(frame);
         return -1;
     }
-    if (nw) {
-        gnutls_session_t tls = NULL;
-        pthread_mutex_lock(&nw->lock);
-        tls = nw->gnutls_session;
-        pthread_mutex_unlock(&nw->lock);
-        if (tls) {
-            ssize_t sent = 0;
-            while ((size_t)sent < flen) {
-                ssize_t n = gnutls_record_send(tls, frame + sent, flen - (size_t)sent);
-                if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
-                    int raw_fd = (int)(intptr_t)gnutls_transport_get_ptr(tls);
-                    if (raw_fd < 0) { free(frame); return -1; }
-                    fd_set wfds; FD_ZERO(&wfds); FD_SET(raw_fd, &wfds);
-                    struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
-                    if (select(raw_fd + 1, NULL, &wfds, NULL, &tv) <= 0) { free(frame); return -1; }
-                    continue;
-                }
-                if (n <= 0) { free(frame); return -1; }
-                sent += n;
+    /* After WS upgrade, nw->sock is a non-blocking socketpair endpoint.
+     * MHD's internal polling thread handles TLS: it decrypts data from the
+     * real client socket via GnuTLS and writes plaintext to mhd.socket (sv[1]).
+     * Our thread writes plaintext to app.socket (sv[0]=nw->sock). MHD reads
+     * from mhd.socket, encrypts via GnuTLS, sends to client. No GnuTLS calls
+     * from our thread — avoids race with MHD's internal polling thread. */
+    ssize_t sent = 0;
+    while ((size_t)sent < flen) {
+        ssize_t n = send(nw->sock, frame + sent, flen - (size_t)sent, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                fd_set wfds; FD_ZERO(&wfds); FD_SET(nw->sock, &wfds);
+                struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
+                if (select(nw->sock + 1, NULL, &wfds, NULL, &tv) <= 0) { free(frame); return -1; }
+                continue;
             }
             free(frame);
-            return (ssize_t)flen;
+            return -1;
         }
+        sent += n;
     }
-    ssize_t sent = send(nw ? nw->sock : -1, frame, flen, MSG_NOSIGNAL);
     free(frame);
-    return sent == (ssize_t)flen ? (ssize_t)flen : -1;
+    return (ssize_t)flen;
 }
 
 static ssize_t ws_recv_node(struct node_ws *nw, unsigned char *buf, size_t buf_size) {
-    if (nw) {
-        gnutls_session_t tls = NULL;
-        pthread_mutex_lock(&nw->lock);
-        tls = nw->gnutls_session;
-        pthread_mutex_unlock(&nw->lock);
-        if (tls) {
-            ssize_t n = gnutls_record_recv(tls, buf, buf_size);
-            if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
-                int raw_fd = (int)(intptr_t)gnutls_transport_get_ptr(tls);
-                if (raw_fd < 0) return -1;
-                fd_set rfds; FD_ZERO(&rfds); FD_SET(raw_fd, &rfds);
-                struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
-                if (select(raw_fd + 1, &rfds, NULL, NULL, &tv) <= 0) return -1;
-                return gnutls_record_recv(tls, buf, buf_size);
-            }
-if ((g_logging & LOG_LEVEL_DEBUG) && n <= 0) zep_log_debug("ws: recv TLS result=%d cn=%s\n",
-                                          (int)n, nw->cn);
-            return n;
+    /* MHD's polling thread decrypts TLS data from the real client socket
+     * and writes plaintext to mhd.socket (sv[1]).  Our thread reads from
+     * app.socket (sv[0]=nw->sock) — plain socketpair, no GnuTLS needed. */
+    ssize_t n = recv(nw->sock, buf, buf_size, 0);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            fd_set rfds; FD_ZERO(&rfds); FD_SET(nw->sock, &rfds);
+            struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
+            if (select(nw->sock + 1, &rfds, NULL, NULL, &tv) <= 0) return -1;
+            return recv(nw->sock, buf, buf_size, 0);
         }
     }
-    return recv(nw ? nw->sock : -1, buf, buf_size, 0);
+    return n;
 }
 
 static ssize_t ws_recv_frame_full(struct node_ws *nw, unsigned char *buf, size_t buf_size,
@@ -669,23 +656,17 @@ struct node_ws_thread_ctx {
 static void *node_ws_thread(void *arg) {
     struct node_ws_thread_ctx *ctx = (struct node_ws_thread_ctx *)arg;
     struct node_ws *nw = ctx->nw;
-    int sock = ctx->sock;
+    (void)ctx->sock;
     struct MHD_UpgradeResponseHandle *urh = ctx->urh;
     free(ctx);
 
-    int raw_sock = sock;
-    if (nw->gnutls_session)
-        raw_sock = (int)(intptr_t)gnutls_transport_get_ptr(nw->gnutls_session);
-    if (raw_sock < 0) raw_sock = sock;
-
-    ws_make_blocking(sock);
     unsigned char *buf = malloc(WS_SUBCHUNK);
     unsigned char *out = malloc(WS_SUBCHUNK);
     if (!buf || !out) { free(buf); free(out); MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return NULL; }
 
-if (g_logging & LOG_LEVEL_DEBUG) {
-         zep_log_debug("ws: node %s listening sock=%d\n", nw->cn, sock);
-     }
+    if (g_logging & LOG_LEVEL_DEBUG) {
+        zep_log_debug("ws: node %s listening sock=%d\n", nw->cn, nw->sock);
+    }
 
     time_t last_ping = time(NULL);
     for (;;) {
@@ -694,28 +675,28 @@ if (g_logging & LOG_LEVEL_DEBUG) {
         int exiting = nw->pipe_starting;
         int closed = nw->ws_closed;
         pthread_mutex_unlock(&nw->lock);
-if (closed) {
-             if (g_logging & LOG_LEVEL_DEBUG) {
-                 zep_log_debug("ws: node %s closed by new connection\n", nw->cn);
-             }
-             break;
-         }
-         if (exiting) {
-              if (g_logging & LOG_LEVEL_DEBUG) {
-                  zep_log_debug("ws: node %s exiting for pipe bridge\n", nw->cn);
-              }
-              pthread_mutex_lock(&nw->lock);
-              nw->pipe_thread_exited = 1;
-              pthread_cond_signal(&nw->pipe_ready);
-              pthread_mutex_unlock(&nw->lock);
-             break;
-         }
+        if (closed) {
+            if (g_logging & LOG_LEVEL_DEBUG) {
+                zep_log_debug("ws: node %s closed by new connection\n", nw->cn);
+            }
+            break;
+        }
+        if (exiting) {
+            if (g_logging & LOG_LEVEL_DEBUG) {
+                zep_log_debug("ws: node %s exiting for pipe bridge\n", nw->cn);
+            }
+            pthread_mutex_lock(&nw->lock);
+            nw->pipe_thread_exited = 1;
+            pthread_cond_signal(&nw->pipe_ready);
+            pthread_mutex_unlock(&nw->lock);
+            break;
+        }
 
         struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(raw_sock, &rfds);
-        int sel = select(raw_sock + 1, &rfds, NULL, NULL, &tv);
+        FD_SET(nw->sock, &rfds);
+        int sel = select(nw->sock + 1, &rfds, NULL, NULL, &tv);
 
         time_t now = time(NULL);
         if (now - last_ping >= 60) {
@@ -724,7 +705,7 @@ if (closed) {
             last_ping = now;
         }
 
-            if (sel > 0 && FD_ISSET(raw_sock, &rfds)) {
+        if (sel > 0 && FD_ISSET(nw->sock, &rfds)) {
                 ssize_t plen = ws_recv_frame_full(nw, buf, WS_SUBCHUNK, out, WS_SUBCHUNK, &buf[0]);
                 unsigned char opcode = buf[0] & 0x0F;
                 if (plen < 0) {
@@ -871,9 +852,9 @@ if (g_logging & LOG_LEVEL_DEBUG) {
 
 /* Node WS upgrade handler */
 static void ws_node_upgrade_handler(void *cls, struct MHD_Connection *conn,
-                                     void *con_cls, const char *extra_in,
-                                     size_t extra_in_size, int sock,
-                                     struct MHD_UpgradeResponseHandle *urh) {
+                                      void *con_cls, const char *extra_in,
+                                      size_t extra_in_size, int sock,
+                                      struct MHD_UpgradeResponseHandle *urh) {
     (void)cls; (void)conn; (void)con_cls; (void)extra_in; (void)extra_in_size;
 
     const char *cn = (const char *)cls;
@@ -884,12 +865,11 @@ static void ws_node_upgrade_handler(void *cls, struct MHD_Connection *conn,
     struct node_ws *nw = node_ws_register(cn, sock);
     if (!nw) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
     nw->mhd_conn = conn;
-    {
-        const union MHD_ConnectionInfo *ci = MHD_get_connection_info(conn, MHD_CONNECTION_INFO_GNUTLS_SESSION);
-        nw->gnutls_session = (ci && ci->tls_session) ? (gnutls_session_t)ci->tls_session : NULL;
-    }
 
-    /* Spawn thread for WS loop */
+    /* Spawn thread for WS loop — uses plain send/recv on socketpair fd.
+     * MHD's internal polling thread handles TLS (gnutls_record_send/recv)
+     * on the real client socket. The socketpair (sv[0]=app.socket) carries
+     * plaintext — our thread never touches GnuTLS, avoiding the data race. */
     struct node_ws_thread_ctx *ctx = malloc(sizeof(*ctx));
     ctx->nw = nw;
     ctx->sock = sock;
@@ -1158,13 +1138,10 @@ zep_log_debug("ws: pipe found node %s sock=%d\n", node_cn, nw->sock);
     /* Join the node thread to ensure it is fully dead */
     pthread_join(nw->thread, NULL);
 
-zep_log_debug("ws: node %s thread joined, pipe taking over\n", node_cn);
+   zep_log_debug("ws: node %s thread joined, pipe taking over\n", node_cn);
 
-    /* Get raw TCP fd for select */
-    int node_raw_fd = nw->sock;
-    if (nw->gnutls_session)
-        node_raw_fd = (int)(intptr_t)gnutls_transport_get_ptr(nw->gnutls_session);
-    if (node_raw_fd < 0) node_raw_fd = nw->sock;
+    /* Bridge: admin socket ↔ node WS via socketpair (nw->sock) */
+    int node_fd = nw->sock;
     int admin_raw_fd = sock;
 
     /* Send task JSON to node */
@@ -1184,7 +1161,7 @@ zep_log_debug("ws: sending task to node: %s\n", task_json);
 
     /* Bridge: admin socket ↔ node WS */
     ws_make_blocking(sock);
-    ws_make_blocking(node_raw_fd);
+    ws_make_blocking(node_fd);
     unsigned char *admin_buf = malloc(WS_ADMIN_BUF);
     size_t admin_acc_len = 0;
     unsigned char *node_buf = malloc(WS_SUBCHUNK);
@@ -1202,8 +1179,8 @@ zep_log_debug("ws: sending task to node: %s\n", task_json);
         fd_set rfds;
         FD_ZERO(&rfds);
         int maxfd = 0;
-        if (admin_alive) { FD_SET(admin_raw_fd, &rfds); if (admin_raw_fd > maxfd) maxfd = admin_raw_fd; }
-        if (node_alive) { FD_SET(node_raw_fd, &rfds); if (node_raw_fd > maxfd) maxfd = node_raw_fd; }
+             if (admin_alive) { FD_SET(admin_raw_fd, &rfds); if (admin_raw_fd > maxfd) maxfd = admin_raw_fd; }
+        if (node_alive) { FD_SET(node_fd, &rfds); if (node_fd > maxfd) maxfd = node_fd; }
         int sel = select(maxfd + 1, &rfds, NULL, NULL, &tv);
 
         if (sel > 0) {
@@ -1222,7 +1199,7 @@ zep_log_debug("ws: sending task to node: %s\n", task_json);
             }
 
             /* Node → Admin: forward all BIN and TEXT frames */
-            if (node_alive && FD_ISSET(node_raw_fd, &rfds)) {
+                     if (node_alive && FD_ISSET(node_fd, &rfds)) {
                 ssize_t plen = ws_recv_frame_full(nw, node_buf, WS_SUBCHUNK, node_out, WS_SUBCHUNK, &node_buf[0]);
                 if (plen < 0) { node_alive = 0; }
                 else {
