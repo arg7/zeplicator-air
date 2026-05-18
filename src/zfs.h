@@ -26,7 +26,6 @@ err_t zfs_recv_abort(const char *fs);
 err_t zfs_get_recv_token(const char *fs, char *token, size_t token_len);
 err_t zfs_get_snapshot_guid(const char *snapshot, char *guid, size_t len);
 err_t zfs_get_latest_guid(const char *fs, char *guid, size_t len);
-err_t zfs_snapshot_exists(const char *fs, const char *snap);
 err_t zfs_destroy_snapshot(const char *snapshot);
 
 #endif

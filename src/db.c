@@ -188,174 +188,6 @@ err_t db_config_load(sqlite3 *db, zep_config_t *cfg) {
     return ZEP_ERR_OK;
 }
 
-err_t db_push_record(sqlite3 *db, const snapshot_meta_t *meta) {
-    sqlite3_stmt *stmt = NULL;
-    const char *sql =
-        "INSERT OR REPLACE INTO pushed (guid, snapshot, base_guid, label, created, blob_count, stream_size) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, meta->guid, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, meta->snapshot, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, meta->base_guid[0] ? meta->base_guid : NULL, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 4, meta->label, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 5, meta->created, -1, SQLITE_STATIC);
-    sqlite3_bind_int(stmt,  6, meta->blob_count);
-    sqlite3_bind_int64(stmt, 7, (sqlite3_int64)meta->stream_size);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
-}
-
-err_t db_pull_record(sqlite3 *db, const snapshot_meta_t *meta, const char *donor) {
-    sqlite3_stmt *stmt = NULL;
-    const char *sql =
-        "INSERT OR REPLACE INTO pulled (guid, snapshot, base_guid, label, created, donor_node, blob_count, stream_size) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, meta->guid, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, meta->snapshot, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, meta->base_guid[0] ? meta->base_guid : NULL, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 4, meta->label, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 5, meta->created, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 6, donor, -1, SQLITE_STATIC);
-    sqlite3_bind_int(stmt,  7, meta->blob_count);
-    sqlite3_bind_int64(stmt, 8, (sqlite3_int64)meta->stream_size);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
-}
-
-int db_was_pushed(sqlite3 *db, const char *guid) {
-    sqlite3_stmt *stmt = NULL;
-    int exists = 0;
-    if (sqlite3_prepare_v2(db, "SELECT 1 FROM pushed WHERE guid = ?", -1, &stmt, NULL) != SQLITE_OK)
-        return 0;
-    sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
-    if (sqlite3_step(stmt) == SQLITE_ROW) exists = 1;
-    sqlite3_finalize(stmt);
-    return exists;
-}
-
-int db_was_pulled(sqlite3 *db, const char *guid) {
-    sqlite3_stmt *stmt = NULL;
-    int exists = 0;
-    if (sqlite3_prepare_v2(db, "SELECT 1 FROM pulled WHERE guid = ?", -1, &stmt, NULL) != SQLITE_OK)
-        return 0;
-    sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
-    if (sqlite3_step(stmt) == SQLITE_ROW) exists = 1;
-    sqlite3_finalize(stmt);
-    return exists;
-}
-
-err_t db_list_pushed(sqlite3 *db, char ***guids, int *count) {
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, "SELECT guid FROM pushed ORDER BY pushed_at DESC", -1, &stmt, NULL) != SQLITE_OK)
-        return ZEP_ERR_DB;
-
-    int cap = 16, cnt = 0;
-    char **list = calloc((size_t)cap, sizeof(char *));
-    if (!list) return ZEP_ERR_SYS;
-
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        if (cnt >= cap) {
-            cap *= 2;
-            list = realloc(list, (size_t)cap * sizeof(char *));
-            if (!list) return ZEP_ERR_SYS;
-        }
-        list[cnt++] = strdup((const char *)sqlite3_column_text(stmt, 0));
-    }
-    sqlite3_finalize(stmt);
-    *guids = list;
-    *count = cnt;
-    return ZEP_ERR_OK;
-}
-
-err_t db_list_pulled(sqlite3 *db, char ***guids, int *count) {
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, "SELECT guid FROM pulled ORDER BY pulled_at DESC", -1, &stmt, NULL) != SQLITE_OK)
-        return ZEP_ERR_DB;
-
-    int cap = 16, cnt = 0;
-    char **list = calloc((size_t)cap, sizeof(char *));
-    if (!list) return ZEP_ERR_SYS;
-
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        if (cnt >= cap) {
-            cap *= 2;
-            list = realloc(list, (size_t)cap * sizeof(char *));
-            if (!list) return ZEP_ERR_SYS;
-        }
-        list[cnt++] = strdup((const char *)sqlite3_column_text(stmt, 0));
-    }
-    sqlite3_finalize(stmt);
-    *guids = list;
-    *count = cnt;
-    return ZEP_ERR_OK;
-}
-
-err_t db_chain_insert(sqlite3 *db, const char *cluster_key,
-                      const char *toguid, const char *fromguid,
-                      const char *snapshot, const char *pushed_by) {
-    const char *sql =
-        "INSERT OR IGNORE INTO cluster_chain "
-        "(cluster_key, toguid, fromguid, snapshot, pushed_by) "
-        "VALUES (?, ?, ?, ?, ?)";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "db_chain_insert: %s\n", sqlite3_errmsg(db));
-        return ZEP_ERR_DB;
-    }
-    sqlite3_bind_text(stmt, 1, cluster_key, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, toguid, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, fromguid, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 4, snapshot, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 5, pushed_by, -1, SQLITE_STATIC);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
-}
-
-err_t db_chain_latest(sqlite3 *db, const char *cluster_key,
-                      char *guid, size_t len) {
-    const char *sql =
-        "SELECT toguid FROM cluster_chain WHERE cluster_key = ? "
-        "ORDER BY rowid DESC LIMIT 1";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, cluster_key, -1, SQLITE_STATIC);
-    err_t ret = ZEP_ERR_NOT_FOUND;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        snprintf(guid, len, "%s", sqlite3_column_text(stmt, 0));
-        ret = ZEP_ERR_OK;
-    }
-    sqlite3_finalize(stmt);
-    return ret;
-}
-
-err_t db_chain_common(sqlite3 *db, const char *cluster_key,
-                      const char *client_guid,
-                      char *common_guid, size_t len) {
-    if (!client_guid || !client_guid[0] || strcmp(client_guid, "0") == 0)
-        return ZEP_ERR_NOT_FOUND;
-
-    const char *sql =
-        "SELECT toguid FROM cluster_chain WHERE cluster_key = ? AND toguid = ?";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, cluster_key, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, client_guid, -1, SQLITE_STATIC);
-    err_t ret = ZEP_ERR_NOT_FOUND;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        snprintf(common_guid, len, "%s", client_guid);
-        ret = ZEP_ERR_OK;
-    }
-    sqlite3_finalize(stmt);
-    return ret;
-}
 
 err_t db_cert_store(sqlite3 *db, const char *cn,
                     const char *fingerprint, const char *pem_data,
@@ -392,10 +224,6 @@ err_t db_cert_lookup(sqlite3 *db, const char *cn,
     }
     sqlite3_finalize(stmt);
     return ret;
-}
-
-err_t db_ca_fingerprint(sqlite3 *db, char *fp, size_t len) {
-    return db_cert_lookup(db, "Zep-Air testing", fp, len);
 }
 
 err_t db_auth_list(sqlite3 *db, char ***names, int *count) {
@@ -453,35 +281,10 @@ err_t db_auth_get_role_by_fp(sqlite3 *db, const char *fingerprint,
     return ret;
 }
 
-err_t db_ack_guid(sqlite3 *db, const char *cn, const char *guid) {
-    const char *sql =
-        "UPDATE auth SET last_ack_guid = ?, last_ack_at = datetime('now') WHERE cn = ?";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, cn, -1, SQLITE_STATIC);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
-}
-
 err_t db_set_suspended(sqlite3 *db, const char *cn, int val) {
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db,
             "UPDATE auth SET suspended = ? WHERE cn = ?", -1, &stmt, NULL) != SQLITE_OK)
-        return ZEP_ERR_DB;
-    sqlite3_bind_int(stmt, 1, val);
-    sqlite3_bind_text(stmt, 2, cn, -1, SQLITE_STATIC);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
-}
-
-err_t db_set_pipe_active(sqlite3 *db, const char *cn, int val) {
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db,
-            "UPDATE auth SET pipe_active = ? WHERE cn = ?", -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;
     sqlite3_bind_int(stmt, 1, val);
     sqlite3_bind_text(stmt, 2, cn, -1, SQLITE_STATIC);

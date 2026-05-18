@@ -10,7 +10,6 @@
 #define AUDIT_EVT_EXEC    "exec"
 #define AUDIT_EVT_HTTP    "http"
 #define AUDIT_EVT_CERT    "cert"
-#define AUDIT_EVT_ZEP     "zep"
 
 #define audit_init(p)      audit_log_init((p))
 #define audit_close()      audit_log_close()

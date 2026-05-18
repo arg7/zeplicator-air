@@ -306,7 +306,6 @@ static struct ws_node_conn *ws_node_connect(const char *server_url, const char *
     return c;
 }
 
-__attribute__((unused))
 static void *ws_node_pipe_thread(void *arg) {
     zep_config_t *cfg = (zep_config_t *)arg;
     if (!cfg) return NULL;

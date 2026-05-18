@@ -142,10 +142,8 @@ err_t storage_read_meta(const char *root, const char *node, const char *prefix,
             cJSON *b;
             cJSON_ArrayForEach(b, blobs_arr) {
                 if (i >= meta->blob_count) break;
-                cJSON *p = cJSON_GetObjectItem(b, "part");
                 cJSON *s = cJSON_GetObjectItem(b, "size");
                 cJSON *h = cJSON_GetObjectItem(b, "sha256");
-                if (p && cJSON_IsNumber(p)) snprintf(meta->blobs[i].part, sizeof(meta->blobs[i].part), "%04d", p->valueint);
                 if (s && cJSON_IsNumber(s)) meta->blobs[i].size = (size_t)s->valuedouble;
                 if (h && cJSON_IsString(h)) snprintf(meta->blobs[i].sha256, sizeof(meta->blobs[i].sha256), "%s", h->valuestring);
                 i++;

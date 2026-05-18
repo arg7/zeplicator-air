@@ -305,15 +305,6 @@ err_t zfs_get_latest_guid(const char *fs, char *guid, size_t len) {
     return zfs_get_snapshot_guid(line, guid, len);
 }
 
-err_t zfs_snapshot_exists(const char *fs, const char *snap) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-        "zfs list -Hp -t snapshot -o name '%s' 2>/dev/null | grep -Fx '%s' >/dev/null 2>&1",
-        fs, snap);
-    int rc = audit_system(cmd);
-    return rc == 0 ? ZEP_ERR_OK : ZEP_ERR_NOT_FOUND;
-}
-
 err_t zfs_destroy_snapshot(const char *snapshot) {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd), "zfs destroy '%s' 2>&1", snapshot);

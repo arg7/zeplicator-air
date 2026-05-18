@@ -42,11 +42,6 @@ err_t pipeline_resolve_fs(const char *cluster_fs, const char *mapping,
     return ZEP_ERR_NOT_FOUND;
 }
 
-int pipeline_has_mapping(const char *cluster_fs, const char *mapping) {
-    char buf[512];
-    return pipeline_resolve_fs(cluster_fs, mapping, buf, sizeof(buf)) == ZEP_ERR_OK;
-}
-
 err_t pipeline_reverse_fs(const char *mapping, const char *local_fs,
                           char *cluster_fs, size_t len) {
     if (!mapping || !local_fs) return ZEP_ERR_NOT_FOUND;
@@ -69,35 +64,6 @@ err_t pipeline_reverse_fs(const char *mapping, const char *local_fs,
         p = comma ? comma + 1 : colon + strlen(colon);
     }
     return ZEP_ERR_NOT_FOUND;
-}
-
-err_t pipeline_for_each_fs(const char *mapping,
-                           void (*cb)(const char *cluster_fs, const char *local_fs,
-                                      void *user), void *user) {
-    if (!mapping || !mapping[0]) return ZEP_ERR_NOT_FOUND;
-    const char *p = mapping;
-    while (*p) {
-        const char *colon = strchr(p, ':');
-        if (!colon) break;
-        char cf[256], lf[256];
-        size_t cf_len = (size_t)(colon - p);
-        if (cf_len >= sizeof(cf)) cf_len = sizeof(cf) - 1;
-        memcpy(cf, p, cf_len); cf[cf_len] = '\0';
-
-        const char *start = colon + 1;
-        const char *end = strchr(start, ',');
-        if (!end) end = start + strlen(start);
-        const char *paren = strchr(start, '(');
-        size_t lf_len = paren ? (size_t)(paren - start) : (size_t)(end - start);
-        if (lf_len >= sizeof(lf)) lf_len = sizeof(lf) - 1;
-        memcpy(lf, start, lf_len); lf[lf_len] = '\0';
-
-        cb(cf, lf, user);
-
-        const char *comma = strchr(colon, ',');
-        p = comma ? comma + 1 : colon + strlen(colon);
-    }
-    return ZEP_ERR_OK;
 }
 
 static void sha256_hex(const unsigned char *data, size_t len, char hex[65]) {
@@ -242,12 +208,8 @@ err_t pipeline_push(const zep_config_t *cfg,
                                 for (int i = 0; i < prev_blob_count; i++) {
                                     cJSON *item = cJSON_GetArrayItem(pb, i);
                                     if (!item) continue;
-                                    cJSON *ip = cJSON_GetObjectItem(item, "part");
                                     cJSON *is = cJSON_GetObjectItem(item, "size");
                                     cJSON *ih = cJSON_GetObjectItem(item, "sha256");
-                                    if (ip && cJSON_IsNumber(ip))
-                                        snprintf(prev_blobs[i].part, sizeof(prev_blobs[i].part),
-                                                 "%04d", ip->valueint);
                                     if (is && cJSON_IsNumber(is))
                                         prev_blobs[i].size = (size_t)is->valuedouble;
                                     if (ih && cJSON_IsString(ih))
@@ -430,9 +392,6 @@ skip_snapshot:
 
         sha256_hex(comp_buf, comp_len, blobs[blob_count].sha256);
         blobs[blob_count].size = comp_len;
-        snprintf(blobs[blob_count].part, sizeof(blobs[blob_count].part),
-                 "%04d", chunk_start + blob_count);
-
         ret = http_put_blob(http_cfg, cfg->node_name, prefix,
                             chunk_start + blob_count, comp_buf, comp_len);
         free(comp_buf);
@@ -890,126 +849,5 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
         }
     }
 
-    return ZEP_ERR_OK;
-}
-
-err_t pipeline_resolve_zfs_cmd(const char *cmd, const char *mapping,
-                               char *out, size_t out_len) {
-    if (!cmd || !mapping || !out || out_len == 0)
-        return ZEP_ERR_SYS;
-    const char *space = strchr(cmd, ' ');
-    if (!space) {
-        snprintf(out, out_len, "%s", cmd);
-        return ZEP_ERR_OK;
-    }
-    int pos = (int)(space - cmd);
-    memcpy(out, cmd, (size_t)pos);
-    out[pos] = '\0';
-
-    if (strcmp(out, "zfs") != 0) {
-        snprintf(out, out_len, "%s", cmd);
-        return ZEP_ERR_OK;
-    }
-
-    char *cmd_copy = strdup(cmd);
-    if (!cmd_copy) return ZEP_ERR_SYS;
-
-    int argc = 0;
-    char *argv[64];
-    char *save = NULL;
-    char *tok = strtok_r(cmd_copy, " ", &save);
-    while (tok && argc < 63) {
-        argv[argc++] = tok;
-        tok = strtok_r(NULL, " ", &save);
-    }
-
-    if (argc < 3) {
-        free(cmd_copy);
-        snprintf(out, out_len, "%s", cmd);
-        return ZEP_ERR_OK;
-    }
-
-    int fs_idx = argc - 1;
-    char fs_buf[ZEP_MAX_SNAPSHOT_NAME];
-    const char *fs_arg = argv[fs_idx];
-
-    char base_fs[ZEP_MAX_SNAPSHOT_NAME];
-    const char *at = strchr(fs_arg, '@');
-    if (at) {
-        size_t n = (size_t)(at - fs_arg);
-        if (n >= sizeof(base_fs)) n = sizeof(base_fs) - 1;
-        memcpy(base_fs, fs_arg, n);
-        base_fs[n] = '\0';
-    } else {
-        snprintf(base_fs, sizeof(base_fs), "%s", fs_arg);
-    }
-
-    char local_fs[ZEP_MAX_SNAPSHOT_NAME];
-    if (pipeline_resolve_fs(base_fs, mapping, local_fs, sizeof(local_fs))
-        == ZEP_ERR_OK) {
-        if (at)
-            snprintf(fs_buf, sizeof(fs_buf), "%s%s", local_fs, at);
-        else
-            snprintf(fs_buf, sizeof(fs_buf), "%s", local_fs);
-        argv[fs_idx] = fs_buf;
-    }
-
-    size_t off = 0;
-    for (int i = 0; i < argc; i++) {
-        int n = snprintf(out + off, out_len - off, "%s%s",
-                         i > 0 ? " " : "", argv[i]);
-        if (n < 0 || (size_t)n >= out_len - off) break;
-        off += (size_t)n;
-    }
-
-    free(cmd_copy);
-    return ZEP_ERR_OK;
-}
-
-err_t pipeline_build_pipe_send(const char *command, int compress, int buffer,
-                               const zep_config_t *cfg,
-                               char *out, size_t out_len) {
-    if (!command || !cfg || !out || out_len == 0) return ZEP_ERR_SYS;
-    size_t off = 0;
-    int n = snprintf(out, out_len, "%s", command);
-    if (n < 0) return ZEP_ERR_SYS;
-    off = (size_t)n;
-
-    if (buffer && cfg->push_buf_cmd[0]) {
-        n = snprintf(out + off, out_len - off, " | %s",
-                     cfg->push_buf_cmd);
-        if (n < 0 || (size_t)n >= out_len - off) return ZEP_ERR_SYS;
-        off += (size_t)n;
-    }
-    if (compress && cfg->push_zip_cmd[0]) {
-        n = snprintf(out + off, out_len - off, " | %s",
-                     cfg->push_zip_cmd);
-        if (n < 0 || (size_t)n >= out_len - off) return ZEP_ERR_SYS;
-        off += (size_t)n;
-    }
-    return ZEP_ERR_OK;
-}
-
-err_t pipeline_build_pipe_recv(const char *command, int compress, int buffer,
-                               const zep_config_t *cfg,
-                               char *out, size_t out_len) {
-    if (!command || !cfg || !out || out_len == 0) return ZEP_ERR_SYS;
-    size_t off = 0;
-
-    if (compress && cfg->pull_unzip_cmd[0]) {
-        int n = snprintf(out, out_len, "%s", cfg->pull_unzip_cmd);
-        if (n < 0) return ZEP_ERR_SYS;
-        off = (size_t)n;
-    }
-    if (buffer && cfg->pull_buf_cmd[0]) {
-        int n = snprintf(out + off, out_len - off, "%s%s",
-                         off > 0 ? " | " : "",
-                         cfg->pull_buf_cmd);
-        if (n < 0 || (size_t)n >= out_len - off) return ZEP_ERR_SYS;
-        off += (size_t)n;
-    }
-    int n = snprintf(out + off, out_len - off, "%s%s",
-                     off > 0 ? " | " : "", command);
-    if (n < 0 || (size_t)n >= out_len - off) return ZEP_ERR_SYS;
     return ZEP_ERR_OK;
 }

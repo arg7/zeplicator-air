@@ -47,7 +47,6 @@ typedef int8_t err_t;
 extern int g_logging;
 
 typedef struct {
-    char part[8];
     size_t size;
     char sha256[65];
 } blob_info_t;

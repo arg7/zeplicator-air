@@ -25,18 +25,6 @@ err_t pipeline_pull_v2(const zep_config_t *cfg,
 
 err_t pipeline_resolve_fs(const char *cluster_fs, const char *mapping,
                           char *local_fs, size_t len);
-int   pipeline_has_mapping(const char *cluster_fs, const char *mapping);
-err_t pipeline_for_each_fs(const char *mapping,
-                           void (*cb)(const char *cluster_fs, const char *local_fs,
-                                      void *user), void *user);
-err_t pipeline_resolve_zfs_cmd(const char *cmd, const char *mapping,
-                               char *out, size_t out_len);
-err_t pipeline_build_pipe_send(const char *command, int compress, int buffer,
-                               const zep_config_t *cfg,
-                               char *out, size_t out_len);
-err_t pipeline_build_pipe_recv(const char *command, int compress, int buffer,
-                               const zep_config_t *cfg,
-                               char *out, size_t out_len);
 
 err_t pipeline_reverse_fs(const char *mapping, const char *local_fs,
                           char *cluster_fs, size_t len);

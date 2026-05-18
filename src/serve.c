@@ -15,7 +15,6 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/time.h>
-#include <sys/time.h>
 #include <microhttpd.h>
 #include <openssl/x509.h>
 #include <openssl/ssl.h>
@@ -57,18 +56,13 @@ struct node_ws {
     pthread_mutex_t lock;
     time_t last_ping;
     time_t last_pong;
-    /* Pipe coordination: bridge sets these, node thread reads them */
     char pipe_cmd[4096];
-    int pipe_cmd_ready;
-    int pipe_done;
-    int pipe_recv_mode;
     int pipe_starting;
     int pipe_thread_exited;
     pthread_cond_t pipe_ready;
-    struct MHD_Connection *mhd_conn;
     /* Pipes for inter-thread data transfer */
-    int pipe_admin_to_node[2];  /* bridge→node: admin data */
-    int pipe_node_to_admin[2];  /* node→bridge: node data */
+    int pipe_admin_to_node[2];
+    int pipe_node_to_admin[2];
     pthread_t thread;
 };
 
@@ -88,7 +82,6 @@ struct conn_ctx {
     int parsed;
     int authed;
     char role[16];
-    int  status_code;
 };
 
 static void conn_ctx_free(struct conn_ctx *ctx) {
@@ -162,7 +155,6 @@ static enum MHD_Result send_response(struct MHD_Connection *conn,
                                       const void *body, size_t body_len,
                                       struct conn_ctx *ctx) {
     if (ctx) {
-        ctx->status_code = status;
         const char *method = ctx->method[0] ? ctx->method : "?";
         const char *role   = ctx->role[0]   ? ctx->role   : "?";
         zep_log("http: %s %s %s %s → %d (%zub)\n", ctx->node[0] ? ctx->node : "?", role, method, ctx->target_url, status, body_len);
@@ -648,15 +640,12 @@ static void ws_set_keepalive(int fd) {
 
 struct node_ws_thread_ctx {
     struct node_ws *nw;
-    int sock;
-    struct MHD_Connection *mhd_conn;
     struct MHD_UpgradeResponseHandle *urh;
 };
 
 static void *node_ws_thread(void *arg) {
     struct node_ws_thread_ctx *ctx = (struct node_ws_thread_ctx *)arg;
     struct node_ws *nw = ctx->nw;
-    (void)ctx->sock;
     struct MHD_UpgradeResponseHandle *urh = ctx->urh;
     free(ctx);
 
@@ -865,7 +854,6 @@ static void ws_node_upgrade_handler(void *cls, struct MHD_Connection *conn,
 
     struct node_ws *nw = node_ws_register(cn, sock);
     if (!nw) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
-    nw->mhd_conn = conn;
 
     /* Spawn thread for WS loop — uses plain send/recv on socketpair fd.
      * MHD's internal polling thread handles TLS (gnutls_record_send/recv)
@@ -873,8 +861,6 @@ static void ws_node_upgrade_handler(void *cls, struct MHD_Connection *conn,
      * plaintext — our thread never touches GnuTLS, avoiding the data race. */
     struct node_ws_thread_ctx *ctx = malloc(sizeof(*ctx));
     ctx->nw = nw;
-    ctx->sock = sock;
-    ctx->mhd_conn = conn;
     ctx->urh = urh;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
