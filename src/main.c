@@ -1803,10 +1803,8 @@ int pipeline_push_ws(const zep_config_t *cfg, const char *fs,
                 char *tab = strchr(line, '\t');
                 if (!tab) continue;
                 *tab = '\0';
-                char *at = strchr(line, '@');
-                char *sname = at ? at + 1 : line;
                 size_t fslen = strlen(fs);
-                if (strncmp(line, fs, fslen) == 0 && sname[0] == '\0') {
+                if (strncmp(line, fs, fslen) == 0 && line[fslen] == '@') {
                     char *g = tab + 1;
                     size_t gl = strlen(g);
                     while (gl > 0 && (g[gl-1]=='\n'||g[gl-1]=='\r')) g[--gl]='\0';
