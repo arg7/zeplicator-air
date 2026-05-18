@@ -1993,6 +1993,8 @@ zep_log_debug("config set: key=%s body_len=%zu body=%.*s\n",
                                             cJSON_AddStringToObject(t, "action", "push");
                                             cJSON_AddStringToObject(t, "cluster_fs", cluster_fs);
                                             cJSON_AddStringToObject(t, "label", lbl->string);
+                                            if (last == 0)
+                                                cJSON_AddTrueToObject(t, "create");
                                             cJSON_AddItemToArray(tasks, t);
                                         }
                                     }
