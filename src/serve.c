@@ -252,9 +252,14 @@ static void node_ws_shutdown(void) {
     }
     pthread_mutex_unlock(&g_node_ws_lock);
 
+    /* Give threads time to notice ws_closed and exit */
+    sleep(2);
+
+    /* Force-cancel threads that are still alive */
     pthread_mutex_lock(&g_node_ws_lock);
     for (struct node_ws *nw = g_node_ws; nw; nw = nw->next) {
         if (nw->thread) {
+            pthread_cancel(nw->thread);
             pthread_join(nw->thread, NULL);
             nw->thread = 0;
         }
@@ -2884,11 +2889,9 @@ zep_log_debug("config set: key=%s body_len=%zu body=%.*s\n",
 
 static void sig_handler(int sig) {
     (void)sig;
-    if (g_daemon) {
-        node_ws_shutdown();
+    if (g_daemon)
         MHD_stop_daemon(g_daemon);
-        g_daemon = NULL;
-    }
+    g_daemon = NULL;
 }
 
 static int load_pem(const char *path, char **data) {

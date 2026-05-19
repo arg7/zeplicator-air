@@ -1367,7 +1367,10 @@ static int cmd_cron(int argc, char *argv[]) {
             }
         }
 
-        /* Create snapshots for all create=true push tasks, track last snapshot name */
+        /* Create snapshots for all push tasks that have a cluster,
+         * track last snapshot name.  Always create — the server tells us
+         * which labels are due.  The "create" flag on the first cycle is
+         * just an optimization to avoid redundant creates. */
         char local_fs_last[ZEP_MAX_SNAPSHOT_NAME] = {0};
         char cfs_last[ZEP_MAX_PATH] = {0};
         char label_last[ZEP_MAX_SNAPSHOT_NAME] = {0};
@@ -1391,29 +1394,52 @@ static int cmd_cron(int argc, char *argv[]) {
                 db_config_load(db, &cfg2);
                 if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
                                         local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
-                    cJSON *create = cJSON_GetObjectItem(p, "create");
-                    if (create && cJSON_IsTrue(create) && cfg2.cluster[0]) {
+                    if (cfg2.cluster[0]) {
                         char snap_label[128];
                         snprintf(snap_label, sizeof(snap_label), "%s-%s-%s",
                                  cfg2.cluster, lbl->valuestring, ts_buf);
-                        char snap_cmd[2048];
-                        snprintf(snap_cmd, sizeof(snap_cmd),
-                                 "zfs snapshot '%s@%s'", local_fs, snap_label);
-                        zep_log("cron: creating snapshot '%s'\n", snap_label);
-                        char _snap_err[512];
-                        FILE *_snap_fp = audit_popen(snap_cmd);
-                        int _snap_rc = _snap_fp ? audit_popen_result(_snap_fp, _snap_err, sizeof(_snap_err)) : -128;
-                        audit_log_err("snapshot", "zfs", snap_cmd, _snap_rc, _snap_err);
-                    }
-                    if (i == push_count - 1) {
-                        snprintf(local_fs_last, sizeof(local_fs_last), "%s", local_fs);
-                        snprintf(cfs_last, sizeof(cfs_last), "%s", cfs->valuestring);
-                        snprintf(label_last, sizeof(label_last), "%s", lbl->valuestring);
-                        if (create && cJSON_IsTrue(create)) {
-                            char snap_label[128];
-                            snprintf(snap_label, sizeof(snap_label), "%s-%s-%s",
-                                     cfg2.cluster, lbl->valuestring, ts_buf);
+                        char snap_full[512];
+                        snprintf(snap_full, sizeof(snap_full), "%s@%s", local_fs, snap_label);
+
+                        /* Check if snapshot already exists */
+                        char guid_cmd[1024];
+                        snprintf(guid_cmd, sizeof(guid_cmd),
+                                 "zfs get -Hp -o value guid '%s' 2>/dev/null", snap_full);
+                        FILE *_guid_fp = audit_popen(guid_cmd);
+                        if (_guid_fp) {
+                            char _gline[128];
+                            while (fgets(_gline, sizeof(_gline), _guid_fp)) {
+                                char *nl = strchr(_gline, '\n');
+                                if (nl) *nl = '\0';
+                                if (_gline[0]) break;
+                            }
+                            pclose(_guid_fp);
+                            if (_gline[0]) {
+                                /* Snapshot already exists — skip create but still track it */
+                            } else {
+                                /* Does not exist — create it */
+                                char snap_cmd[2048];
+                                snprintf(snap_cmd, sizeof(snap_cmd),
+                                         "zfs snapshot '%s'", snap_full);
+                                zep_log("cron: creating snapshot '%s'\n", snap_label);
+                                char _snap_err[512];
+                                FILE *_snap_fp = audit_popen(snap_cmd);
+                                int _snap_rc = _snap_fp ? audit_popen_result(_snap_fp, _snap_err, sizeof(_snap_err)) : -128;
+                                audit_log_err("snapshot", "zfs", snap_cmd, _snap_rc, _snap_err);
+                            }
+                        }
+
+                        if (i == push_count - 1 && cfg2.cluster[0]) {
+                            snprintf(local_fs_last, sizeof(local_fs_last), "%s", local_fs);
+                            snprintf(cfs_last, sizeof(cfs_last), "%s", cfs->valuestring);
+                            snprintf(label_last, sizeof(label_last), "%s", lbl->valuestring);
                             snprintf(snap_last, sizeof(snap_last), "%s@%s", local_fs, snap_label);
+                        }
+                    } else {
+                        if (i == push_count - 1) {
+                            snprintf(local_fs_last, sizeof(local_fs_last), "%s", local_fs);
+                            snprintf(cfs_last, sizeof(cfs_last), "%s", cfs->valuestring);
+                            snprintf(label_last, sizeof(label_last), "%s", lbl->valuestring);
                         }
                     }
                 }
