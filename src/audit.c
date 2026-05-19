@@ -65,6 +65,7 @@ void zep_air_log(int level, const char *fmt, ...) {
 
     fprintf(stderr, "[%s] %s: ", ts, label);
     vfprintf(stderr, fmt, ap);
+    if (level == LOG_LEVEL_AUDIT) fputc('\n', stderr);
     fflush(stderr);
 
     va_end(ap);

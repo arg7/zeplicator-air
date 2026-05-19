@@ -1,7 +1,7 @@
 #!/bin/bash
 # cluster/cluster-init.sh — initialize a Zeplicator Air cluster
-# Usage: cluster-init.sh [--env <env-file>] [--zfs] [--no-start]
-#        cluster-init.sh <cluster-name> [--zfs] [--no-start]
+# Usage: cluster-init.sh [--env <env-file>] [--zfs] [--no-start] [--resume-test]
+#        cluster-init.sh <cluster-name> [--zfs] [--no-start] [--resume-test]
 #
 # With a cluster name: reads cluster/<name>.env
 # With --env: reads the given env file
@@ -18,16 +18,19 @@ PROJ_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE=""
 DO_ZFS=0
 NO_START=0
+RESUME_TEST=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --env) ENV_FILE="$2"; shift 2 ;;
         --zfs) DO_ZFS=1; shift ;;
         --no-start) NO_START=1; shift ;;
+        --resume-test) RESUME_TEST=1; shift ;;
         -h|--help)
-            echo "Usage: $0 [--env <file>] [--zfs] [--no-start] [<cluster-name>]"
-            echo "  --zfs        Create ZFS pools (requires root, loopback sparse files)"
-            echo "  --no-start   Skip starting server for node registration"
+            echo "Usage: $0 [--env <file>] [--zfs] [--no-start] [--resume-test] [<cluster-name>]"
+            echo "  --zfs            Create ZFS pools (requires root, loopback sparse files)"
+            echo "  --no-start       Skip starting server for node registration"
+            echo "  --resume-test    Configure resume=1, debug injection, and 1MB test file"
             exit 0 ;;
         *)
             if [[ -z "$ENV_FILE" ]]; then
@@ -207,6 +210,21 @@ if [[ "$DO_ZFS" -eq 1 && -n "${ZFS_POOLS:-}" ]]; then
         img="${ZEP_BASE}/${pool}.img"
         [[ -f "$img" ]] && chown "${cn}:${cn}" "$img" 2>/dev/null || true
     done
+
+    # Create 1MB test file on master dataset (only for resume-test)
+    if [[ "$RESUME_TEST" -eq 1 ]]; then
+        local_mnt="${ZEP_BASE}/mnt/za-master-pool/master"
+        # Mount the dataset properly so ZFS tracks the file
+        zfs set mountpoint="${local_mnt}" za-master-pool/master 2>/dev/null || true
+        zfs mount za-master-pool/master 2>/dev/null || true
+        # Ensure ownership
+        chown za-master:za-master "${local_mnt}" 2>/dev/null || true
+        sudo -u za-master dd if=/dev/urandom of="${local_mnt}/testfile" bs=1M count=1 2>/dev/null
+        say "  Created 1MB test file at ${local_mnt}/testfile"
+        # Reset mountpoint
+        zfs umount za-master-pool/master 2>/dev/null || true
+        zfs set mountpoint=none za-master-pool/master 2>/dev/null || true
+    fi
 fi
 
 ###############################################################################
@@ -297,6 +315,12 @@ for entry in ${NODES:-}; do
     "$ZEP" --db "$node_db" config set cluster    "$CLUSTER_NAME"
     "$ZEP" --db "$node_db" config set mapping    "${CLUSTER_POOL:-za-pool-1}/${CLUSTER_FS:-za-data-1}:${poolfs}"
     [[ -z "${KEY_PASSWORD:-}" ]] || "$ZEP" --db "$node_db" config set key_password "$KEY_PASSWORD"
+    # Resume-on test config (only on master node)
+    if [[ "$RESUME_TEST" -eq 1 && "$role" == "master" ]]; then
+        "$ZEP" --db "$node_db" config set resume 1 >/dev/null
+        "$ZEP" --db "$node_db" config set debug_inject_zfs_pipeline_cmd "head -c 200K" >/dev/null
+        say "  Master node ${cn}: resume=1, debug_inject_zfs_pipeline_cmd='head -c 200K'"
+    fi
     id "$cn" &>/dev/null && chown -R "${cn}:${cn}" "$(dirname "$node_db")" 2>/dev/null || true
 done
 
@@ -321,7 +345,46 @@ fi
 echo ""
 echo -e "${GREEN}=== Cluster '${CLUSTER_NAME}' initialized ===${NC}"
 echo ""
-echo "  Configuration: $ENV_FILE"
+###############################################################################
+# 8. Post-init: server-side resume config (optional, use --resume-test)
+###############################################################################
+if [[ "$RESUME_TEST" -eq 1 && "$NO_START" -ne 1 ]]; then
+    say "Configuring server-side resume=1 ..."
+    "$SERV" --port "$SERVER_PORT" \
+        --cert "${PKI_DIR}/server.crt" --key "${PKI_DIR}/server.key" \
+        --ca "${PKI_DIR}/ca.crt" --db "$SERVER_DB" \
+        --storage "$SERVER_STORAGE" 2>/dev/null &
+    RESUME_SERV_PID=$!
+    sleep 2
+    if ! kill -0 "$RESUME_SERV_PID" 2>/dev/null; then
+        echo -e "${RED}Error: resume temp server failed to start${NC}"
+        exit 1
+    fi
+    "$ADMIN" $ADMIN_BASE config set resume 1 >/dev/null
+    say "  resume=1 set on server"
+    kill "$RESUME_SERV_PID" 2>/dev/null || true
+    for i in $(seq 1 10); do
+        kill -0 "$RESUME_SERV_PID" 2>/dev/null || break
+        sleep 1
+    done
+    kill -9 "$RESUME_SERV_PID" 2>/dev/null || true
+    say "  Resume temp server stopped."
+
+    # Create 1MB test file on master (re-init on existing cluster, no --zfs)
+    for entry in ${NODES:-}; do
+        IFS=':' read -r cn role poolfs <<< "$entry"
+        if [[ "$role" != "master" ]]; then continue; fi
+        local_mnt="${ZEP_BASE}/mnt/za-master-pool/master"
+        mkdir -p "$local_mnt" 2>/dev/null || true
+        chown "$cn:$cn" "$local_mnt" 2>/dev/null || true
+        sudo -u "$cn" dd if=/dev/urandom of="${local_mnt}/testfile" bs=1M count=1 2>/dev/null
+        say "  Master node ${cn}: created 1MB test file"
+    done
+fi
+
+###############################################################################
+# 9. Generate cluster.env for cluster-ctl.sh / cluster-destroy.sh
+###############################################################################
 echo "  PKI:           ${PKI_DIR}/"
 echo "  Server DB:     ${SERVER_DB}"
 echo "  Storage:       ${SERVER_STORAGE}"
@@ -335,3 +398,6 @@ echo "  cluster-destroy.sh                # teardown everything"
 echo ""
 echo "Admin commands (no manual --cert/--ca needed):"
 echo "  zep-air-admin --db $admin_db config list"
+echo ""
+echo "For resume=on testing:"
+echo "  $0 ${CLUSTER_NAME:-cluster} --resume-test   # set up resume test environment"

@@ -33,7 +33,7 @@ err_t db_snapshot_insert(sqlite3 *db, const char *cluster, const char *node,
                          const char *snapshot, const char *label,
                          const char *cluster_fs, int blob_count,
                          size_t blob_size, const char *direction,
-                         const char *storage_base);
+                         const char *storage_base, const char *status);
 char *db_snapshot_chain_json(sqlite3 *db, const char *cluster,
                              const char *master_cn,
                              const char *client_guid);

@@ -195,9 +195,9 @@ do_start() {
                 continue
             }
             if [[ -n "$VERB" ]]; then
-                sudo -u "$cn" sh -c "\"$ZEP\" --logging DEBUG,INFO,WARN,ERROR,AUDIT --db \"$node_db\" cron --daemon --interval \"$CRON_INTERVAL\" > /tmp/zep-${cn}.log 2>&1" &
+                nohup sudo -u "$cn" sh -c "\"$ZEP\" --logging DEBUG,INFO,WARN,ERROR,AUDIT --db \"$node_db\" cron --daemon --interval \"$CRON_INTERVAL\" > /tmp/zep-${cn}.log 2>&1" </dev/null >/dev/null 2>&1 &
             else
-                sudo -u "$cn" sh -c "\"$ZEP\" --db \"$node_db\" cron --daemon --interval \"$CRON_INTERVAL\" > /tmp/zep-${cn}.log 2>&1" &
+                nohup sudo -u "$cn" sh -c "\"$ZEP\" --db \"$node_db\" cron --daemon --interval \"$CRON_INTERVAL\" > /tmp/zep-${cn}.log 2>&1" </dev/null >/dev/null 2>&1 &
             fi
         else
             [[ -f "$node_db" ]] || {
@@ -205,14 +205,13 @@ do_start() {
                 continue
             }
             if [[ -n "$VERB" ]]; then
-                "$ZEP" --logging DEBUG,INFO,WARN,ERROR,AUDIT --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" >/tmp/zep-${cn}.log 2>&1 &
+                nohup "$ZEP" --logging DEBUG,INFO,WARN,ERROR,AUDIT --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" </dev/null >/tmp/zep-${cn}.log 2>&1 &
             else
-                "$ZEP" --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" >/tmp/zep-${cn}.log 2>&1 &
+                nohup "$ZEP" --db "$node_db" cron --daemon --interval "$CRON_INTERVAL" </dev/null >/tmp/zep-${cn}.log 2>&1 &
             fi
         fi
         local cpid=$!
         disown $cpid 2>/dev/null || true
-        ( sleep "$NODE_START_TIMEOUT" && kill -0 "$cpid" 2>/dev/null && echo -e "  ${YELLOW}$cn (PID $cpid) still starting after ${NODE_START_TIMEOUT}s — continuing${NC}" >&2 ) &
         cron_pids_file_content="${cron_pids_file_content}${cpid}\n"
         echo -e "  $cn started (PID $cpid)"
     done

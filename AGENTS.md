@@ -17,7 +17,7 @@ sudo apt install gcc make libcurl4-openssl-dev libssl-dev libsqlite3-dev \
 
 make            # three binaries: zep-air, zep-air-serve, zep-air-admin
 
-After modifying sources, always do a **clean stop → install → start** cycle. Do not just restart individual daemons — the old binary remains running under the cron daemon wrapper.
+After modifying sources, always do a clean stop → install → start cycle. Do not just restart individual daemons — the old binary remains running under the cron daemon wrapper. Ensure all binaries are fully stopped before install; otherwise the old binary stays locked.
 
 ```sh
 sudo cluster/cluster-ctl.sh stop

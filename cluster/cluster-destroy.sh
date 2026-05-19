@@ -70,11 +70,8 @@ echo "  Nodes:          ${NODES:-none}"
 echo ""
 
 if [[ "$FORCE" -ne 1 ]]; then
-    read -p "Type 'yes' to confirm: " ans
-    if [[ "$ans" != "yes" ]]; then
-        echo "Aborted."
-        exit 0
-    fi
+    echo "Aborted."
+    exit 0
 fi
 
 ###############################################################################

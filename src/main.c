@@ -335,8 +335,11 @@ int pipeline_pull_ws(const zep_config_t *cfg, const http_config_t *http_cfg,
                      const char *remote_guid, const char *local_guid,
                      sqlite3 *db);
 int pipeline_push_ws(const zep_config_t *cfg, const char *fs,
-                     const char *label, const char *cluster_fs,
-                     sqlite3 *db);
+                      const char *label, const char *cluster_fs,
+                      sqlite3 *db, const char *ext_resume_token);
+int pipeline_push_ws_explicit(const zep_config_t *cfg, const char *snap_name,
+                               const char *cluster_fs, const char *label,
+                               sqlite3 *db, const char *ext_resume_token);
 
 static void *ws_node_pipe_thread(void *arg) {
     zep_config_t *cfg = (zep_config_t *)arg;
@@ -574,28 +577,28 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                 char _pscmd[8192];
                 {
                     char scmd[8192];
-                  if (prt[0]) {
-                         snprintf(scmd, sizeof(scmd),
-                             "zfs send %s -t '%s' 2>/dev/null%s%s%s%s%s%s",
-                             cfg->send_options[0] ? cfg->send_options : "",
-                             prt,
-                             cfg->push_buf_cmd[0] ? " | " : "",
-                             cfg->push_buf_cmd[0] ? cfg->push_buf_cmd : "",
-                             cfg->push_zip_cmd[0] ? " | " : "",
-                             cfg->push_zip_cmd[0] ? cfg->push_zip_cmd : "",
-                             cfg->debug_inject_zfs_pipeline_cmd[0] ? " | " : "",
-                             cfg->debug_inject_zfs_pipeline_cmd[0] ? cfg->debug_inject_zfs_pipeline_cmd : "");
-                     } else {
-                         snprintf(scmd, sizeof(scmd),
-                             "zfs send %s '%s' 2>/dev/null%s%s%s%s%s%s",
-                             cfg->send_options[0] ? cfg->send_options : "",
-                             psnap,
-                             cfg->push_buf_cmd[0] ? " | " : "",
-                             cfg->push_buf_cmd[0] ? cfg->push_buf_cmd : "",
-                             cfg->push_zip_cmd[0] ? " | " : "",
-                             cfg->push_zip_cmd[0] ? cfg->push_zip_cmd : "",
-                             cfg->debug_inject_zfs_pipeline_cmd[0] ? " | " : "",
-                             cfg->debug_inject_zfs_pipeline_cmd[0] ? cfg->debug_inject_zfs_pipeline_cmd : "");
+                 if (prt[0]) {
+                          snprintf(scmd, sizeof(scmd),
+                              "set -o pipefail; exec zfs send %s -t '%s'%s%s%s%s%s%s",
+                              cfg->send_options[0] ? cfg->send_options : "",
+                              prt,
+                              cfg->push_buf_cmd[0] ? " | " : "",
+                              cfg->push_buf_cmd[0] ? cfg->push_buf_cmd : "",
+                              cfg->push_zip_cmd[0] ? " | " : "",
+                              cfg->push_zip_cmd[0] ? cfg->push_zip_cmd : "",
+                              cfg->debug_inject_zfs_pipeline_cmd[0] ? " | " : "",
+                              cfg->debug_inject_zfs_pipeline_cmd[0] ? cfg->debug_inject_zfs_pipeline_cmd : "");
+                      } else {
+                          snprintf(scmd, sizeof(scmd),
+                              "set -o pipefail; exec zfs send %s '%s'%s%s%s%s%s%s",
+                              cfg->send_options[0] ? cfg->send_options : "",
+                              psnap,
+                              cfg->push_buf_cmd[0] ? " | " : "",
+                              cfg->push_buf_cmd[0] ? cfg->push_buf_cmd : "",
+                              cfg->push_zip_cmd[0] ? " | " : "",
+                              cfg->push_zip_cmd[0] ? cfg->push_zip_cmd : "",
+                              cfg->debug_inject_zfs_pipeline_cmd[0] ? " | " : "",
+                              cfg->debug_inject_zfs_pipeline_cmd[0] ? cfg->debug_inject_zfs_pipeline_cmd : "");
                      }
                   send_fp = popen(scmd, "r");
                      zep_log_debug("ws-node: push_ws opened send pipe cmd=%s\n", scmd);
@@ -626,83 +629,93 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                     continue;
                 }
 
-                /* Wait for server response (resume: true/false) */
+                /* Stream pipe data as BIN frames, multiplexed with server WS frames */
                 int push_ws_err = 0;
-                for (;;) {
-                    ssize_t rn = ws_node_recv_frame(conn, out,
-                        WS_NODE_FRAME_MAX, &buf[0]);
-                    if (rn < 0) { push_ws_err = 1; break; }
-                    unsigned char op = buf[0] & 0x0F;
-                    if (op == WS_NODE_OP_CLOSE) { push_ws_err = 1; break; }
-                    if (op == WS_NODE_OP_PING) {
-                        ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)rn);
-                        continue;
-                    }
-                    if (op == WS_NODE_OP_PONG) continue;
-                    if (op == WS_NODE_OP_TEXT && rn > 0) {
-                        /* Server response: {"resume":true,"offset":123} or {"guid":"...","size":...} */
-                        out[rn] = '\0';
-                        cJSON *resp = cJSON_Parse((char *)out);
-                        if (resp) {
-                            cJSON *res = cJSON_GetObjectItem(resp, "resume");
-                            if (res && cJSON_IsTrue(res)) {
-                                cJSON *off = cJSON_GetObjectItem(resp, "offset");
-                                if (off && cJSON_IsNumber(off) && send_fp) {
-                                    /* Server has partial data, skip to offset */
-                                    long skip = (long)off->valuedouble;
-                                    char discard[65536];
-                                    long skipped = 0;
-                                    while (skipped < skip) {
-                                        size_t nr = fread(discard, 1,
-                                            sizeof(discard), send_fp);
-                                        if (nr == 0) break;
-                                        skipped += nr;
-                                    }
-                                    zep_log("push_ws: resuming from offset %ld\n", skip);
-                                }
-                            }
-                            cJSON_Delete(resp);
-                        }
-                        continue;
-                    }
-                    if (op == WS_NODE_OP_BIN && rn > 0 && send_fp) {
-                        if (fwrite(out, 1, (size_t)rn, send_fp) != (size_t)rn) {
-                            zep_log("ws-node: push_ws fwrite failed\n");
-                            push_ws_err = 1;
-                            break;
-                        }
-                        continue;
-                    }
-                    if (op == WS_NODE_OP_EXIT || op == WS_NODE_OP_EOF) break;
-                }
+                int server_done = 0;
+                int resume_skipped = 0;
+                unsigned char *pipe_buf = malloc(WS_NODE_FRAME_MAX);
+                int pipe_eof = 0;
 
-               int send_rc = 0;
+                for (;;) {
+                    fd_set rfds;
+                    FD_ZERO(&rfds);
+                    FD_SET(ws_fd, &rfds);
+                    int maxfd = ws_fd;
+                    struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
+                    if (!server_done) {
+                        int sel = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+                        if (sel < 0 && errno != EINTR) { push_ws_err = 1; break; }
+
+                        if (FD_ISSET(ws_fd, &rfds)) {
+                            ssize_t rn = ws_node_recv_frame(conn, out,
+                                WS_NODE_FRAME_MAX, &buf[0]);
+                            if (rn < 0) { push_ws_err = 1; break; }
+                            unsigned char op = buf[0] & 0x0F;
+                            if (op == WS_NODE_OP_CLOSE) { push_ws_err = 1; break; }
+                            if (op == WS_NODE_OP_PING) {
+                                ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)rn);
+                                continue;
+                            }
+                            if (op == WS_NODE_OP_PONG) continue;
+                            if (op == WS_NODE_OP_TEXT && rn > 0 && !resume_skipped) {
+                                out[rn] = '\0';
+                                cJSON *resp = cJSON_Parse((char *)out);
+                                if (resp) {
+                                    cJSON *res = cJSON_GetObjectItem(resp, "resume");
+                                    if (res && cJSON_IsTrue(res)) {
+                                        cJSON *off = cJSON_GetObjectItem(resp, "offset");
+                                        if (off && cJSON_IsNumber(off) && send_fp && !pipe_eof) {
+                                            long skip = (long)off->valuedouble;
+                                            char discard[65536];
+                                            long skipped = 0;
+                                            while (skipped < skip) {
+                                                size_t nr = fread(discard, 1, sizeof(discard), send_fp);
+                                                if (nr == 0) break;
+                                                skipped += nr;
+                                            }
+                                            zep_log("push_ws: resuming from offset %ld\n", skip);
+                                        }
+                                    }
+                                    resume_skipped = 1;
+                                    cJSON_Delete(resp);
+                                }
+                                continue;
+                            }
+                            if (op == WS_NODE_OP_EXIT || op == WS_NODE_OP_EOF) { server_done = 1; break; }
+                        }
+                    }
+
+                    /* Stream pipe data as BIN frames to server */
+                    if (!server_done && send_fp && !pipe_eof) {
+                        size_t nr = fread(pipe_buf, 1, WS_NODE_FRAME_MAX, send_fp);
+                        if (nr > 0) {
+                            if (ws_node_send_frame(conn, WS_NODE_OP_BIN, pipe_buf, nr) < 0) {
+                                push_ws_err = 1; break;
+                            }
+                        } else {
+                            pipe_eof = 1;
+                        }
+                    }
+
+                    /* If pipe is done and server is done, exit */
+                    if (server_done && pipe_eof) break;
+                    /* If pipe is done, just wait for server DONE */
+                    if (pipe_eof && !server_done) continue;
+                    /* If pipe has data, keep sending */
+                    if (!pipe_eof) continue;
+                    /* Default: spin */
+                }
+                free(pipe_buf);
+
+           /* Close pipe and check exit code */
                 if (send_fp) {
-                    send_rc = pclose(send_fp);
+                    int send_rc = pclose(send_fp);
                     audit_log("push_send", "zfs", _pscmd, WIFEXITED(send_rc) ? WEXITSTATUS(send_rc) : -128);
                     zep_log_debug("ws-node: push_ws send pipe closed rc=%d\n", send_rc);
                 }
 
-                /* Wait for server completion response */
-                int server_done = 0;
-                for (;;) {
-                    ssize_t rn = ws_node_recv_frame(conn, out,
-                        WS_NODE_FRAME_MAX, &buf[0]);
-                    if (rn < 0) break;
-                    unsigned char op = buf[0] & 0x0F;
-                    if (op == WS_NODE_OP_CLOSE) break;
-                    if (op == WS_NODE_OP_PING) {
-                        ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)rn);
-                        continue;
-                    }
-                    if (op == WS_NODE_OP_PONG) continue;
-                    if (op == WS_NODE_OP_EXIT || op == WS_NODE_OP_EOF) {
-                        server_done = 1;
-                        break;
-                    }
-                }
-
-                char pres = (push_ws_err || send_rc != 0 || !server_done) ? 1 : 0;
+                /* server_done was set by the main loop above */
+                char pres = (push_ws_err || server_done != 1) ? 1 : 0;
                 (void)!write(g_push_ws_resp_pipe[1], &pres, 1);
                 continue;
             }
@@ -1336,6 +1349,119 @@ static int cmd_cron(int argc, char *argv[]) {
 
         int tasks_done = 0;
 
+        /* Collect push task pointers for batching (no ownership transfer) */
+        cJSON **push_ptrs = NULL;
+        int push_count = 0;
+        {
+            cJSON *item;
+            int total = cJSON_GetArraySize(tasks);
+            push_ptrs = malloc((size_t)total * sizeof(cJSON *));
+            cJSON_ArrayForEach(item, tasks) {
+                cJSON *action = cJSON_GetObjectItem(item, "action");
+                if (!action || !cJSON_IsString(action) || strcmp(action->valuestring, "push") != 0) continue;
+                cJSON *cfs = cJSON_GetObjectItem(item, "cluster_fs");
+                if (!cfs || !cJSON_IsString(cfs)) continue;
+                cJSON *lbl = cJSON_GetObjectItem(item, "label");
+                if (!lbl || !cJSON_IsString(lbl)) continue;
+                push_ptrs[push_count++] = item;
+            }
+        }
+
+        /* Create snapshots for all create=true push tasks, track last snapshot name */
+        char local_fs_last[ZEP_MAX_SNAPSHOT_NAME] = {0};
+        char cfs_last[ZEP_MAX_PATH] = {0};
+        char label_last[ZEP_MAX_SNAPSHOT_NAME] = {0};
+        char snap_last[ZEP_MAX_PATH] = {0};
+        /* Capture one timestamp for all snapshots (all created within same second) */
+        time_t now = time(NULL);
+        struct tm tm = {0};
+        gmtime_r(&now, &tm);
+        char ts_buf[32];
+        strftime(ts_buf, sizeof(ts_buf), "%Y%m%d%H%M%S", &tm);
+
+        for (int i = 0; i < push_count; i++) {
+            cJSON *p = push_ptrs[i];
+            cJSON *lbl = cJSON_GetObjectItem(p, "label");
+            cJSON *cfs = cJSON_GetObjectItem(p, "cluster_fs");
+            char local_fs[ZEP_MAX_SNAPSHOT_NAME];
+
+            if (db_open(g_db_path, &db) == ZEP_ERR_OK) {
+                db_init_tables(db);
+                zep_config_t cfg2;
+                db_config_load(db, &cfg2);
+                if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
+                                        local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
+                    cJSON *create = cJSON_GetObjectItem(p, "create");
+                    if (create && cJSON_IsTrue(create) && cfg2.cluster[0]) {
+                        char snap_label[128];
+                        snprintf(snap_label, sizeof(snap_label), "%s-%s-%s",
+                                 cfg2.cluster, lbl->valuestring, ts_buf);
+                        char snap_cmd[2048];
+                        snprintf(snap_cmd, sizeof(snap_cmd),
+                                 "zfs snapshot '%s@%s'", local_fs, snap_label);
+                        zep_log("cron: creating snapshot '%s'\n", snap_label);
+                        char _snap_err[512];
+                        FILE *_snap_fp = audit_popen(snap_cmd);
+                        int _snap_rc = _snap_fp ? audit_popen_result(_snap_fp, _snap_err, sizeof(_snap_err)) : -128;
+                        audit_log_err("snapshot", "zfs", snap_cmd, _snap_rc, _snap_err);
+                    }
+                    if (i == push_count - 1) {
+                        snprintf(local_fs_last, sizeof(local_fs_last), "%s", local_fs);
+                        snprintf(cfs_last, sizeof(cfs_last), "%s", cfs->valuestring);
+                        snprintf(label_last, sizeof(label_last), "%s", lbl->valuestring);
+                        if (create && cJSON_IsTrue(create)) {
+                            char snap_label[128];
+                            snprintf(snap_label, sizeof(snap_label), "%s-%s-%s",
+                                     cfg2.cluster, lbl->valuestring, ts_buf);
+                            snprintf(snap_last, sizeof(snap_last), "%s@%s", local_fs, snap_label);
+                        }
+                    }
+                }
+                db_close(db);
+            }
+        }
+
+        /* Push only the last task (most recent snapshot), ack all */
+        for (int i = 0; i < push_count; i++) {
+            cJSON *p = push_ptrs[i];
+            cJSON *lbl = cJSON_GetObjectItem(p, "label");
+            cJSON *cfs = cJSON_GetObjectItem(p, "cluster_fs");
+            char local_fs[ZEP_MAX_SNAPSHOT_NAME];
+            if (db_open(g_db_path, &db) == ZEP_ERR_OK) {
+                db_init_tables(db);
+                zep_config_t cfg2;
+                db_config_load(db, &cfg2);
+                if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
+                                        local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
+                    char ext_resume_token[ZEP_MAX_LINE] = {0};
+                    cJSON *rto = cJSON_GetObjectItem(p, "resume_token");
+                    if (rto && cJSON_IsString(rto) && rto->valuestring[0]) {
+                        snprintf(ext_resume_token, sizeof(ext_resume_token),
+                                 "%s", rto->valuestring);
+                    }
+                    if (i == push_count - 1 && cfg2.cluster[0] && snap_last[0]) {
+                        /* Use explicit snapshot name to avoid ZFS -S creation
+                         * tiebreaking when multiple snapshots share the same
+                         * second timestamp */
+                        pipeline_push_ws_explicit(&cfg2, snap_last,
+                                         cfs_last, lbl->valuestring,
+                                         db, ext_resume_token[0] ? ext_resume_token : NULL);
+                    }
+                    tasks_done++;
+                    {
+                        char body[512];
+                        snprintf(body, sizeof(body),
+                                 "{\"label\":\"%s\",\"cluster_fs\":\"%s\"}",
+                                 lbl->valuestring, cfs->valuestring);
+                        http_post_json(&http_cfg, "/v1/cron/ack", body);
+                    }
+                }
+                db_close(db);
+            }
+        }
+
+        free(push_ptrs);
+
         cJSON *task;
         cJSON_ArrayForEach(task, tasks) {
             cJSON *action = cJSON_GetObjectItem(task, "action");
@@ -1351,46 +1477,7 @@ static int cmd_cron(int argc, char *argv[]) {
             if (strcmp(action->valuestring, "push") == 0 &&
                 cfs && cJSON_IsString(cfs) &&
                 label && cJSON_IsString(label)) {
-                char local_fs[ZEP_MAX_SNAPSHOT_NAME];
-                if (db_open(g_db_path, &db) == ZEP_ERR_OK) {
-                    db_init_tables(db);
-                    zep_config_t cfg2;
-                    db_config_load(db, &cfg2);
-                    if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
-                                            local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
-                        /* Create snapshot if server requests it (first push per label) */
-                        cJSON *create = cJSON_GetObjectItem(task, "create");
-                        if (create && cJSON_IsTrue(create) && cfg2.cluster[0]) {
-                            char ts_buf[32];
-                            time_t now = time(NULL);
-                            struct tm tm = {0};
-                            gmtime_r(&now, &tm);
-                            strftime(ts_buf, sizeof(ts_buf), "%Y%m%d%H%M%S", &tm);
-                            char snap_label[128];
-                            snprintf(snap_label, sizeof(snap_label), "%s-%s-%s",
-                                     cfg2.cluster, label->valuestring, ts_buf);
-                           char snap_cmd[2048];
-                             snprintf(snap_cmd, sizeof(snap_cmd),
-                                      "zfs snapshot '%s@%s'", local_fs, snap_label);
-                             zep_log("cron: creating snapshot '%s'\n", snap_label);
-                             char _snap_err[512];
-                              FILE *_snap_fp = audit_popen(snap_cmd);
-                              int _snap_rc = _snap_fp ? audit_popen_result(_snap_fp, _snap_err, sizeof(_snap_err)) : -128;
-                              audit_log_err("snapshot", "zfs", snap_cmd, _snap_rc, _snap_err);
-                        }
-                       pipeline_push_ws(&cfg2, local_fs, label->valuestring,
-                                          cfs->valuestring, db);
-                        tasks_done++;
-                        {
-                            char body[512];
-                            snprintf(body, sizeof(body),
-                                     "{\"label\":\"%s\",\"cluster_fs\":\"%s\"}",
-                                     label->valuestring, cfs->valuestring);
-                            http_post_json(&http_cfg, "/v1/cron/ack", body);
-                        }
-                    }
-                    db_close(db);
-                }
+                /* Already handled above — skip */
             } else if (strcmp(action->valuestring, "sync") == 0 &&
                        cfs && cJSON_IsString(cfs)) {
                 cJSON *donor = cJSON_GetObjectItem(task, "donor");
@@ -1451,7 +1538,6 @@ static int cmd_cron(int argc, char *argv[]) {
                             "zfs list -Hp -t snapshot -o name '%s' 2>/dev/null",
                             local_fs);
                         FILE *fp = popen(cmd, "r");
-                        audit_log("inventory", "zfs", cmd, fp ? -128 : -127);
                         if (fp) {
                             char line[ZEP_MAX_SNAPSHOT_NAME];
                             while (fgets(line, sizeof(line), fp)) {
@@ -1472,25 +1558,28 @@ static int cmd_cron(int argc, char *argv[]) {
                                     }
                                 }
                                 char gbuf[ZEP_MAX_GUID_LEN] = {0};
-                             char _guid_err[512];
-                                 FILE *gp = audit_popen(cmd);
-                                 if (gp) {
-                                     if (fgets(gbuf, sizeof(gbuf), gp)) {
-                                         size_t gl = strlen(gbuf);
-                                         while (gl > 0 && (gbuf[gl-1] == '\n' || gbuf[gl-1] == '\r'))
-                                             gbuf[--gl] = '\0';
-                                     }
-                                     int _guid_rc = audit_popen_result(gp, _guid_err, sizeof(_guid_err));
-                                     audit_log_err("inventory_guid", "zfs", cmd, _guid_rc, _guid_err);
-                                 }
+                                char guid_cmd[2048], _guid_err[512];
+                                snprintf(guid_cmd, sizeof(guid_cmd),
+                                    "zfs get -Hp -o value guid '%s' 2>/dev/null", line);
+                                FILE *gp = audit_popen(guid_cmd);
+                                if (gp) {
+                                    if (fgets(gbuf, sizeof(gbuf), gp)) {
+                                        size_t gl = strlen(gbuf);
+                                        while (gl > 0 && (gbuf[gl-1] == '\n' || gbuf[gl-1] == '\r'))
+                                            gbuf[--gl] = '\0';
+                                    }
+                                    int _guid_rc = audit_popen_result(gp, _guid_err, sizeof(_guid_err));
+                                    audit_log_err("inventory_guid", "zfs", guid_cmd, _guid_rc, _guid_err);
+                                }
                                 cJSON *sn = cJSON_CreateObject();
                                 cJSON_AddStringToObject(sn, "guid", gbuf);
                                 cJSON_AddStringToObject(sn, "snapshot", line);
                                 cJSON_AddStringToObject(sn, "label", label);
                                 cJSON_AddItemToArray(snaps, sn);
                             }
-                            pclose(fp);
-                        }
+                            int list_rc = pclose(fp);
+                            audit_log("inventory_list", "zfs", cmd, WIFEXITED(list_rc) ? WEXITSTATUS(list_rc) : -128);
+                            }
                         cJSON *inv = cJSON_CreateObject();
                         cJSON_AddStringToObject(inv, "cluster_fs", cfs->valuestring);
                         cJSON_AddItemToObject(inv, "snapshots", snaps);
@@ -1816,93 +1905,102 @@ int pipeline_resume_request(const char *guid, const char *token, const char *fs)
 }
 
 int pipeline_push_ws(const zep_config_t *cfg, const char *fs,
-                     const char *label, const char *cluster_fs,
-                     sqlite3 *db) {
-     (void)cfg; (void)fs; (void)db;
-     if (g_push_ws_req_pipe[1] < 0) return 1;
+                      const char *label, const char *cluster_fs,
+                      sqlite3 *db, const char *ext_resume_token) {
+      (void)cfg; (void)db;
+      char snap_name[1024] = {0};
+      char guid_str[ZEP_MAX_GUID_LEN] = {0};
 
-     char snap_name[ZEP_MAX_SNAPSHOT_NAME] = {0};
-     char guid[ZEP_MAX_GUID_LEN] = {0};
-     char cmd[1024];
+      /* Find latest snapshot for this filesystem */
+      char cmd[1024];
+      snprintf(cmd, sizeof(cmd), "zfs list -Hp -t snapshot -o name,guid -S creation '%s' 2>/dev/null", fs);
+      FILE *p = popen(cmd, "r");
+      if (p) {
+          char line[1024];
+          while (fgets(line, sizeof(line), p)) {
+              char *tab = strchr(line, '\t');
+              if (!tab) continue;
+              *tab = '\0';
+              size_t fslen = strlen(fs);
+              if (strncmp(line, fs, fslen) == 0 && line[fslen] == '@') {
+                  char *g = tab + 1;
+                  size_t gl = strlen(g);
+                  while (gl > 0 && (g[gl-1]=='\n'||g[gl-1]=='\r')) g[--gl]='\0';
+                  if (guid_str[0]) continue;
+                  snprintf(guid_str, sizeof(guid_str), "%s", g);
+                  snprintf(snap_name, sizeof(snap_name), "%s", line);
+                  break;
+              }
+          }
+          pclose(p);
+      }
+      if (!guid_str[0]) {
+          zep_log("push_ws: no snapshot guid found for fs=%s\n", fs);
+          return 1;
+      }
 
-     /* Find latest snapshot for this filesystem */
-     snprintf(cmd, sizeof(cmd), "zfs list -Hp -t snapshot -o name,guid '%s' 2>/dev/null", fs);
-     FILE *p = popen(cmd, "r");
-     if (p) {
-         char line[1024];
-         while (fgets(line, sizeof(line), p)) {
-             char *tab = strchr(line, '\t');
-             if (!tab) continue;
-             *tab = '\0';
-             size_t fslen = strlen(fs);
-             if (strncmp(line, fs, fslen) == 0 && line[fslen] == '@') {
-                 char *g = tab + 1;
-                 size_t gl = strlen(g);
-                 while (gl > 0 && (g[gl-1]=='\n'||g[gl-1]=='\r')) g[--gl]='\0';
-                 snprintf(guid, sizeof(guid), "%s", g);
-                 char *at = strchr(line, '@');
-                 if (at) {
-                     size_t slen = strlen(at);
-                     while (slen > 0 && (at[slen-1]=='\n'||at[slen-1]=='\r')) at[--slen]='\0';
-                     snprintf(snap_name, sizeof(snap_name), "%s", at);
-                 }
-                 break;
-             }
-         }
-         pclose(p);
-     }
-     if (!guid[0]) {
-         zep_log("push_ws: no snapshot guid found for fs=%s\n", fs);
-         return 1;
-     }
+      /* Dispatch with found snapshot */
+      (void)g_push_ws_req_pipe[1];
+      pthread_mutex_lock(&g_push_ws_lock);
+      snprintf(g_push_ws_req.guid, sizeof(g_push_ws_req.guid), "%s", guid_str);
+      snprintf(g_push_ws_req.base_guid, sizeof(g_push_ws_req.base_guid), "%s", "");
+      snprintf(g_push_ws_req.snapshot, sizeof(g_push_ws_req.snapshot), "%s", snap_name);
+      snprintf(g_push_ws_req.label, sizeof(g_push_ws_req.label), "%s", label ? label : "");
+      snprintf(g_push_ws_req.cluster_fs, sizeof(g_push_ws_req.cluster_fs), "%s", cluster_fs ? cluster_fs : "");
+      g_push_ws_req.stream_size = 0;
+      if (ext_resume_token && ext_resume_token[0])
+          snprintf(g_push_ws_req.resume_token, sizeof(g_push_ws_req.resume_token), "%s", ext_resume_token);
+      else
+          g_push_ws_req.resume_token[0] = '\0';
+      g_push_ws_req.ready = 1;
+      pthread_mutex_unlock(&g_push_ws_lock);
+      (void)!write(g_push_ws_req_pipe[1], "!", 1);
+      char res;
+      ssize_t r = read(g_push_ws_resp_pipe[0], &res, 1);
+      if (r == 1) return (int)res;
+      return 1;
+}
 
-     /* Check for resume */
-     char resume_token[ZEP_MAX_LINE] = {0};
-     if (cfg->resume && db) {
-         char state_key[320];
-         snprintf(state_key, sizeof(state_key), "push_ws_state_%s", guid);
-         char state_buf[ZEP_MAX_LINE * 2];
-         if (db_config_get(db, state_key, state_buf, sizeof(state_buf)) == ZEP_ERR_OK
-             && state_buf[0]) {
-             char offset_str[ZEP_MAX_LINE] = {0};
-             char *save = NULL, *st = strdup(state_buf);
-             if (st) {
-                 char *tok = strtok_r(st, ":", &save);
-                 if (tok) snprintf(offset_str, sizeof(offset_str), "%s", tok);
-                 free(st);
-             }
-             if (offset_str[0]) {
-                 char tok_cmd[2048];
-                 snprintf(tok_cmd, sizeof(tok_cmd),
-                     "zstream token -g -i /tmp/zep-push-%s.stream 2>/dev/null", guid);
-                 FILE *pp = popen(tok_cmd, "r");
-                 if (pp) {
-                     if (fgets(resume_token, sizeof(resume_token), pp)) {
-                         size_t tn = strlen(resume_token);
-                         while (tn > 0 && (resume_token[tn-1]=='\n'||resume_token[tn-1]=='\r')) resume_token[--tn]='\0';
-                     }
-                     pclose(pp);
-                 }
-             }
-         }
-     }
+int pipeline_push_ws_explicit(const zep_config_t *cfg, const char *snap_name,
+                               const char *cluster_fs, const char *label,
+                               sqlite3 *db, const char *ext_resume_token) {
+      (void)cfg; (void)db;
+      if (g_push_ws_req_pipe[1] < 0) return 1;
 
-     pthread_mutex_lock(&g_push_ws_lock);
-     snprintf(g_push_ws_req.guid, sizeof(g_push_ws_req.guid), "%s", guid);
-     snprintf(g_push_ws_req.base_guid, sizeof(g_push_ws_req.base_guid), "%s", "");
-     snprintf(g_push_ws_req.snapshot, sizeof(g_push_ws_req.snapshot), "%s", snap_name);
-     snprintf(g_push_ws_req.label, sizeof(g_push_ws_req.label), "%s", label ? label : "");
-     snprintf(g_push_ws_req.cluster_fs, sizeof(g_push_ws_req.cluster_fs), "%s", cluster_fs ? cluster_fs : "");
-     g_push_ws_req.stream_size = 0;
-     snprintf(g_push_ws_req.resume_token, sizeof(g_push_ws_req.resume_token), "%s", resume_token);
-     g_push_ws_req.ready = 1;
-     pthread_mutex_unlock(&g_push_ws_lock);
+      char guid[ZEP_MAX_GUID_LEN] = {0};
+      char cmd[1024];
+      snprintf(cmd, sizeof(cmd),
+          "zfs get -Hp -o value guid '%s' 2>/dev/null", snap_name);
+      FILE *p = popen(cmd, "r");
+      if (p) {
+          if (fgets(guid, sizeof(guid), p)) {
+              size_t gl = strlen(guid);
+              while (gl > 0 && (guid[gl-1]=='\n'||guid[gl-1]=='\r')) guid[--gl]='\0';
+          }
+          pclose(p);
+      }
+      if (!guid[0]) {
+          zep_log("push_ws_explicit: no guid found for snap=%s\n", snap_name);
+          return 1;
+      }
 
-     (void)!write(g_push_ws_req_pipe[1], "!", 1);
-
-     char res;
-     ssize_t r = read(g_push_ws_resp_pipe[0], &res, 1);
-     if (r == 1) return (int)res;
-     return 1;
+      pthread_mutex_lock(&g_push_ws_lock);
+      snprintf(g_push_ws_req.guid, sizeof(g_push_ws_req.guid), "%s", guid);
+      snprintf(g_push_ws_req.base_guid, sizeof(g_push_ws_req.base_guid), "%s", "");
+      snprintf(g_push_ws_req.snapshot, sizeof(g_push_ws_req.snapshot), "%s", snap_name);
+      snprintf(g_push_ws_req.label, sizeof(g_push_ws_req.label), "%s", label ? label : "");
+      snprintf(g_push_ws_req.cluster_fs, sizeof(g_push_ws_req.cluster_fs), "%s", cluster_fs ? cluster_fs : "");
+      g_push_ws_req.stream_size = 0;
+      if (ext_resume_token && ext_resume_token[0])
+          snprintf(g_push_ws_req.resume_token, sizeof(g_push_ws_req.resume_token), "%s", ext_resume_token);
+      else
+          g_push_ws_req.resume_token[0] = '\0';
+      g_push_ws_req.ready = 1;
+      pthread_mutex_unlock(&g_push_ws_lock);
+      (void)!write(g_push_ws_req_pipe[1], "!", 1);
+      char res;
+      ssize_t r = read(g_push_ws_resp_pipe[0], &res, 1);
+      if (r == 1) return (int)res;
+      return 1;
 }
 
