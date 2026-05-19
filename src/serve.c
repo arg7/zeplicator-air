@@ -241,6 +241,33 @@ static struct node_ws *node_ws_register(const char *cn, int sock) {
     return nw;
 }
 
+static void node_ws_shutdown(void) {
+    pthread_mutex_lock(&g_node_ws_lock);
+    for (struct node_ws *nw = g_node_ws; nw; nw = nw->next) {
+        pthread_mutex_lock(&nw->lock);
+        nw->ws_closed = 1;
+        nw->pipe_starting = 1;
+        pthread_cond_signal(&nw->pipe_ready);
+        pthread_mutex_unlock(&nw->lock);
+    }
+    pthread_mutex_unlock(&g_node_ws_lock);
+
+    pthread_mutex_lock(&g_node_ws_lock);
+    for (struct node_ws *nw = g_node_ws; nw; nw = nw->next) {
+        if (nw->thread) {
+            pthread_join(nw->thread, NULL);
+            nw->thread = 0;
+        }
+        if (nw->pipe_admin_to_node[0] >= 0) close(nw->pipe_admin_to_node[0]);
+        if (nw->pipe_admin_to_node[1] >= 0) close(nw->pipe_admin_to_node[1]);
+        if (nw->pipe_node_to_admin[0] >= 0) close(nw->pipe_node_to_admin[0]);
+        if (nw->pipe_node_to_admin[1] >= 0) close(nw->pipe_node_to_admin[1]);
+        pthread_mutex_destroy(&nw->lock);
+        pthread_cond_destroy(&nw->pipe_ready);
+    }
+    pthread_mutex_unlock(&g_node_ws_lock);
+}
+
 static void node_ws_unregister(struct node_ws *target) {
     pthread_mutex_lock(&g_node_ws_lock);
     struct node_ws *prev = NULL, *nw = g_node_ws;
@@ -466,7 +493,7 @@ static void *node_ws_thread(void *arg) {
 
     unsigned char *buf = malloc(WS_SUBCHUNK + 256);
     unsigned char *out = malloc(WS_SUBCHUNK);
-    if (!buf || !out) { free(buf); free(out); MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return NULL; }
+    if (!buf || !out) { free(buf); free(out); return NULL; }
 
     if (g_logging & LOG_LEVEL_DEBUG) {
         zep_log_debug("ws: node %s listening sock=%d\n", nw->cn, nw->sock);
@@ -2857,8 +2884,11 @@ zep_log_debug("config set: key=%s body_len=%zu body=%.*s\n",
 
 static void sig_handler(int sig) {
     (void)sig;
-    if (g_daemon) MHD_stop_daemon(g_daemon);
-    g_daemon = NULL;
+    if (g_daemon) {
+        node_ws_shutdown();
+        MHD_stop_daemon(g_daemon);
+        g_daemon = NULL;
+    }
 }
 
 static int load_pem(const char *path, char **data) {
@@ -3142,6 +3172,7 @@ case 'v': g_logging = LOG_LEVEL_ALL; break;  /* -v for backwards compat: show al
     }
 
     printf("\nServer stopped.\n");
+    node_ws_shutdown();
     db_close(g_db);
    ;
     return 0;
