@@ -420,13 +420,15 @@ static void *ws_node_pipe_thread(void *arg) {
                             memcpy(label, d1, ll);
                             label[ll] = '\0';
                         }
+                        /* Skip snapshots without a proper label (cluster must be followed by label then timestamp) */
+                        if (!label[0]) continue;
                         char guid[ZEP_MAX_GUID_LEN] = {0};
                         char *tab = strchr(line, '\t');
                         if (tab) {
                             *tab = '\0';
                             snprintf(guid, sizeof(guid), "%s", tab + 1);
                         }
-                        if (guid[0] && label[0]) {
+                        if (guid[0]) {
                             cJSON *sn = cJSON_CreateObject();
                             cJSON_AddStringToObject(sn, "guid", guid);
                             cJSON_AddStringToObject(sn, "snapshot", line);
