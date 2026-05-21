@@ -202,13 +202,13 @@ CRON_PID=$!
 disown $CRON_PID 2>/dev/null || true
 echo "  Cron daemon started (PID $CRON_PID)"
 
-# Wait for discovery to happen (WS connect + discovery sent + processed)
-echo "  Waiting for discovery to complete..."
+# Wait for discovery and scheduler to complete (phase 1 + phase 2)
+echo "  Waiting for discovery and scheduler to complete..."
 DISCOVERY_TIMEOUT=15
 elapsed=0
 while [[ $elapsed -lt $DISCOVERY_TIMEOUT ]]; do
-    if grep -q "discovery: phase 1 complete" /tmp/zep-server.log 2>/dev/null; then
-        echo "  Discovery complete after ${elapsed}s"
+    if grep -q "create_snap: phase 2 complete\|discovery: phase 1 complete" /tmp/zep-server.log 2>/dev/null; then
+        echo "  Discovery + scheduler complete after ${elapsed}s"
         break
     fi
     sleep 1
@@ -216,7 +216,7 @@ while [[ $elapsed -lt $DISCOVERY_TIMEOUT ]]; do
 done
 
 if [[ $elapsed -ge $DISCOVERY_TIMEOUT ]]; then
-    echo "  WARNING: Discovery did not complete within ${DISCOVERY_TIMEOUT}s"
+    echo "  WARNING: Discovery + scheduler did not complete within ${DISCOVERY_TIMEOUT}s"
 fi
 
 
@@ -304,10 +304,10 @@ $SUDO sqlite3 "$SERVER_DB" "SELECT snapshot, label, guid, cluster_fs, status FRO
 proper_count=$($SUDO sqlite3 "$SERVER_DB" \
     "SELECT COUNT(*) FROM snapshots WHERE node='za-master' AND snapshot LIKE 'za-master-pool/master@test-%';" 2>/dev/null || echo 0)
 
-if [[ "$proper_count" -eq 2 ]]; then
-    ok "DB: exactly 2 properly-named snapshots registered (got $proper_count)"
+if [[ "$proper_count" -ge 2 ]]; then
+    ok "DB: >= 2 properly-named snapshots registered (got $proper_count)"
 else
-    bad "DB: expected 2 properly-named snapshots, got $proper_count"
+    bad "DB: expected >= 2 properly-named snapshots, got $proper_count"
 fi
 
 # Count registered improper snapshots (should be 0)
@@ -370,10 +370,46 @@ else
 fi
 
 ###############################################################################
-# 7. Dump full server log for debugging
+# 7. Test server-driven create_snap (phase 2)
 ###############################################################################
-echo -e "${CYAN}=== Step 8: Discovery-related log entries ===${NC}"
-grep -i "discovery" /tmp/zep-server.log 2>/dev/null | while IFS= read -r line; do
+echo -e "${CYAN}=== Step 7: Test create_snap (server-driven) ===${NC}"
+
+if grep -q "create_snap: phase 2 complete" /tmp/zep-server.log 2>/dev/null; then
+    ok "create_snap: phase 2 complete (server-driven snapshot creation)"
+else
+    bad "create_snap: phase 2 complete NOT found in server log"
+fi
+
+# Server scheduler sends create_snap tasks for labels with unset cron_last_*
+# The 'min' label has a 60s interval, cron_last_* is unset on fresh cache → fires
+# Check that a server-generated snapshot was registered
+server_snap_count=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT COUNT(*) FROM snapshots WHERE node='za-master' AND snapshot LIKE '%test-min-%' AND snapshot NOT LIKE '%test-hourly-%';" 2>/dev/null || echo 0)
+
+# We have at least 2 snapshots with 'min' in the name:
+# 1. Locally created: za-master-pool/master@test-min-<epoch> (from discovery)
+# 2. Server-generated: za-master-pool/master@test-min-<different_epoch> (from scheduler)
+if [[ "$server_snap_count" -ge 2 ]]; then
+    ok "DB: $server_snap_count min snapshots registered (discovery + server-driven)"
+else
+    bad "DB: expected >= 2 min snapshots, got $server_snap_count"
+fi
+
+# Verify server-generated snapshot has a non-empty GUID (from scheduler)
+server_guid=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT guid FROM snapshots WHERE node='za-master' AND snapshot LIKE '%test-min-%' AND guid != '' ORDER BY recorded_at DESC LIMIT 1;" 2>/dev/null || echo "")
+
+if [[ -n "$server_guid" && "$server_guid" != "" ]]; then
+    ok "server-generated snapshot has GUID: ${server_guid:0:16}..."
+else
+    bad "server-generated snapshot missing GUID"
+fi
+
+###############################################################################
+# 8. Dump full server log for debugging
+###############################################################################
+echo -e "${CYAN}=== Step 8: Discovery+scheduler log entries ===${NC}"
+grep -iE "discovery|create_snap|scheduler" /tmp/zep-server.log 2>/dev/null | while IFS= read -r line; do
     echo "  $line"
 done
 

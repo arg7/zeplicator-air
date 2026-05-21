@@ -1212,41 +1212,41 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                 }
                                 char cmd[4096];
                                 snprintf(cmd, sizeof(cmd),
-                                    "zfs snapshot -g '%s' '%s' 2>&1",
-                                    guid, local_snap);
+                                    "zfs snapshot -g 'guid' '%s' 2>&1",
+                                    local_snap);
                                zep_log("create_snap: %s\n", cmd);
 
-                                /* Run snapshot command, capture stderr for errors */
+                                /* Run snapshot command, capture stdout for guid */
                                 FILE *fp = popen(cmd, "r");
-                                char stderr_buf[1024] = {0};
+                                char stdout_buf[64] = {0};
+                                char real_guid[33] = {0};
+                                int exit_code = -1;
                                 if (fp) {
-                                    char tmp[64];
-                                    size_t en = 0;
-                                    while (fgets(tmp, sizeof(tmp), fp)) {
-                                        size_t tl = strlen(tmp);
-                                        if (en < sizeof(stderr_buf) - 1) {
-                                            memcpy(stderr_buf + en, tmp, tl);
-                                            en += tl;
+                                    if (fgets(stdout_buf, (int)sizeof(stdout_buf), fp)) {
+                                        size_t len = strlen(stdout_buf);
+                                        while (len > 0 && (stdout_buf[len-1]=='\n'||stdout_buf[len-1]=='\r'))
+                                            stdout_buf[--len] = '\0';
+                                        if (stdout_buf[0]) {
+                                            snprintf(real_guid, sizeof(real_guid), "%s", stdout_buf);
                                         }
                                     }
                                     int rc = pclose(fp);
-                                    int exit_code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
-                                    zep_log("create_snap: rc=%d stderr=%s\n",
-                                        exit_code, stderr_buf);
+                                    exit_code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+                                    zep_log("create_snap: rc=%d guid=%s\n",
+                                        exit_code, real_guid);
 
-                                    /* zfs snapshot -g uses the client-provided GUID */
                                     char resp[512];
                                     int rn = snprintf(resp, sizeof(resp),
-                                        "{\"action\":\"create_snap\",\"snapshot\":\"%s\",\"guid\":\"%s\",\"rc\":%d}",
-                                        snap, guid, exit_code);
+                                        "{\"action\":\"create_snap\",\"guid\":\"%s\",\"rc\":%d}",
+                                        real_guid[0] ? real_guid : guid, exit_code);
                                     ws_node_send_frame(conn, WS_NODE_OP_TEXT,
                                         (unsigned char *)resp, (size_t)rn);
                                 } else {
                                     zep_log("create_snap: popen failed\n");
                                     char resp[256];
                                     int rn = snprintf(resp, sizeof(resp),
-                                        "{\"action\":\"create_snap\",\"snapshot\":\"%s\",\"guid\":\"%s\",\"rc\":1}",
-                                        snap, guid);
+                                        "{\"action\":\"create_snap\",\"guid\":\"%s\",\"rc\":1}",
+                                        guid);
                                     ws_node_send_frame(conn, WS_NODE_OP_TEXT,
                                         (unsigned char *)resp, (size_t)rn);
                                 }

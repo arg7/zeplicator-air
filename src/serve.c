@@ -509,6 +509,12 @@ static void *node_ws_thread(void *arg) {
     /* Track if discovery has been received from node */
     int discovery_done = 0;
 
+    /* Pending create_snap task queue (FIFO) */
+    #define MAX_PENDING 8
+    char pending_snaps[MAX_PENDING][ZEP_MAX_SNAPSHOT_NAME];
+    char pending_labels[MAX_PENDING][64];
+    int pending_head = 0, pending_tail = 0;
+
     /* Query node role for scheduler */
     char role_buf[16] = {0}, cluster_buf[64] = {0}, mapping_buf[2048] = {0};
     {
@@ -591,13 +597,18 @@ static void *node_ws_thread(void *arg) {
                                     "%s@%s-%s-%lu",
                                     cluster_fs, cluster_buf, ln, (unsigned long)now);
 
-                                /* Skip if snapshot already exists in DB */
+                                /* Skip if snapshot already exists in DB (check by label+timestamp suffix) */
                                 {
                                     sqlite3_stmt *chk = NULL;
-                                    if (sqlite3_prepare_v2(g_db,
-                                            "SELECT 1 FROM snapshots WHERE snapshot=?1 LIMIT 1",
-                                            -1, &chk, NULL) == SQLITE_OK) {
-                                        sqlite3_bind_text(chk, 1, snap_name, -1, SQLITE_STATIC);
+                                    char suffix[256];
+                                    snprintf(suffix, sizeof(suffix), "@%s-%s-%lu",
+                                        cluster_buf, ln, (unsigned long)now);
+                                    char chk_sql[1024];
+                                    snprintf(chk_sql, sizeof(chk_sql),
+                                        "SELECT 1 FROM snapshots WHERE node=?1 AND snapshot LIKE '%%%s%%'",
+                                        suffix);
+                                    if (sqlite3_prepare_v2(g_db, chk_sql, -1, &chk, NULL) == SQLITE_OK) {
+                                        sqlite3_bind_text(chk, 1, nw->cn, -1, SQLITE_STATIC);
                                         if (sqlite3_step(chk) == SQLITE_ROW) {
                                             sqlite3_finalize(chk);
                                             continue; /* already exists */
@@ -631,6 +642,11 @@ static void *node_ws_thread(void *arg) {
                                 if (n > 0 && n < (int)sizeof(task_json)) {
                                     zep_log("scheduler: create_snap %s (label=%s, interval=%ds)\n",
                                         snap_name, ln, interval_sec);
+                                    if (pending_tail < MAX_PENDING) {
+                                        snprintf(pending_snaps[pending_tail], ZEP_MAX_SNAPSHOT_NAME, "%s", snap_name);
+                                        snprintf(pending_labels[pending_tail], sizeof(pending_labels[0]), "%s", ln);
+                                        pending_tail++;
+                                    }
                                     ws_send_frame_gtls(nw, WS_OP_TEXT,
                                         (unsigned char *)task_json, (size_t)n);
                                 }
@@ -714,6 +730,11 @@ static void *node_ws_thread(void *arg) {
                             if (n > 0 && n < (int)sizeof(task_json)) {
                                 zep_log("scheduler: create_snap %s (label=%s, interval=%ds)\n",
                                     snap_name, ln, interval_sec);
+                                if (pending_tail < MAX_PENDING) {
+                                    snprintf(pending_snaps[pending_tail], ZEP_MAX_SNAPSHOT_NAME, "%s", snap_name);
+                                    snprintf(pending_labels[pending_tail], sizeof(pending_labels[0]), "%s", ln);
+                                    pending_tail++;
+                                }
                                 ws_send_frame_gtls(nw, WS_OP_TEXT,
                                     (unsigned char *)task_json, (size_t)n);
                             }
@@ -1397,92 +1418,58 @@ static void *node_ws_thread(void *arg) {
                          zep_log("create_snap: RX response from %s\n", nw->cn);
                          cJSON *guid_j = cJSON_GetObjectItem(msg, "guid");
                          cJSON *rc_j = cJSON_GetObjectItem(msg, "rc");
-                         cJSON *snap_j = cJSON_GetObjectItem(msg, "snapshot");
                          if (rc_j && cJSON_IsNumber(rc_j) && rc_j->valueint == 0 &&
                              guid_j && cJSON_IsString(guid_j) &&
-                             snap_j && cJSON_IsString(snap_j)) {
+                             pending_head < pending_tail) {
                              const char *guid = guid_j->valuestring;
-                             const char *snap = snap_j->valuestring;
+                             const char *snap_name = pending_snaps[pending_head];
+                             const char *label = pending_labels[pending_head];
+                             pending_head++;
 
-                             /* Query node's cluster and mapping from auth table */
-                             char cluster_buf[64] = {0}, mapping_buf[2048] = {0};
-                             {
-                                 sqlite3_stmt *rs = NULL;
-                                 if (sqlite3_prepare_v2(g_db,
-                                         "SELECT cluster, mapping FROM auth WHERE cn = ?1",
-                                         -1, &rs, NULL) == SQLITE_OK) {
-                                     sqlite3_bind_text(rs, 1, nw->cn, -1, SQLITE_STATIC);
-                                     if (sqlite3_step(rs) == SQLITE_ROW) {
-                                         const char *c = (const char *)sqlite3_column_text(rs, 0);
-                                         const char *m = (const char *)sqlite3_column_text(rs, 1);
-                                         if (c) snprintf(cluster_buf, sizeof(cluster_buf), "%s", c);
-                                         if (m) snprintf(mapping_buf, sizeof(mapping_buf), "%s", m);
-                                     }
-                                     sqlite3_finalize(rs);
-                                 }
-                             }
-                             if (!cluster_buf[0]) { cJSON_Delete(msg); continue; }
-
-                             /* Extract label from snapshot name: fs@cluster-label-ts */
-                             const char *at = strchr(snap, '@');
-                             char label[64] = {0};
-                             if (at) {
-                                 size_t clen = strlen(cluster_buf);
-                                 const char *dash1 = at + 1 + clen;
-                                 if (dash1[0] == '-') dash1++;
-                                 const char *dash2 = strchr(dash1, '-');
-                                 if (dash2) {
-                                     size_t ll = (size_t)(dash2 - dash1);
-                                     if (ll >= sizeof(label)) ll = sizeof(label) - 1;
-                                     memcpy(label, dash1, ll);
-                                     label[ll] = '\0';
-                                 }
-                             }
-
-                             /* Determine cluster_fs from mapping */
+                             /* Determine cluster_fs from snapshot name (before @) */
+                             const char *at = strchr(snap_name, '@');
                              char cluster_fs[512] = {0};
-                             {
+                             if (at) {
+                                 size_t n = (size_t)(at - snap_name);
+                                 if (n >= sizeof(cluster_fs)) n = sizeof(cluster_fs) - 1;
+                                 memcpy(cluster_fs, snap_name, n);
+                                 cluster_fs[n] = '\0';
+                             }
+
+                             /* Resolve to local snapshot name for DB storage */
+                             char local_snap[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                             if (cluster_fs[0] && mapping_buf[0]) {
                                  const char *mp = mapping_buf;
-                                 const char *snap_str = snap;
-                                 const char *ats = strchr(snap_str, '@');
-                                 if (ats) {
-                                     size_t fslen = (size_t)(ats - snap_str);
-                                     char local_fs[ZEP_MAX_SNAPSHOT_NAME] = {0};
-                                     if (fslen >= sizeof(local_fs)) fslen = sizeof(local_fs) - 1;
-                                     memcpy(local_fs, snap_str, fslen);
-                                     local_fs[fslen] = '\0';
-                                     const char *cm = mp;
-                                     while (cm && *cm) {
-                                         while (*cm==' '||*cm=='\t') cm++;
-                                         if (!*cm) break;
-                                         const char *colon = strchr(cm, ':');
-                                         if (!colon) break;
-                                         size_t cflen = (size_t)(colon - cm);
-                                         char cfs_buf[512];
-                                         if (cflen >= sizeof(cfs_buf)) cflen = sizeof(cfs_buf) - 1;
-                                         memcpy(cfs_buf, cm, cflen);
-                                         cfs_buf[cflen] = '\0';
+                                 while (mp && *mp) {
+                                     while (*mp==' '||*mp=='\t') mp++;
+                                     if (!*mp) break;
+                                     const char *colon = strchr(mp, ':');
+                                     if (!colon) break;
+                                     size_t cflen = (size_t)(colon - mp);
+                                     char cfs_buf[512] = {0};
+                                     if (cflen >= sizeof(cfs_buf)) cflen = sizeof(cfs_buf) - 1;
+                                     memcpy(cfs_buf, mp, cflen);
+                                     if (strcmp(cfs_buf, cluster_fs) == 0) {
                                          const char *start = colon + 1;
                                          while (*start==' ') start++;
                                          const char *end = strchr(start, ',');
                                          if (!end) end = start + strlen(start);
                                          const char *paren = strchr(start, '(');
-                                         size_t n = paren ? (size_t)(paren - start) : (size_t)(end - start);
-                                         char resolved[ZEP_MAX_SNAPSHOT_NAME] = {0};
-                                         if (n >= sizeof(resolved)) n = sizeof(resolved) - 1;
-                                         memcpy(resolved, start, n);
-                                         resolved[n] = '\0';
-                                         if (strcmp(local_fs, resolved) == 0) {
-                                             snprintf(cluster_fs, sizeof(cluster_fs), "%s", cfs_buf);
-                                             break;
-                                         }
-                                         const char *comma = strchr(colon, ',');
-                                         cm = comma ? comma + 1 : colon + strlen(colon);
+                                         size_t ln = paren ? (size_t)(paren - start) : (size_t)(end - start);
+                                         char local_fs[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                                         if (ln >= sizeof(local_fs)) ln = sizeof(local_fs) - 1;
+                                         memcpy(local_fs, start, ln);
+                                         snprintf(local_snap, sizeof(local_snap), "%s%s", local_fs, at);
+                                         break;
                                      }
+                                     const char *comma = strchr(colon, ',');
+                                     mp = comma ? comma + 1 : colon + strlen(colon);
                                  }
                              }
+                             if (!local_snap[0] && at)
+                                 snprintf(local_snap, sizeof(local_snap), "%s", snap_name);
 
-                             if (cluster_fs[0] && label[0]) {
+                             if (cluster_fs[0]) {
                                  char now_str[32];
                                  {
                                      time_t tnow = time(NULL);
@@ -1491,17 +1478,18 @@ static void *node_ws_thread(void *arg) {
                                      strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
                                  }
                                  db_snapshot_insert(g_db, cluster_buf, nw->cn,
-                                     guid, "", snap, label, cluster_fs, 0, 0,
+                                     guid, "", local_snap, label, cluster_fs, 0, 0,
                                      "push", "", "pending");
-                                 /* Update cron_last_* */
                                  char cron_key[1024];
                                  snprintf(cron_key, sizeof(cron_key),
                                      "cron_last_%s_%s_%s", cluster_buf, cluster_fs, label);
                                  db_config_set(g_db, cron_key, now_str);
                                  zep_log("scheduler: registered snap %s guid=%s label=%s\n",
-                                     snap, guid, label);
+                                      local_snap, guid, label);
+                                 zep_log("create_snap: phase 2 complete\n");
                              }
                          } else {
+                             if (pending_head < pending_tail) pending_head++;
                              zep_log("create_snap failed for node %s rc=%d\n",
                                  nw->cn, rc_j ? rc_j->valueint : -1);
                          }
