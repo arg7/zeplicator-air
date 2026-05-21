@@ -22,6 +22,10 @@ ENV_FILE="$(cd "$(dirname "$0")/.." && pwd)/cluster/cluster.env"
 SUDO="sudo"
 SERVER_PORT=18443
 
+CACHE_ARCHIVE="/tmp/ws_tests.tar.xz"
+ZEP_BASE="/var/lib/zep-air"
+ZFS_POOLS="za-master-pool za-client-1-pool za-client-2-pool"
+
 SERV_LOG="/tmp/zep-server-discovery.log"
 NODE_CNF_DIR="/tmp/zep-discovery-cnf"
 
@@ -44,48 +48,84 @@ bad() { echo -e "  ${RED}FAIL${NC} $1"; fail=$((fail+1)); }
 cleanup() {
     # Stop server and cron
     $SUDO cluster/cluster-ctl.sh --env "$ENV_FILE" stop 2>/dev/null || true
-    sleep 2
     # Kill anything lingering
-    pkill -f "zep-air-serve.*$SERVER_PORT" 2>/dev/null || true
-    pkill -f "zep-air.*cron.*za-master" 2>/dev/null || true
+    pkill -9 zep-air-serve || true
+    pkill -9 zep-air || true
+}
+
+# ── cache helpers ──
+cache_exists() { [[ -f "$CACHE_ARCHIVE" ]]; }
+
+warm_cache() {
+    echo -e "${CYAN}=== Warming cache ===${NC}"
+    # Kill lingering zep processes
+    $SUDO cluster/cluster-ctl.sh --env "$ENV_FILE" stop 2>/dev/null || true
+    pkill -9 zep-air-serve 2>/dev/null || true
+    pkill -9 zep-air 2>/dev/null || true
     sleep 1
-    pkill -9 -f "zep-air-serve.*$SERVER_PORT" 2>/dev/null || true
-    pkill -9 -f "zep-air.*cron.*za-master" 2>/dev/null || true
+    # Export pools so loopback img files are not in use
+    for p in $ZFS_POOLS; do
+        zpool export "$p" 2>/dev/null || true
+    done
+    sleep 1
+    # Remove old archive, create fresh tar.xz
+    $SUDO rm -f "$CACHE_ARCHIVE"
+    $SUDO sh -c "cd / && tar -cJf $CACHE_ARCHIVE var/lib/zep-air/" 2>&1
+    echo "  Cache written: $CACHE_ARCHIVE ($(du -h "$CACHE_ARCHIVE" | cut -f1))"
+    # Re-import pools so the test can run against them
+    for p in $ZFS_POOLS; do
+        zpool import -d "$ZEP_BASE" "$p" 2>/dev/null || true
+    done
+    sleep 1
+}
+
+restore_cache() {
+    echo -e "${CYAN}=== Restoring from cache ===${NC}"
+    # Kill lingering zep processes
+    $SUDO cluster/cluster-ctl.sh --env "$ENV_FILE" stop 2>/dev/null || true
+    pkill -9 zep-air-serve 2>/dev/null || true
+    pkill -9 zep-air 2>/dev/null || true
+    sleep 1
+    # Destroy any leftover pools from a crashed previous run
+    for p in $ZFS_POOLS; do
+        zpool list -H -o name "$p" 2>/dev/null && zpool destroy -f "$p" 2>/dev/null || true
+    done
+    sleep 1
+    # Clean slate
+    $SUDO rm -rf "$ZEP_BASE"
+    $SUDO mkdir -p "$ZEP_BASE"
+    # Extract archive (tar --same-owner preserves ownership)
+    $SUDO tar -xJf "$CACHE_ARCHIVE" -C / 2>&1
+    echo "  Cache restored: $ZEP_BASE ($(du -sh "$ZEP_BASE" | cut -f1))"
+    # Re-import pools from restored loopback img files
+    for p in $ZFS_POOLS; do
+        zpool import -d "$ZEP_BASE" "$p" 2>/dev/null || true
+    done
+    sleep 1
+    echo "  Ready for tests"
 }
 
 ###############################################################################
-# 0. Build binaries
+# 1. Setup: cache restore or full init
 ###############################################################################
-echo -e "${CYAN}=== Building binaries ===${NC}"
-make -s 2>&1 || true
-cp "$PROJ_DIR/zep-air" "$PROJ_DIR/zep-air-serve" "$PROJ_DIR/zep-air-admin" /usr/local/bin/ 2>/dev/null || true
+echo -e "${CYAN}=== Step 1: Setup environment ===${NC}"
+if cache_exists; then
+    restore_cache
+else
+    echo -e "${CYAN}No cache — full init${NC}"
+    $SUDO cluster/cluster-destroy.sh --env "$ENV_FILE" --force
+    $SUDO zpool destroy za-master-pool 2>/dev/null || true
+    $SUDO zpool destroy za-client-1-pool 2>/dev/null || true
+    $SUDO zpool destroy za-client-2-pool 2>/dev/null || true
 
-###############################################################################
-# 1. Destroy
-###############################################################################
-echo -e "${CYAN}=== Step 1: Destroy cluster ===${NC}"
-$SUDO cluster/cluster-destroy.sh --env "$ENV_FILE" --force
+    echo -e "${CYAN}=== Step 2: Build and install ===${NC}"
+    $SUDO make install 2>&1
 
-# Extra cleanup: ensure no stale processes or ZFS state
-sleep 2
-$SUDO zpool destroy za-master-pool 2>/dev/null || true
-$SUDO zpool destroy za-client-1-pool 2>/dev/null || true
-$SUDO zpool destroy za-client-2-pool 2>/dev/null || true
-pkill -f "zep-air-serve" 2>/dev/null || true
-sleep 2
+    echo -e "${CYAN}=== Step 3: Init cluster ===${NC}"
+    $SUDO cluster/cluster-init.sh --env "$ENV_FILE" --zfs --resume-test
 
-###############################################################################
-# 2. Build and install
-###############################################################################
-echo -e "${CYAN}=== Step 2: Build and install ===${NC}"
-make -s 2>&1
-$SUDO make install 2>&1
-
-###############################################################################
-# 3. Init
-###############################################################################
-echo -e "${CYAN}=== Step 3: Init cluster ===${NC}"
-$SUDO cluster/cluster-init.sh --env "$ENV_FILE" --zfs --resume-test
+    warm_cache
+fi
 
 ###############################################################################
 # 4. Create snapshots with proper and improper names
@@ -102,7 +142,6 @@ $SUDO zfs snapshot za-master-pool/master@test-hourly-${NOW}
 echo "Created: za-master-pool/master@test-hourly-${NOW}"
 
 # Proper snapshot 2 (min label)
-sleep 1
 NOW2=$(date +%s)
 $SUDO zfs snapshot za-master-pool/master@test-min-${NOW2}
 echo "Created: za-master-pool/master@test-min-${NOW2}"
@@ -148,7 +187,6 @@ $SERV --logging DEBUG,INFO,WARN,ERROR,AUDIT --port "$SERVER_PORT" \
     --storage "/var/lib/zep-air/store" \
     2>/tmp/zep-server.log &
 SERV_PID=$!
-sleep 3
 
 if ! kill -0 "$SERV_PID" 2>/dev/null; then
     echo "Server failed to start!"
@@ -181,7 +219,6 @@ if [[ $elapsed -ge $DISCOVERY_TIMEOUT ]]; then
     echo "  WARNING: Discovery did not complete within ${DISCOVERY_TIMEOUT}s"
 fi
 
-sleep 1
 
 ###############################################################################
 # 5. Check serve log

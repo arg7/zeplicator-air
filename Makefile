@@ -31,6 +31,6 @@ clean:
 	rm -f zep-air zep-air-serve zep-air-admin zep-stream-ff
 
 install: all
-	cp zep-air zep-air-serve zep-air-admin zep-stream-ff /usr/local/bin/
+	install -m 755 zep-air zep-air-serve zep-air-admin zep-stream-ff /usr/local/bin/
 
 .PHONY: all clean install

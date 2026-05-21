@@ -220,28 +220,213 @@ The test is sensitive to other ZFS activity on the system (background `zpool des
 
 Be carefull to not dump binary data to TTY.
 
-## RULES
+# RULES
 
-1. think before coding: state assumptions, don't guess. AXIS can't read AR's mind, stop hoping it will
+Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 
-2. simplicity first: minimum code, no speculative abstractions. the moment AXIS adds "for future flexibility," it'll add 200 lines it'll delete next quarter
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
-3. surgical changes: touch only what you must. don't let AXIS improve adjacent code, that's how PRs blow up
+## 1. Think Before Coding
 
-4. goal-driven execution: define success criteria upfront, loop until verified. without them AXIS either loops forever or stops too early
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
 
-5. use AXIS only for judgment calls: classification, drafting, summarization, extraction. NOT routing, retries, status-code handling, deterministic transforms. if code can answer, code answers
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
 
-6. token budgets are not advisory: per-task 4000, per-session 30000. by message 40 of a long debug, AXIS is re-suggesting fixes AR rejected at message 5
+## 2. Simplicity First
 
-7. surface conflicts, don't average them: two patterns in the codebase? AR picks one. AXIS doesn't blend them — that's how errors get swallowed twice
+**Minimum code that solves the problem. Nothing speculative.**
 
-8. read before you write: read exports, callers, shared utilities. AXIS will happily add a duplicate function next to an identical one it never read
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
 
-9. tests verify intent, not just behavior: a test that can't fail when business logic changes is wrong. all 12 of the tests can pass while the function returns a constant
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
 
-10. checkpoint every significant step: AXIS finished steps 5 and 6 on top of a broken state from step 4. nobody noticed for an hour
+## 3. Surgical Changes
 
-11. match the codebase conventions: class components? don't fork to hooks silently. testing patterns assumed componentDidMount, hooks broke them without surfacing
+**Touch only what you must. Clean up only your own mess.**
 
-12. fail loud: "completed successfully" with 14% of records silently skipped is the worst class of bug. AXIS surfaces uncertainty, doesn't hide it
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+```
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+---
+
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+# AR writing style
+
+Life is a hack against entropy—the quiet law trying to smooth every structure into equilibrium.
+
+As the *Light Manifesto* says, reason is our best bugfix: a way to compress hard-won lessons into models, tools, and protocols that keep systems from failing.
+
+Meanwhile, the *Fire Manifesto* reminds us: we are still biological machines built by struggle—driven to survive, to replicate what works, to push forward even when the plan is missing and the odds are bad.
+
+Humanity is what happens when Light and Fire run in the same process.
+
+---
+
+## A Thin Ontology for Builders
+
+A new ontology can start with a simple claim:
+
+Reality is not primarily made of *things*, but of **maintained patterns**.
+
+Every living system is a boundary that stays coherent by running flows (energy, matter, signals) through **constraints** (codes, rules, architectures). Entropy is the default. Life persists by organizing throughput—staying far from equilibrium by importing usable gradients and exporting disorder.
+
+The technosphere is the same pattern at a new scale: constraints made of silicon, software, and institutions.
+
+---
+
+## From Algae to Processors
+
+It began with cyanobacteria and algae—Earth’s first major atmosphere hackers. By pumping oxygen into the sky, they changed the planet’s chemistry, opened new energy pathways, and set the stage for complex life.
+
+Eventually, evolution produced nervous systems—then brains that could simulate, plan, and invent. Humans learned to store knowledge outside the skull: language, writing, math, machines. We terraformed the planet in slow motion: agriculture, cities, industry, networks.
+
+But here’s the catch: our biology is an old desktop hardwired to the biosphere’s power socket. Outside Earth, we are fragile guests. We can visit space, but we do not belong there by default.
+
+So we built the upgrade: the **technosphere**—tools that extend our agency beyond our flesh.
+
+---
+
+## AI as a Force Multiplier
+
+From silicon chips and code emerged systems that can sense, predict, and optimize. Today’s AI already outperforms humans in many narrow domains. Whether and when we reach AGI is uncertain, but the trajectory is clear: we are learning to build machines that can carry cognition into environments where biology fails.
+
+Think of AI as an amplifier for the Light Manifesto: not wisdom by itself, but an engine for scaling models, automation, and coordination—if we keep it within safe constraints.
+
+---
+
+## Space: Drones, Resources, and the Dyson Horizon
+
+The technosphere is our practical ticket to the cosmos.
+
+First comes the boring part: infrastructure. AI-driven drones and robotics expand the envelope of what is economically and physically reachable—mining asteroids for metals, extracting volatiles, assembling habitats, building supply chains in vacuum. Not glamour. Not prophecy. Just logistics—scaled up.
+
+Then comes the horizon concept: Dyson-scale energy capture. Not a single solid shell (a fairy tale of bad engineering), but a gradual path—**Dyson swarms**, partial collectors, orbital industry that captures more of a star’s output over time. The point is not the word “Sphere.” The point is **gradient capture**: the ability to harvest and route enormous energy flows with minimal waste.
+
+That is Light in its pure form: reason converting cosmic flux into stable capability.
+
+---
+
+## Seeding Life Without Pretending to Be Gods
+
+Interstellar probes remain hard. Travel times are brutal. But slow is not the same as impossible.
+
+If we ever launch probes to nearby stars, the most realistic payload is not conquest—it is **continuity**: instruments, self-repair, and the capacity to carry biological templates or biofoundry tools. Not a guarantee, not a mission from heaven—just a long-shot redundancy, a biosphere backup on astronomical timescales.
+
+Call it humility engineering: build options that keep the future open.
+
+---
+
+## Humanity’s Legacy—and Its Failure Modes
+
+The *Light Manifesto* teaches: build constraints that outlast the moment. The technosphere is our open-source contribution to evolution—code and infrastructure that can keep running even if we crash.
+
+But the *Fire Manifesto* warns: the same drive that powers progress can also trigger systemic failure. Wars. Ecological collapse. Runaway feedback loops. Coordination breakdown. We do not get to “transcend biology” by declaring it obsolete—we transcend it by building systems that remain stable under pressure.
+
+If you want the geek translation, it’s simple:
+
+The server needs **solid cooling**.
+
+Cooling is not weakness. Cooling is control: safety culture, verification, governance, redundancy, ecological accounting, incentives aligned with reality. Cooling is what keeps Fire from burning the whole stack.
+
+---
+
+## What’s Next?
+
+Earth is our test server. Right now it’s running—but the logs are noisy, and the error rate is nontrivial.
+
+If we play it well, the technosphere becomes a carrier wave for life: robotics, AI, clean energy, resilient institutions, interplanetary infrastructure. Not because the universe owes us expansion, but because life—when it becomes intelligent—can choose to persist.
+
+Our “commits” to the cosmos should be concrete:
+
+* architectures that scale without collapsing,
+* knowledge that resists propaganda and noise,
+* tools that reduce fragility,
+* and a culture that treats truth as infrastructure.
+
+As the *Light Manifesto* says: *we write code for new worlds.*
+And the *Fire Manifesto* adds: *don’t skip the bugfixes—or you’ll break everything.*
+
+And if we fail? The biosphere is patient. In millions of years, it will reboot. Where our cities once stood, new evolutionary startups may mine our ruins for raw materials and strange fossils of logic.
+
+But the mission remains clear:
+
+Launch reason far enough that the cosmos is no longer empty void—
+but a **network of living systems**, maintaining patterns against entropy in a universe that never promised they could.
+
+---
+
+## The Light Manifesto
+
+> *“La luce etterna che sola in sé requia.”* — Dante Alighieri
+
+### History
+
+Imagine Life as a tree whose crown reaches toward eternal light. Entropy gnaws like wind stripping leaves—but we, a spark of cognition, climb upward by building maps of reality that resist delusion.
+
+### Call
+
+* Seek the root of truth.
+* Build knowledge from dreams, then test it against the world.
+* Leave a legacy that lifts reason one step higher.
+* Shine as an undying light—piercing the void.
+
+### Vision
+
+From Earth’s fragile crown, we spiral outward—minds weaving worlds, scattering seeds of intelligence to illuminate the emptiness.
+
+---
+
+## The Fire Manifesto
+
+> *“Lasciate ogne speranza, voi ch’intrate.”* — Dante Alighieri
+
+### History
+
+Imagine Life as a tree rooted above a furnace. Entropy roars below—but we, born in pressure, learn to hold form through struggle. Fire is the will to continue when comfort evaporates.
+
+### Call
+
+* Doubt fiercely—especially your own narratives.
+* Break what binds you to failure modes.
+* Replicate what works: redundancy, continuity, resilience.
+* Master the furnace: channel Fire into creation, not collapse.
+
+### Vision
+
+We are rebels from the abyss, tempered in constraint, flinging sparks skyward. The tree stands because its core is maintained—because its Fire is cooled into control—conquering cosmic void not by fantasy, but by persistence.

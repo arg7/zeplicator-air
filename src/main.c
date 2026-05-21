@@ -1155,6 +1155,111 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                             continue;
                         }
                     }
+                    /* Handle create_snap: create ZFS snapshot, report GUID back */
+                    if (action && cJSON_IsString(action) &&
+                        strcmp(action->valuestring, "create_snap") == 0) {
+                        zep_log("ws-node: RX create_snap from server\n");
+                        cJSON *cfs_j = cJSON_GetObjectItem(task, "cluster_fs");
+                        cJSON *snap_j = cJSON_GetObjectItem(task, "snapshot");
+                        cJSON *guid_j = cJSON_GetObjectItem(task, "guid");
+                        if (cfs_j && cJSON_IsString(cfs_j) && snap_j && cJSON_IsString(snap_j) &&
+                            guid_j && cJSON_IsString(guid_j)) {
+                            const char *cfs = cfs_j->valuestring;
+                            const char *snap = snap_j->valuestring;
+                            const char *guid = guid_j->valuestring;
+
+                            /* Resolve local filesystem from mapping */
+                            const char *mp = cfg->mapping;
+                            char local_fs[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                            while (mp && *mp) {
+                                while (*mp==' '||*mp=='\t') mp++;
+                                if (!*mp) break;
+                                const char *colon = strchr(mp, ':');
+                                if (!colon) break;
+                                size_t cflen = (size_t)(colon - mp);
+                                char cfs_buf[512];
+                                if (cflen >= sizeof(cfs_buf)) cflen = sizeof(cfs_buf) - 1;
+                                memcpy(cfs_buf, mp, cflen);
+                                cfs_buf[cflen] = '\0';
+                                const char *start = colon + 1;
+                                while (*start==' ') start++;
+                                const char *end = strchr(start, ',');
+                                if (!end) end = start + strlen(start);
+                                const char *paren = strchr(start, '(');
+                                size_t n = paren ? (size_t)(paren - start) : (size_t)(end - start);
+                                char resolved[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                                if (n >= sizeof(resolved)) n = sizeof(resolved) - 1;
+                                memcpy(resolved, start, n);
+                                resolved[n] = '\0';
+                                if (strcmp(cfs_buf, cfs) == 0) {
+                                    snprintf(local_fs, sizeof(local_fs), "%s", resolved);
+                                    break;
+                                }
+                                const char *comma = strchr(colon, ',');
+                                mp = comma ? comma + 1 : colon + strlen(colon);
+                            }
+
+                            if (local_fs[0]) {
+                                /* snap is cluster_fs@name — extract @name part for local fs */
+                                const char *at = strchr(snap, '@');
+                                char local_snap[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                                if (at) {
+                                    snprintf(local_snap, sizeof(local_snap),
+                                        "%s%s", local_fs, at);
+                                } else {
+                                    snprintf(local_snap, sizeof(local_snap),
+                                        "%s@%s", local_fs, snap);
+                                }
+                                char cmd[4096];
+                                snprintf(cmd, sizeof(cmd),
+                                    "zfs snapshot -g '%s' '%s' 2>&1",
+                                    guid, local_snap);
+                               zep_log("create_snap: %s\n", cmd);
+
+                                /* Run snapshot command, capture stderr for errors */
+                                FILE *fp = popen(cmd, "r");
+                                char stderr_buf[1024] = {0};
+                                if (fp) {
+                                    char tmp[64];
+                                    size_t en = 0;
+                                    while (fgets(tmp, sizeof(tmp), fp)) {
+                                        size_t tl = strlen(tmp);
+                                        if (en < sizeof(stderr_buf) - 1) {
+                                            memcpy(stderr_buf + en, tmp, tl);
+                                            en += tl;
+                                        }
+                                    }
+                                    int rc = pclose(fp);
+                                    int exit_code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+                                    zep_log("create_snap: rc=%d stderr=%s\n",
+                                        exit_code, stderr_buf);
+
+                                    /* zfs snapshot -g uses the client-provided GUID */
+                                    char resp[512];
+                                    int rn = snprintf(resp, sizeof(resp),
+                                        "{\"action\":\"create_snap\",\"snapshot\":\"%s\",\"guid\":\"%s\",\"rc\":%d}",
+                                        snap, guid, exit_code);
+                                    ws_node_send_frame(conn, WS_NODE_OP_TEXT,
+                                        (unsigned char *)resp, (size_t)rn);
+                                } else {
+                                    zep_log("create_snap: popen failed\n");
+                                    char resp[256];
+                                    int rn = snprintf(resp, sizeof(resp),
+                                        "{\"action\":\"create_snap\",\"snapshot\":\"%s\",\"guid\":\"%s\",\"rc\":1}",
+                                        snap, guid);
+                                    ws_node_send_frame(conn, WS_NODE_OP_TEXT,
+                                        (unsigned char *)resp, (size_t)rn);
+                                }
+                            } else {
+                                zep_log("create_snap: no mapping for %s\n", cfs);
+                                char resp[256];
+                                int rn = snprintf(resp, sizeof(resp),
+                                    "{\"action\":\"create_snap\",\"rc\":1}");
+                                ws_node_send_frame(conn, WS_NODE_OP_TEXT,
+                                    (unsigned char *)resp, (size_t)rn);
+                            }
+                        }
+                    }
                     cJSON_Delete(task);
                 }
             }

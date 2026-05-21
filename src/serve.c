@@ -45,6 +45,7 @@ static int  g_resume = 0;
 static struct MHD_Daemon *g_daemon = NULL;
 static sqlite3 *g_db = NULL;
 
+
 /* Persistent node WebSocket connection */
 struct node_ws {
     struct node_ws *next;
@@ -397,6 +398,7 @@ static ssize_t ws_send_frame_gtls(struct node_ws *nw, unsigned char opcode,
     ssize_t sent = 0;
     while ((size_t)sent < flen) {
         ssize_t n = send(nw->sock, frame + sent, flen - (size_t)sent, MSG_NOSIGNAL);
+        zep_log_debug("ws_send_frame: sock=%d sent=%zd total=%zu errno=%d\n", nw->sock, n, flen, errno);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
                 fd_set wfds; FD_ZERO(&wfds); FD_SET(nw->sock, &wfds);
@@ -419,6 +421,7 @@ static ssize_t ws_recv_node(struct node_ws *nw, unsigned char *buf, size_t buf_s
      * app.socket (sv[0]=nw->sock) — plain socketpair, no GnuTLS needed. */
     for (;;) {
         ssize_t n = recv(nw->sock, buf, buf_size, 0);
+        zep_log_debug("ws_recv_node: sock=%d n=%zd errno=%d\n", nw->sock, n, errno);
         if (n >= 0) return n;
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) return n;
@@ -485,6 +488,7 @@ static void ws_set_keepalive(int fd) {
 #endif
 }
 
+
 struct node_ws_thread_ctx {
     struct node_ws *nw;
 };
@@ -504,6 +508,222 @@ static void *node_ws_thread(void *arg) {
 
     /* Track if discovery has been received from node */
     int discovery_done = 0;
+
+    /* Query node role for scheduler */
+    char role_buf[16] = {0}, cluster_buf[64] = {0}, mapping_buf[2048] = {0};
+    {
+        sqlite3_stmt *role_st = NULL;
+        if (sqlite3_prepare_v2(g_db,
+                "SELECT role, cluster, mapping FROM auth WHERE cn = ?1",
+                -1, &role_st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(role_st, 1, nw->cn, -1, SQLITE_STATIC);
+            if (sqlite3_step(role_st) == SQLITE_ROW) {
+                const char *r = (const char *)sqlite3_column_text(role_st, 0);
+                const char *c = (const char *)sqlite3_column_text(role_st, 1);
+                const char *m = (const char *)sqlite3_column_text(role_st, 2);
+                if (r) snprintf(role_buf, sizeof(role_buf), "%s", r);
+                if (c) snprintf(cluster_buf, sizeof(cluster_buf), "%s", c);
+                if (m) snprintf(mapping_buf, sizeof(mapping_buf), "%s", m);
+            }
+            sqlite3_finalize(role_st);
+        }
+    }
+
+    /* Scheduler: check cron_last_* vs label intervals, send create_snap tasks (masters only) */
+    if (strcmp(role_buf, "master") == 0 && cluster_buf[0] && mapping_buf[0]) {
+        char cluster_def[4096] = {0};
+        char ckey[128];
+        snprintf(ckey, sizeof(ckey), "cluster_%s", cluster_buf);
+        db_config_get(g_db, ckey, cluster_def, sizeof(cluster_def));
+        if (cluster_def[0]) {
+            cJSON *cj = cJSON_Parse(cluster_def);
+            if (cj && cJSON_IsObject(cj)) {
+                /* Support both old and new cluster formats:
+                 * New: {"pools":{"pool":{"fs":{"labels":{"min":60,...}}}}}
+                 * Old: {"labels":["min","hour"],"filesystems":["pool/fs"]}
+                 */
+                cJSON *pools = cJSON_GetObjectItem(cj, "pools");
+                cJSON *labels = cJSON_GetObjectItem(cj, "labels");
+                cJSON *fs_arr = cJSON_GetObjectItem(cj, "filesystems");
+                time_t now = time(NULL);
+                if (pools && cJSON_IsObject(pools)) {
+                    /* New format: iterate pools → datasets → labels */
+                    cJSON *pool;
+                    cJSON_ArrayForEach(pool, pools) {
+                        const char *pool_name = pool->string; /* pool name */
+                        if (!pool_name || !cJSON_IsObject(pool)) continue;
+                        cJSON *dataset;
+                        cJSON_ArrayForEach(dataset, pool) {
+                            const char *ds_name = dataset->string; /* dataset name */
+                            if (!ds_name || !cJSON_IsObject(dataset)) continue;
+                            cJSON *ds_obj = dataset;
+                            cJSON *lbls = cJSON_GetObjectItem(ds_obj, "labels");
+                            if (!lbls || !cJSON_IsObject(lbls)) continue;
+
+                            char cluster_fs[512];
+                            snprintf(cluster_fs, sizeof(cluster_fs), "%s/%s", pool_name, ds_name);
+
+                            /* Iterate each label */
+                            cJSON *lbl_item;
+                            cJSON_ArrayForEach(lbl_item, lbls) {
+                                const char *ln = lbl_item->string; /* key = label name */
+                                int interval_sec = lbl_item->valueint; /* value = interval in seconds */
+                                if (!ln || interval_sec == 0) continue;
+
+                                char cron_key[1024];
+                                snprintf(cron_key, sizeof(cron_key),
+                                    "cron_last_%s_%s_%s", cluster_buf, cluster_fs, ln);
+                                char last_str[32] = {0};
+                                db_config_get(g_db, cron_key, last_str, sizeof(last_str));
+
+                                time_t last = 0;
+                                if (last_str[0]) {
+                                    struct tm tm = {0};
+                                    if (strptime(last_str, "%Y-%m-%dT%H:%M:%SZ", &tm))
+                                        last = timegm(&tm);
+                                }
+
+                                if (last > 0 && (now - last) < interval_sec)
+                                    continue;
+
+                                char snap_name[1024];
+                                snprintf(snap_name, sizeof(snap_name),
+                                    "%s@%s-%s-%lu",
+                                    cluster_fs, cluster_buf, ln, (unsigned long)now);
+
+                                /* Skip if snapshot already exists in DB */
+                                {
+                                    sqlite3_stmt *chk = NULL;
+                                    if (sqlite3_prepare_v2(g_db,
+                                            "SELECT 1 FROM snapshots WHERE snapshot=?1 LIMIT 1",
+                                            -1, &chk, NULL) == SQLITE_OK) {
+                                        sqlite3_bind_text(chk, 1, snap_name, -1, SQLITE_STATIC);
+                                        if (sqlite3_step(chk) == SQLITE_ROW) {
+                                            sqlite3_finalize(chk);
+                                            continue; /* already exists */
+                                        }
+                                        sqlite3_finalize(chk);
+                                    }
+                                }
+
+                                char guid[65];
+                                {
+                                    unsigned char bytes[16];
+                                    FILE *f = fopen("/dev/urandom", "r");
+                                    if (f) {
+                                        fread(bytes, 1, 16, f);
+                                        fclose(f);
+                                    } else {
+                                        for (int i = 0; i < 16; i++) bytes[i] = (unsigned char)rand();
+                                    }
+                                    snprintf(guid, sizeof(guid),
+                                        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                                        bytes[0], bytes[1], bytes[2], bytes[3],
+                                        bytes[4], bytes[5], bytes[6], bytes[7],
+                                        bytes[8], bytes[9], bytes[10], bytes[11],
+                                        bytes[12], bytes[13], bytes[14], bytes[15]);
+                                }
+
+                                char task_json[2048];
+                                int n = snprintf(task_json, sizeof(task_json),
+                                    "{\"action\":\"create_snap\",\"cluster_fs\":\"%s\",\"label\":\"%s\",\"snapshot\":\"%s\",\"guid\":\"%s\"}",
+                                    cluster_fs, ln, snap_name, guid);
+                                if (n > 0 && n < (int)sizeof(task_json)) {
+                                    zep_log("scheduler: create_snap %s (label=%s, interval=%ds)\n",
+                                        snap_name, ln, interval_sec);
+                                    ws_send_frame_gtls(nw, WS_OP_TEXT,
+                                        (unsigned char *)task_json, (size_t)n);
+                                }
+                            }
+                        }
+                    }
+                } else if (labels && cJSON_IsArray(labels) && fs_arr && cJSON_IsArray(fs_arr)) {
+                    /* Old format (fallback) */
+                    cJSON *label_item;
+                    cJSON_ArrayForEach(label_item, labels) {
+                        const char *ln = cJSON_GetStringValue(label_item);
+                        if (!ln) continue;
+                        int interval_sec = 0;
+                        if (strncmp(ln, "min", 3) == 0) {
+                            char *end;
+                            long val = strtol(ln + 3, &end, 10);
+                            interval_sec = (end > ln + 3 && *end == 'N') ? (int)(val * 60) : 60;
+                        } else if (strncmp(ln, "hour", 4) == 0) {
+                            char *end;
+                            long val = strtol(ln + 4, &end, 10);
+                            interval_sec = (end > ln + 4 && *end == 'N') ? (int)(val * 3600) : 3600;
+                        } else if (strncmp(ln, "day", 3) == 0) {
+                            char *end;
+                            long val = strtol(ln + 3, &end, 10);
+                            interval_sec = (end > ln + 3 && *end == 'N') ? (int)(val * 86400) : 86400;
+                        } else if (strncmp(ln, "week", 4) == 0) {
+                            char *end;
+                            long val = strtol(ln + 4, &end, 10);
+                            interval_sec = (end > ln + 4 && *end == 'N') ? (int)(val * 604800) : 7 * 86400;
+                        }
+                        if (interval_sec == 0) continue;
+
+                        cJSON *fs_item;
+                        cJSON_ArrayForEach(fs_item, fs_arr) {
+                            const char *cluster_fs = cJSON_GetStringValue(fs_item);
+                            if (!cluster_fs) continue;
+
+                            char cron_key[1024];
+                            snprintf(cron_key, sizeof(cron_key),
+                                "cron_last_%s_%s_%s", cluster_buf, cluster_fs, ln);
+                            char last_str[32] = {0};
+                            db_config_get(g_db, cron_key, last_str, sizeof(last_str));
+
+                            time_t last = 0;
+                            if (last_str[0]) {
+                                struct tm tm = {0};
+                                if (strptime(last_str, "%Y-%m-%dT%H:%M:%SZ", &tm))
+                                    last = timegm(&tm);
+                            }
+
+                            if (last > 0 && (now - last) < interval_sec)
+                                continue;
+
+                            char snap_name[1024];
+                            snprintf(snap_name, sizeof(snap_name),
+                                "%s@%s-%s-%lu",
+                                cluster_fs, cluster_buf, ln, (unsigned long)now);
+
+                            char guid[65];
+                            {
+                                unsigned char bytes[16];
+                                FILE *f = fopen("/dev/urandom", "r");
+                                if (f) {
+                                    fread(bytes, 1, 16, f);
+                                    fclose(f);
+                                } else {
+                                    for (int i = 0; i < 16; i++) bytes[i] = (unsigned char)rand();
+                                }
+                                snprintf(guid, sizeof(guid),
+                                    "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                                    bytes[0], bytes[1], bytes[2], bytes[3],
+                                    bytes[4], bytes[5], bytes[6], bytes[7],
+                                    bytes[8], bytes[9], bytes[10], bytes[11],
+                                    bytes[12], bytes[13], bytes[14], bytes[15]);
+                            }
+
+                            char task_json[2048];
+                            int n = snprintf(task_json, sizeof(task_json),
+                                "{\"action\":\"create_snap\",\"cluster_fs\":\"%s\",\"label\":\"%s\",\"snapshot\":\"%s\",\"guid\":\"%s\"}",
+                                cluster_fs, ln, snap_name, guid);
+                            if (n > 0 && n < (int)sizeof(task_json)) {
+                                zep_log("scheduler: create_snap %s (label=%s, interval=%ds)\n",
+                                    snap_name, ln, interval_sec);
+                                ws_send_frame_gtls(nw, WS_OP_TEXT,
+                                    (unsigned char *)task_json, (size_t)n);
+                            }
+                        }
+                    }
+                }
+                cJSON_Delete(cj);
+            }
+        }
+    }
 
     time_t last_ping = time(NULL);
     for (;;) {
@@ -663,23 +883,9 @@ static void *node_ws_thread(void *arg) {
                       if (!discovery_done && action && cJSON_IsString(action) &&
                           strcmp(action->valuestring, "discovery") == 0) {
                           cJSON *snaps = cJSON_GetObjectItem(msg, "snaps");
-                          char role_buf[16] = {0}, cluster_buf[64] = {0}, mapping_buf[2048] = {0};
+
+                          /* Phase 1: Register discovered snapshots (only if node sent snapshots) */
                           if (snaps && cJSON_IsArray(snaps)) {
-                              sqlite3_stmt *role_st = NULL;
-                              if (sqlite3_prepare_v2(g_db,
-                                      "SELECT role, cluster, mapping FROM auth WHERE cn = ?1",
-                                      -1, &role_st, NULL) == SQLITE_OK) {
-                                  sqlite3_bind_text(role_st, 1, nw->cn, -1, SQLITE_STATIC);
-                                  if (sqlite3_step(role_st) == SQLITE_ROW) {
-                                      const char *r = (const char *)sqlite3_column_text(role_st, 0);
-                                      const char *c = (const char *)sqlite3_column_text(role_st, 1);
-                                      const char *m = (const char *)sqlite3_column_text(role_st, 2);
-                                      if (r) snprintf(role_buf, sizeof(role_buf), "%s", r);
-                                      if (c) snprintf(cluster_buf, sizeof(cluster_buf), "%s", c);
-                                      if (m) snprintf(mapping_buf, sizeof(mapping_buf), "%s", m);
-                                  }
-                                  sqlite3_finalize(role_st);
-                              }
                               int total = 0, regd = 0, existing = 0;
                               if (strcmp(role_buf, "master") == 0 && cluster_buf[0]) {
                                   cJSON *snap;
@@ -1185,6 +1391,123 @@ static void *node_ws_thread(void *arg) {
                            cJSON_Delete(msg);
                            break;
                        }
+                      /* Handle create_snap response from node */
+                      if (action && cJSON_IsString(action) &&
+                          strcmp(action->valuestring, "create_snap") == 0) {
+                         zep_log("create_snap: RX response from %s\n", nw->cn);
+                         cJSON *guid_j = cJSON_GetObjectItem(msg, "guid");
+                         cJSON *rc_j = cJSON_GetObjectItem(msg, "rc");
+                         cJSON *snap_j = cJSON_GetObjectItem(msg, "snapshot");
+                         if (rc_j && cJSON_IsNumber(rc_j) && rc_j->valueint == 0 &&
+                             guid_j && cJSON_IsString(guid_j) &&
+                             snap_j && cJSON_IsString(snap_j)) {
+                             const char *guid = guid_j->valuestring;
+                             const char *snap = snap_j->valuestring;
+
+                             /* Query node's cluster and mapping from auth table */
+                             char cluster_buf[64] = {0}, mapping_buf[2048] = {0};
+                             {
+                                 sqlite3_stmt *rs = NULL;
+                                 if (sqlite3_prepare_v2(g_db,
+                                         "SELECT cluster, mapping FROM auth WHERE cn = ?1",
+                                         -1, &rs, NULL) == SQLITE_OK) {
+                                     sqlite3_bind_text(rs, 1, nw->cn, -1, SQLITE_STATIC);
+                                     if (sqlite3_step(rs) == SQLITE_ROW) {
+                                         const char *c = (const char *)sqlite3_column_text(rs, 0);
+                                         const char *m = (const char *)sqlite3_column_text(rs, 1);
+                                         if (c) snprintf(cluster_buf, sizeof(cluster_buf), "%s", c);
+                                         if (m) snprintf(mapping_buf, sizeof(mapping_buf), "%s", m);
+                                     }
+                                     sqlite3_finalize(rs);
+                                 }
+                             }
+                             if (!cluster_buf[0]) { cJSON_Delete(msg); continue; }
+
+                             /* Extract label from snapshot name: fs@cluster-label-ts */
+                             const char *at = strchr(snap, '@');
+                             char label[64] = {0};
+                             if (at) {
+                                 size_t clen = strlen(cluster_buf);
+                                 const char *dash1 = at + 1 + clen;
+                                 if (dash1[0] == '-') dash1++;
+                                 const char *dash2 = strchr(dash1, '-');
+                                 if (dash2) {
+                                     size_t ll = (size_t)(dash2 - dash1);
+                                     if (ll >= sizeof(label)) ll = sizeof(label) - 1;
+                                     memcpy(label, dash1, ll);
+                                     label[ll] = '\0';
+                                 }
+                             }
+
+                             /* Determine cluster_fs from mapping */
+                             char cluster_fs[512] = {0};
+                             {
+                                 const char *mp = mapping_buf;
+                                 const char *snap_str = snap;
+                                 const char *ats = strchr(snap_str, '@');
+                                 if (ats) {
+                                     size_t fslen = (size_t)(ats - snap_str);
+                                     char local_fs[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                                     if (fslen >= sizeof(local_fs)) fslen = sizeof(local_fs) - 1;
+                                     memcpy(local_fs, snap_str, fslen);
+                                     local_fs[fslen] = '\0';
+                                     const char *cm = mp;
+                                     while (cm && *cm) {
+                                         while (*cm==' '||*cm=='\t') cm++;
+                                         if (!*cm) break;
+                                         const char *colon = strchr(cm, ':');
+                                         if (!colon) break;
+                                         size_t cflen = (size_t)(colon - cm);
+                                         char cfs_buf[512];
+                                         if (cflen >= sizeof(cfs_buf)) cflen = sizeof(cfs_buf) - 1;
+                                         memcpy(cfs_buf, cm, cflen);
+                                         cfs_buf[cflen] = '\0';
+                                         const char *start = colon + 1;
+                                         while (*start==' ') start++;
+                                         const char *end = strchr(start, ',');
+                                         if (!end) end = start + strlen(start);
+                                         const char *paren = strchr(start, '(');
+                                         size_t n = paren ? (size_t)(paren - start) : (size_t)(end - start);
+                                         char resolved[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                                         if (n >= sizeof(resolved)) n = sizeof(resolved) - 1;
+                                         memcpy(resolved, start, n);
+                                         resolved[n] = '\0';
+                                         if (strcmp(local_fs, resolved) == 0) {
+                                             snprintf(cluster_fs, sizeof(cluster_fs), "%s", cfs_buf);
+                                             break;
+                                         }
+                                         const char *comma = strchr(colon, ',');
+                                         cm = comma ? comma + 1 : colon + strlen(colon);
+                                     }
+                                 }
+                             }
+
+                             if (cluster_fs[0] && label[0]) {
+                                 char now_str[32];
+                                 {
+                                     time_t tnow = time(NULL);
+                                     struct tm tm;
+                                     gmtime_r(&tnow, &tm);
+                                     strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
+                                 }
+                                 db_snapshot_insert(g_db, cluster_buf, nw->cn,
+                                     guid, "", snap, label, cluster_fs, 0, 0,
+                                     "push", "", "pending");
+                                 /* Update cron_last_* */
+                                 char cron_key[1024];
+                                 snprintf(cron_key, sizeof(cron_key),
+                                     "cron_last_%s_%s_%s", cluster_buf, cluster_fs, label);
+                                 db_config_set(g_db, cron_key, now_str);
+                                 zep_log("scheduler: registered snap %s guid=%s label=%s\n",
+                                     snap, guid, label);
+                             }
+                         } else {
+                             zep_log("create_snap failed for node %s rc=%d\n",
+                                 nw->cn, rc_j ? rc_j->valueint : -1);
+                         }
+                         cJSON_Delete(msg);
+                         continue;
+                      }
                       cJSON_Delete(msg);
                 }
             }

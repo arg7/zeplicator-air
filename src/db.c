@@ -100,6 +100,13 @@ err_t db_init_tables(sqlite3 *db) {
                  NULL, NULL, NULL);
     sqlite3_exec(db, "ALTER TABLE auth ADD COLUMN last_err TEXT DEFAULT ''",
                  NULL, NULL, NULL);
+    /* One-shot migration: add created_at to snapshots if not exists */
+    {
+        char *merr = NULL;
+        sqlite3_exec(db, "ALTER TABLE snapshots ADD COLUMN created_at TEXT",
+                     NULL, NULL, &merr);
+        if (merr) sqlite3_free(merr); /* ignore "duplicate column" */
+    }
     return ZEP_ERR_OK;
 }
 
