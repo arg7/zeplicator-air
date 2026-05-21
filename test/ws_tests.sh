@@ -133,16 +133,16 @@ fi
 echo -e "${CYAN}=== Step 4: Create snapshots ===${NC}"
 
 # Properly-named snapshots: <fs>@<cluster>-<label>-<timestamp>
-# Format: za-master-pool/master@test-hourly-<epoch>
+# Format: za-master-pool/master@test-hourly-<YYYYMMDD-hhmmss>
 
-NOW=$(date +%s)
+NOW=$(date +%Y%m%d-%H%M%S)
 
 # Proper snapshot 1 (hourly label)
 $SUDO zfs snapshot za-master-pool/master@test-hourly-${NOW}
 echo "Created: za-master-pool/master@test-hourly-${NOW}"
 
 # Proper snapshot 2 (min label)
-NOW2=$(date +%s)
+NOW2=$(date +%Y%m%d-%H%M%S)
 $SUDO zfs snapshot za-master-pool/master@test-min-${NOW2}
 echo "Created: za-master-pool/master@test-min-${NOW2}"
 
@@ -387,8 +387,8 @@ server_snap_count=$($SUDO sqlite3 "$SERVER_DB" \
     "SELECT COUNT(*) FROM snapshots WHERE node='za-master' AND snapshot LIKE '%test-min-%' AND snapshot NOT LIKE '%test-hourly-%';" 2>/dev/null || echo 0)
 
 # We have at least 2 snapshots with 'min' in the name:
-# 1. Locally created: za-master-pool/master@test-min-<epoch> (from discovery)
-# 2. Server-generated: za-master-pool/master@test-min-<different_epoch> (from scheduler)
+# 1. Locally created: za-master-pool/master@test-min-<YYYYMMDD-hhmmss> (from discovery)
+# 2. Server-generated: za-master-pool/master@test-min-<YYYYMMDD-hhmmss> (from scheduler)
 if [[ "$server_snap_count" -ge 2 ]]; then
     ok "DB: $server_snap_count min snapshots registered (discovery + server-driven)"
 else

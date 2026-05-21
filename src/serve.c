@@ -552,6 +552,10 @@ static void *node_ws_thread(void *arg) {
                 cJSON *labels = cJSON_GetObjectItem(cj, "labels");
                 cJSON *fs_arr = cJSON_GetObjectItem(cj, "filesystems");
                 time_t now = time(NULL);
+                struct tm tm_sched;
+                gmtime_r(&now, &tm_sched);
+                char ts_str[16];
+                strftime(ts_str, sizeof(ts_str), "%Y%m%d-%H%M%S", &tm_sched);
                 if (pools && cJSON_IsObject(pools)) {
                     /* New format: iterate pools → datasets → labels */
                     cJSON *pool;
@@ -594,15 +598,15 @@ static void *node_ws_thread(void *arg) {
 
                                 char snap_name[1024];
                                 snprintf(snap_name, sizeof(snap_name),
-                                    "%s@%s-%s-%lu",
-                                    cluster_fs, cluster_buf, ln, (unsigned long)now);
+                                    "%s@%s-%s-%s",
+                                    cluster_fs, cluster_buf, ln, ts_str);
 
                                 /* Skip if snapshot already exists in DB (check by label+timestamp suffix) */
                                 {
                                     sqlite3_stmt *chk = NULL;
                                     char suffix[256];
-                                    snprintf(suffix, sizeof(suffix), "@%s-%s-%lu",
-                                        cluster_buf, ln, (unsigned long)now);
+                                    snprintf(suffix, sizeof(suffix), "@%s-%s-%s",
+                                        cluster_buf, ln, ts_str);
                                     char chk_sql[1024];
                                     snprintf(chk_sql, sizeof(chk_sql),
                                         "SELECT 1 FROM snapshots WHERE node=?1 AND snapshot LIKE '%%%s%%'",
@@ -702,8 +706,8 @@ static void *node_ws_thread(void *arg) {
 
                             char snap_name[1024];
                             snprintf(snap_name, sizeof(snap_name),
-                                "%s@%s-%s-%lu",
-                                cluster_fs, cluster_buf, ln, (unsigned long)now);
+                                "%s@%s-%s-%s",
+                                cluster_fs, cluster_buf, ln, ts_str);
 
                             char guid[65];
                             {
@@ -1122,7 +1126,7 @@ static void *node_ws_thread(void *arg) {
                                int is_resume = (rt && rt[0]);
 
                                /* Compute inverted timestamp for storage directory */
-                               time_t now = time(NULL);
+                time_t now = time(NULL);
                                uint32_t inverted = (uint32_t)(0xFFFFFFFF - (uint32_t)now);
                                char dir_name[64];
                                snprintf(dir_name, sizeof(dir_name), "%u-%s", inverted, guid);

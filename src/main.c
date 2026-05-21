@@ -422,6 +422,18 @@ static void *ws_node_pipe_thread(void *arg) {
                         }
                         /* Skip snapshots without a proper label (cluster must be followed by label then timestamp) */
                         if (!label[0]) continue;
+                        /* Validate timestamp format after label: YYYYMMDD-hhmmss */
+                        if (d2) {
+                            const char *ts = d2 + 1;
+                            int ok = 1;
+                            for (int i = 0; i < 8 && ok; i++)
+                                if (ts[i] < '0' || ts[i] > '9') ok = 0;
+                            if (ts[8] != '-') ok = 0;
+                            for (int i = 9; i < 15 && ok; i++)
+                                if (ts[i] < '0' || ts[i] > '9') ok = 0;
+                            if (ts[15] != '\0' && ts[15] != '\t') ok = 0;
+                            if (!ok) continue;
+                        }
                         char guid[ZEP_MAX_GUID_LEN] = {0};
                         char *tab = strchr(line, '\t');
                         if (tab) {
