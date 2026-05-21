@@ -1224,9 +1224,9 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                 }
                                 char cmd[4096];
                                 snprintf(cmd, sizeof(cmd),
-                                    "zfs snapshot -g 'guid' '%s' 2>&1",
-                                    local_snap);
-                               zep_log("create_snap: %s\n", cmd);
+                                    "zfs snapshot '%s' 2>&1 && zfs get -Hp -o value guid '%s' 2>/dev/null",
+                                    local_snap, local_snap);
+                                zep_log("create_snap: %s\n", cmd);
 
                                 /* Run snapshot command, capture stdout for guid */
                                 FILE *fp = popen(cmd, "r");
@@ -1244,13 +1244,15 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                     }
                                     int rc = pclose(fp);
                                     exit_code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+                                    if (exit_code == 0 && !real_guid[0])
+                                        exit_code = 1;
                                     zep_log("create_snap: rc=%d guid=%s\n",
                                         exit_code, real_guid);
 
                                     char resp[512];
                                     int rn = snprintf(resp, sizeof(resp),
                                         "{\"action\":\"create_snap\",\"guid\":\"%s\",\"rc\":%d}",
-                                        real_guid[0] ? real_guid : guid, exit_code);
+                                        real_guid, exit_code);
                                     ws_node_send_frame(conn, WS_NODE_OP_TEXT,
                                         (unsigned char *)resp, (size_t)rn);
                                 } else {
