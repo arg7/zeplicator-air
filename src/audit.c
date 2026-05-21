@@ -48,7 +48,7 @@ void zep_air_log(int level, const char *fmt, ...) {
     struct tm tm;
     localtime_r(&t, &tm);
     char ts[32];
-    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", &tm);
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm);
 
     const char *label;
     switch (level) {

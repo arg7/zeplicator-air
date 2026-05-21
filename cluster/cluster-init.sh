@@ -286,7 +286,7 @@ JSONEOF
 
     # Stop temp server
     kill "$SERV_PID" 2>/dev/null || true
-    for i in $(seq 1 10); do
+    for i in $(seq 1 5); do
         kill -0 "$SERV_PID" 2>/dev/null || break
         sleep 1
     done
@@ -363,7 +363,7 @@ if [[ "$RESUME_TEST" -eq 1 && "$NO_START" -ne 1 ]]; then
     "$ADMIN" $ADMIN_BASE config set resume 1 >/dev/null
     say "  resume=1 set on server"
     kill "$RESUME_SERV_PID" 2>/dev/null || true
-    for i in $(seq 1 10); do
+    for i in $(seq 1 5); do
         kill -0 "$RESUME_SERV_PID" 2>/dev/null || break
         sleep 1
     done

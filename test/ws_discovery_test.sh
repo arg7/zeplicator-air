@@ -141,12 +141,12 @@ echo -e "${CYAN}=== Step 5: Start server + cron daemon ===${NC}"
 # Clear old logs (some may be root-owned from previous runs)
 $SUDO rm -f "$SERV_LOG" /tmp/zep-server.log /tmp/zep-za-master.log 2>/dev/null || true
 
-# Start server with verbose logging, redirect to known log file
+# Start server with verbose logging — stderr goes to log, stdout stays clean
 $SERV --logging DEBUG,INFO,WARN,ERROR,AUDIT --port "$SERVER_PORT" \
     --cert "$PKI/server.crt" --key "$PKI/server.key" \
     --ca "$PKI/ca.crt" --db "$SERVER_DB" \
     --storage "/var/lib/zep-air/store" \
-    >/tmp/zep-server.log 2>&1 &
+    2>/tmp/zep-server.log &
 SERV_PID=$!
 sleep 3
 
@@ -159,29 +159,29 @@ echo "  Server started (PID $SERV_PID)"
 
 # Start master cron daemon (this triggers WS connect + discovery)
 # Use same pattern as cluster-ctl.sh: root runs sudo -u <cn> sh -c "..."
-nohup sudo -u za-master sh -c "\"$ZEP\" --logging DEBUG,INFO,WARN,ERROR,AUDIT --db \"$MASTER_DB\" cron --daemon --interval 5 > /tmp/zep-za-master.log 2>&1" </dev/null >/dev/null 2>&1 &
+nohup sudo -u za-master sh -c "\"$ZEP\" --logging DEBUG,INFO,WARN,ERROR,AUDIT --db \"$MASTER_DB\" cron --daemon --interval 5 2> /tmp/zep-za-master.log" </dev/null >/dev/null 2>&1 &
 CRON_PID=$!
 disown $CRON_PID 2>/dev/null || true
 echo "  Cron daemon started (PID $CRON_PID)"
 
 # Wait for discovery to happen (WS connect + discovery sent + processed)
 echo "  Waiting for discovery to complete..."
-DISCOVERY_TIMEOUT=30
+DISCOVERY_TIMEOUT=15
 elapsed=0
 while [[ $elapsed -lt $DISCOVERY_TIMEOUT ]]; do
     if grep -q "discovery: phase 1 complete" /tmp/zep-server.log 2>/dev/null; then
         echo "  Discovery complete after ${elapsed}s"
         break
     fi
-    sleep 2
-    elapsed=$((elapsed + 2))
+    sleep 1
+    elapsed=$((elapsed + 1))
 done
 
 if [[ $elapsed -ge $DISCOVERY_TIMEOUT ]]; then
     echo "  WARNING: Discovery did not complete within ${DISCOVERY_TIMEOUT}s"
 fi
 
-sleep 2
+sleep 1
 
 ###############################################################################
 # 5. Check serve log
