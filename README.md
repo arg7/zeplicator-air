@@ -1,6 +1,6 @@
 # Zeplicator Air
 
-Air-gapped ZFS replication over HTTPS with mutual TLS. No SSH between nodes — the `zep-air-serve` TLS server is the sole communication channel. Pure C, ~3500 LOC.
+Air-gapped ZFS replication over HTTPS with mutual TLS. No SSH between nodes — the `zep-air-serve` TLS server is the sole communication channel. Pure C, ~8000 LOC.
 
 ## Synopsis
 

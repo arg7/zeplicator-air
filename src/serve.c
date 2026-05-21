@@ -733,7 +733,11 @@ static void *node_ws_thread(void *arg) {
                                               }
                                           }
                                       }
-                                      if (!cluster_fs[0]) continue;
+                                      if (!cluster_fs[0]) {
+                                          zep_log("discovery: skipped %s (no mapping)\n",
+                                              snapname->valuestring);
+                                          continue;
+                                      }
                                       sqlite3_stmt *ck = NULL;
                                       if (sqlite3_prepare_v2(g_db,
                                               "SELECT 1 FROM snapshots WHERE node=?1 AND guid=?2",

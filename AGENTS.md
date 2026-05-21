@@ -1,11 +1,21 @@
 # AGENTS.md — Zeplicator Air Development Guide
 
+## Roles
+
+| Role | Name | Responsibility |
+|------|------|----------------|
+| Architect | AR | Sets direction, defines success criteria, reviews decisions, approves changes |
+| Agent | AXIS | Executes tasks, writes code, runs tests, surfaces conflicts and uncertainties |
+
+AR is the sole decision-maker. AXIS executes — it does not second-guess requirements, merge conflicting patterns, or silently skip failures. AXIS asks clarifying questions when direction is unclear and surfaces uncertainty instead of guessing.
+
 ## Overview
 
-Zeplicator Air is an air-gapped ZFS replication system in pure C (~4,600 LOC). No SSH between nodes — a central HTTPS server (`zep-air-serve`) is the sole communication channel. Nodes push ZFS snapshots to it and pull from it. Mutual TLS authenticates every connection.
+Zeplicator Air is an air-gapped ZFS replication system in pure C (~7500 LOC). No SSH between nodes — a central HTTPS server (`zep-air-serve`) is the sole communication channel. Nodes push ZFS snapshots to it and pull from it. Mutual TLS authenticates every connection. Nodes maintain persistent WebSocket connections to the server for real-time task dispatch.
 
 ```
 master ──push──▶ [zep-air-serve] ◀──pull── client
+         ↕ WS (tasks, discovery, keepalive)
 ```
 
 ## Build
@@ -25,29 +35,32 @@ sudo make install
 sudo cluster/cluster-ctl.sh start
 ```
 
+`START_CLIENTS=0` in `cluster/cluster.env` for master-only testing. `cluster-ctl.sh start` cleans `/tmp/zep-*.log` on each invocation.
+
 ## Three Binaries
 
 | Binary | Role | Source |
 |--------|------|--------|
-| `zep-air-serve` | HTTPS server (MHD/GnuTLS), REST API, SQLite, chain tracking | `src/serve.c` |
-| `zep-air` | Node agent: push, pull, snap, rotate, cron daemon | `src/main.c` |
+| `zep-air-serve` | HTTPS server (MHD/GnuTLS), REST API, SQLite, chain tracking, WS node/pipe endpoints | `src/serve.c` |
+| `zep-air` | Node agent: push, pull, snap, cron daemon (WS-based task dispatch) | `src/main.c` |
 | `zep-air-admin` | Remote admin tool (libcurl): cluster, nodes, suspend, promote | `src/admin.c` |
 
 ## Key Source Files
 
 | File | LOC | Purpose |
 |------|-----|---------|
-| `src/serve.c` | 1246 | MHD server, all REST handlers, admin API, cron sync, zstream verify |
-| `src/main.c` | 754 | CLI dispatcher, push/pull/snap/cron/rotate commands |
-| `src/admin.c` | 547 | libcurl client for remote admin — cluster, join, suspend, config |
-| `src/db.c` | 449 | SQLite: config KV, auth (certs+roles), cluster_chain, push/pull tracking |
-| `src/pipeline.c` | 383 | Push/pull orchestration, mapping resolver, SHA256, chunking |
-| `src/http.c` | 314 | libcurl HTTP client with mTLS, PUT/GET blobs+meta |
-| `src/zfs.c` | 209 | Shells out to `zfs`/`zstd` — snapshot, send, recv, guid queries |
-| `src/auth.c` | 161 | OpenSSL: X.509 CN extraction, fingerprint, CA verification |
-| `src/storage.c` | 245 | Filesystem blob store: meta.json, blob files, directory layout |
-| `src/zstream.c` | 62 | Parses `zstream dump -v` output for toguid/fromguid |
-| `test/cluster_smoke.sh` | 206 | 12-test suite with 3 isolated ZFS users over HTTPS |
+| `src/serve.c` | 3297 | MHD server, all REST handlers, admin API, cron sync, zstream verify, WS node/pipe endpoints |
+| `src/main.c` | 1542 | CLI dispatcher, push/pull/snap/cron commands, WS node client with custom frame protocol |
+| `src/admin.c` | 1155 | libcurl client for remote admin — cluster, join, suspend, config |
+| `src/db.c` | 664 | SQLite: config KV, auth (certs+roles), cluster_chain, push/pull tracking |
+| `src/stream-ff.c` | 242 | Stream forwarder for pipe/WS bridging |
+| `src/audit.c` | 171 | Audit logging (stderr-based) |
+| `src/http.c` | 166 | libcurl HTTP client with mTLS, PUT/GET blobs+meta |
+| `src/zfs.c` | 115 | Shells out to `zfs`/`zstd` — snapshot, send, recv, guid queries |
+| `src/zstream.c` | 110 | Parses `zstream dump -v` output for toguid/fromguid |
+| `src/auth.c` | 74 | OpenSSL: X.509 CN extraction, fingerprint, CA verification |
+| `src/pipeline.c` | 43 | Push/pull orchestration, mapping resolver, SHA256, chunking |
+| `test/cluster_smoke.sh` | 203 | 12-test suite with 3 isolated ZFS users over HTTPS |
 | `pki/mk-ca.sh` | 118 | Creates CA, server cert, admin cert |
 | `pki/mk-node.sh` | 97 | Creates per-node cert+key .pem bundle |
 
@@ -68,7 +81,7 @@ GET snapshot list → GET meta.json → GET blobs → SHA256 verify → reassemb
 ```
 GET /v1/cron/sync → execute tasks → POST /v1/cron/ack → GET /v1/cron/protected → rotate
 ```
-Server returns due labels for masters, filesystem list for clients. Nodes never query local ZFS for discovery — the server SQLite is the source of truth.
+Server returns due labels for masters, filesystem list for clients. Discovery is node-initiated via WS TEXT message (`{"action":"discovery","snaps":[...]}`) after WS connect — avoids MHD 1.0.1 GnuTLS socketpair forwarding bug when server initiates. Nodes never query local ZFS for discovery — the server SQLite is the source of truth.
 
 ## Server State (SQLite)
 
@@ -112,6 +125,9 @@ The server DB (`zep-air.db`) is authoritative. Tables:
 
 ```
 GET  /health                          Always 200 (no auth)
+# WebSocket upgrade routes
+GET  /v1/ws/node?cn=<name>           WebSocket upgrade (node agent connection)
+GET  /v1/ws/pipe?cn=<name>           WebSocket upgrade (admin pipe bridge)
 # Data routes
 PUT  /v1/nodes/<n>/snapshots/<p>/meta
 PUT  /v1/nodes/<n>/snapshots/<p>/blobs/<N>
@@ -132,10 +148,14 @@ POST /v1/admin/promote/<cn>
 POST /v1/admin/rollback/<snap>
 POST /v1/admin/snap/<name>
 POST /v1/admin/unsnap/<name>
-# Cron
-GET  /v1/cron/sync
-POST /v1/cron/ack
-GET  /v1/cron/protected?<cluster>
+POST /v1/admin/pipe                  Start pipe (admin → node subprocess)
+# Cron (HTTP-based, used by cron daemon)
+GET  /v1/cron/sync                    Generate sync tasks based on label intervals
+POST /v1/cron/ack                     Acknowledge task completion, update cron_last_*
+GET  /v1/cron/protected?<cluster>     List protected GUIDs (prevent rollback deletion)
+GET  /v1/cron/rotation?cluster=<c>    Get rotation candidates for a cluster
+POST /v1/cron/rotate-ack              Report rotation results (deleted/remaining GUIDs)
+POST /v1/cron/inventory               Register snapshot inventory from node
 ```
 
 ## Storage Layout
@@ -183,9 +203,45 @@ The test is sensitive to other ZFS activity on the system (background `zpool des
 
 8. **Combined .pem files**: `--key` flag is optional — defaults to `--cert` path. The `.pem` file contains both cert and key. OpenSSL/curl handle this natively.
 
+9. **MHD 1.0.1 GnuTLS socketpair bug**: Server cannot receive data through socketpair when initiating communication. Workaround: node-initiated discovery — node sends `{"action":"discovery","snaps":[...]}` as first WS TEXT message after connecting.
+
+10. **`MHD_upgrade_action` SEGV**: Calling `MHD_upgrade_action(MHD_UPGRADE_ACTION_CLOSE)` from a worker thread crashes in MHD's internal code (corrupted state). Removed entirely; MHD handles cleanup on thread exit.
+
+11. **`cJSON_Delete` on child arrays**: Deleting a parent object (e.g., `cJSON_Delete(discovery)`) frees child arrays (e.g., `snaps`). Calling `cJSON_GetArraySize(snaps)` after delete is use-after-free. Save `cJSON_GetArraySize()` before delete.
+
 ## Build Flags
 
 - `-D_GNU_SOURCE` required for `asprintf`, `strptime`
 - Server links `-lgnutls` (for `gnutls_certificate_get_peers`, `gnutls_x509_crt_*`)
 - All binaries link `-lssl -lcrypto -lcurl -lsqlite3 -lcjson -lzstd -lm`
 - MHD linked via pkg-config (GnuTLS backend on Debian)
+
+## MISC
+
+Be carefull to not dump binary data to TTY.
+
+## RULES
+
+1. think before coding: state assumptions, don't guess. AXIS can't read AR's mind, stop hoping it will
+
+2. simplicity first: minimum code, no speculative abstractions. the moment AXIS adds "for future flexibility," it'll add 200 lines it'll delete next quarter
+
+3. surgical changes: touch only what you must. don't let AXIS improve adjacent code, that's how PRs blow up
+
+4. goal-driven execution: define success criteria upfront, loop until verified. without them AXIS either loops forever or stops too early
+
+5. use AXIS only for judgment calls: classification, drafting, summarization, extraction. NOT routing, retries, status-code handling, deterministic transforms. if code can answer, code answers
+
+6. token budgets are not advisory: per-task 4000, per-session 30000. by message 40 of a long debug, AXIS is re-suggesting fixes AR rejected at message 5
+
+7. surface conflicts, don't average them: two patterns in the codebase? AR picks one. AXIS doesn't blend them — that's how errors get swallowed twice
+
+8. read before you write: read exports, callers, shared utilities. AXIS will happily add a duplicate function next to an identical one it never read
+
+9. tests verify intent, not just behavior: a test that can't fail when business logic changes is wrong. all 12 of the tests can pass while the function returns a constant
+
+10. checkpoint every significant step: AXIS finished steps 5 and 6 on top of a broken state from step 4. nobody noticed for an hour
+
+11. match the codebase conventions: class components? don't fork to hooks silently. testing patterns assumed componentDidMount, hooks broke them without surfacing
+
+12. fail loud: "completed successfully" with 14% of records silently skipped is the worst class of bug. AXIS surfaces uncertainty, doesn't hide it

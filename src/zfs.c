@@ -95,7 +95,7 @@ err_t zfs_get_latest_guid(const char *fs, char *guid, size_t len) {
     if (!guid || !len || !fs) return ZEP_ERR_SYS;
     guid[0] = '\0';
     char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "zfs list -H -o name,guid -s creation -t snapshot '%s' 2>/dev/null | tail -1", fs);
+    snprintf(cmd, sizeof(cmd), "zfs list -H -o name,guid -s creation -t snap '%s' 2>/dev/null | tail -1", fs);
     FILE *p = popen(cmd, "r");
     if (!p) return ZEP_ERR_SYS;
     char line[1024];

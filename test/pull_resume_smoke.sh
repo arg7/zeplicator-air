@@ -102,7 +102,7 @@ cron_spawn "$TMP/client.db" 5
 sleep 15
 cron_kill_all
 
-snaps=$(zfs list -r -t snapshot rclient 2>/dev/null | grep -c '@' | tr -d '[:space:]' || echo 0)
+snaps=$(zfs list -r -t snap rclient 2>/dev/null | grep -c '@' | tr -d '[:space:]' || echo 0)
 [[ $snaps -ge 1 ]] && ok "resume complete ($snaps snaps)" || bad "resume: $snaps snaps"
 
 echo ""

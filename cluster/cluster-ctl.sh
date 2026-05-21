@@ -78,6 +78,7 @@ ZEP="${ZEP:-$BIN_DIR/zep-air}"
 SERV="${SERV:-$BIN_DIR/zep-air-serve}"
 ADMIN="${ADMIN:-$BIN_DIR/zep-air-admin}"
 CRON_INTERVAL="${CRON_INTERVAL:-60}"
+START_CLIENTS="${START_CLIENTS:-1}"
 SUDO_NODES="${SUDO_NODES:-0}"
 VERB="${VERB:-}"
 
@@ -156,6 +157,8 @@ do_status() {
 # 4. Start
 ###############################################################################
 do_start() {
+    #rm -f /tmp/zep-server.log /tmp/zep-*.log 2>/dev/null || true
+
     local spid
     spid=$(server_pid)
     if is_running "${spid:-}" 2>/dev/null; then
@@ -184,10 +187,14 @@ do_start() {
         fi
     fi
 
-    say "Starting node cron daemons (interval=${CRON_INTERVAL}s) ..."
-    local cron_pids_file_content=""
-    for entry in ${NODES:-}; do
-        IFS=':' read -r cn role poolfs <<< "$entry"
+     say "Starting node cron daemons (interval=${CRON_INTERVAL}s) ..."
+     local cron_pids_file_content=""
+     for entry in ${NODES:-}; do
+         IFS=':' read -r cn role poolfs <<< "$entry"
+         if [[ "$START_CLIENTS" == "0" && "$role" == "client" ]]; then
+             echo -e "  ${YELLOW}$cn ($role) — skipped (START_CLIENTS=0)${NC}"
+             continue
+         fi
         local node_db="${ZEP_BASE}/home/${cn}/${cn}.db"
         if [[ "$SUDO_NODES" == "1" ]]; then
             sudo -u "$cn" test -f "$node_db" || {

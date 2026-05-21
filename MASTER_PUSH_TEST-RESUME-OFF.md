@@ -58,7 +58,7 @@ Naming convention: `<cluster>-<label>-<YYYYMMDDHHmmSS>`
 
 ### Step 5: Pipeline push — find latest snapshot, send metadata
 For each push task, `pipeline_push_ws()`:
-1. Discovers newest snapshot via `zfs list -Hp -t snapshot -o name,guid -S creation`
+1. Discovers newest snapshot via `zfs list -Hp -t snap -o name,guid -S creation`
 2. Sends push metadata JSON (WS TEXT frame) to server
 3. Opens `zfs send` pipe to stream data
 

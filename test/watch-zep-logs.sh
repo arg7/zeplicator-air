@@ -22,8 +22,8 @@ tmux split-window -v -t zep-watch:0.0 -l ${PANEL_LINES}
 
 # Run watch tail in each pane
 tmux send-keys -t zep-watch:0.0 "watch -n 1 'tail -n ${TAIL_LINES} /tmp/zep-server.log | cut -c1-\$(tput cols)'" Enter
-tmux send-keys -t zep-watch:0.1 "watch -n 1 'tail -n ${TAIL_LINES} /tmp/zep-za-client-1.log | cut -c1-\$(tput cols)'" Enter
-tmux send-keys -t zep-watch:0.2 "watch -n 1 'tail -n ${TAIL_LINES} /tmp/zep-za-client-2.log | cut -c1-\$(tput cols)'" Enter
+tmux send-keys -t zep-watch:0.1 "watch -n 1 'tail -n ${TAIL_LINES} /tmp/zep-za-master.log | cut -c1-\$(tput cols)'" Enter
+tmux send-keys -t zep-watch:0.2 "watch -n 1 'tail -n ${TAIL_LINES} /tmp/zep-za-client-1.log | cut -c1-\$(tput cols)'" Enter
 
 # Attach to the session
 tmux attach-session -t zep-watch

@@ -112,20 +112,20 @@ echo "$out" | grep -q "incremental" && ok "incremental send detected" || bad "no
 # test 3
 echo -e "${CYAN}Test 3: client-1 pull (HTTP)${NC}"
 out=$(sudo -u za-client-1 "$ZEP" $ZCMD "$TMP/za-client-1.db" pull -f za-client-1-pool/slave -d za-master 2>&1)
-snaps=$(sudo zfs list -r -t snapshot za-client-1-pool/slave 2>/dev/null | grep -c '@' | tr -d '[:space:]' || echo 0)
+snaps=$(sudo zfs list -r -t snap za-client-1-pool/slave 2>/dev/null | grep -c '@' | tr -d '[:space:]' || echo 0)
 [[ $snaps -eq 2 ]] && ok "client-1 has 2 snapshots" || bad "client-1 has $snaps snapshots"
 
 # test 4
 echo -e "${CYAN}Test 4: client-2 pull (HTTP)${NC}"
 out=$(sudo -u za-client-2 "$ZEP" $ZCMD "$TMP/za-client-2.db" pull -f za-client-2-pool/slave -d za-master 2>&1)
-snaps=$(sudo zfs list -r -t snapshot za-client-2-pool/slave 2>/dev/null | grep -c '@' | tr -d '[:space:]' || echo 0)
+snaps=$(sudo zfs list -r -t snap za-client-2-pool/slave 2>/dev/null | grep -c '@' | tr -d '[:space:]' || echo 0)
 [[ $snaps -eq 2 ]] && ok "client-2 has 2 snapshots" || bad "client-2 has $snaps snapshots"
 
 # test 5
 echo -e "${CYAN}Test 5: GUID consistency${NC}"
-g_master=$(sudo zfs get -t snapshot -r -Hp -o value guid za-master-pool/master 2>/dev/null | grep -E '^[0-9]+$' | sort -n || true)
-g_c1=$(sudo zfs get -t snapshot -r -Hp -o value guid za-client-1-pool/slave 2>/dev/null | grep -E '^[0-9]+$' | sort -n || true)
-g_c2=$(sudo zfs get -t snapshot -r -Hp -o value guid za-client-2-pool/slave 2>/dev/null | grep -E '^[0-9]+$' | sort -n || true)
+g_master=$(sudo zfs get -t snap -r -Hp -o value guid za-master-pool/master 2>/dev/null | grep -E '^[0-9]+$' | sort -n || true)
+g_c1=$(sudo zfs get -t snap -r -Hp -o value guid za-client-1-pool/slave 2>/dev/null | grep -E '^[0-9]+$' | sort -n || true)
+g_c2=$(sudo zfs get -t snap -r -Hp -o value guid za-client-2-pool/slave 2>/dev/null | grep -E '^[0-9]+$' | sort -n || true)
 diff -q <(echo "$g_master") <(echo "$g_c1") && ok "client-1 GUIDs match" || bad "client-1 GUID mismatch"
 diff -q <(echo "$g_master") <(echo "$g_c2") && ok "client-2 GUIDs match" || bad "client-2 GUID mismatch"
 
@@ -136,14 +136,14 @@ sudo zfs allow -u za-client-1 clone,create,destroy,mount,promote,receive,rollbac
 sudo -u za-client-1 "$ZEP" $ZCMD "$TMP/za-client-1.db" push -f za-client-1-pool/master -l hourly >/dev/null 2>&1
 sudo zfs create -o mountpoint=none za-client-2-pool/slave2 2>/dev/null || true
 sudo -u za-client-2 "$ZEP" $ZCMD "$TMP/za-client-2.db" pull -f za-client-2-pool/slave2 -d za-client-1 >/dev/null 2>&1
-snaps=$(sudo zfs list -r -t snapshot za-client-2-pool/slave2 2>/dev/null | grep -c '@' | tr -d '[:space:]' || echo 0)
+snaps=$(sudo zfs list -r -t snap za-client-2-pool/slave2 2>/dev/null | grep -c '@' | tr -d '[:space:]' || echo 0)
 [[ $snaps -ge 1 ]] && ok "replica chain works ($snaps snaps)" || bad "replica chain failed ($snaps snaps)"
 
 # test 7
 echo -e "${CYAN}Test 7: idempotent pull${NC}"
-before=$(sudo zfs list -r -t snapshot za-client-1-pool/slave 2>/dev/null | grep -c '@' | tr -d '[:space:]' || echo 0)
+before=$(sudo zfs list -r -t snap za-client-1-pool/slave 2>/dev/null | grep -c '@' | tr -d '[:space:]' || echo 0)
 sudo -u za-client-1 "$ZEP" $ZCMD "$TMP/za-client-1.db" pull -f za-client-1-pool/slave -d za-master >/dev/null 2>&1
-after=$(sudo zfs list -r -t snapshot za-client-1-pool/slave 2>/dev/null | grep -c '@' | tr -d '[:space:]' || echo 0)
+after=$(sudo zfs list -r -t snap za-client-1-pool/slave 2>/dev/null | grep -c '@' | tr -d '[:space:]' || echo 0)
 [[ $before -eq $after ]] && ok "idempotent ($before snaps)" || bad "duplicates: $before -> $after"
 
 # test 8
@@ -169,13 +169,13 @@ pipe_allow zfs
 PIPE_ADM="--server https://master.zep.lan:18443 --cert $PKI/admin.crt --key $PKI/admin.key --ca $PKI/ca.crt"
 
 # test 10
-echo -e "${CYAN}Test 10: pipe zfs list -t snapshot${NC}"
-out=$(timeout 12s "$ADMIN" $PIPE_ADM pipe --node za-master zfs list -t snapshot 2>/dev/null)
+echo -e "${CYAN}Test 10: pipe zfs list -t snap${NC}"
+out=$(timeout 12s "$ADMIN" $PIPE_ADM pipe --node za-master zfs list -t snap 2>/dev/null)
 echo "$out" | grep -q '@' && ok "pipe zfs list returned snapshots" || bad "pipe zfs list failed"
 
 # test 11
 echo -e "${CYAN}Test 11: pipe zfs send | zstream dump -v${NC}"
-last_snap=$(sudo zfs list -t snapshot -o name -s creation za-master-pool/master 2>/dev/null | tail -1 | tr -d '[:space:]')
+last_snap=$(sudo zfs list -t snap -o name -s creation za-master-pool/master 2>/dev/null | tail -1 | tr -d '[:space:]')
 if [ -n "$last_snap" ]; then
     timeout 12s "$ADMIN" $PIPE_ADM pipe --node za-master zfs send "$last_snap" 2>/dev/null \
         | zstream dump -v >/dev/null 2>&1
@@ -187,7 +187,7 @@ fi
 
 # test 12 — pipe send pipeline: zfs list | zstd -c → admin | zstd -d
 echo -e "${CYAN}Test 12: pipe send pipeline (zfs list | zstd -c → zstd -d)${NC}"
-out=$(timeout 12s "$ADMIN" $PIPE_ADM pipe --node za-master "zfs list -H -o name -t snapshot za-master-pool/master | zstd -c" 2>/dev/null | zstd -d 2>/dev/null)
+out=$(timeout 12s "$ADMIN" $PIPE_ADM pipe --node za-master "zfs list -H -o name -t snap za-master-pool/master | zstd -c" 2>/dev/null | zstd -d 2>/dev/null)
 echo "$out" | grep -q '@' && ok "pipe send pipeline returned snapshots" || bad "pipe send pipeline failed"
 
 # test 13 — pipe recv pipeline: echo | zstd -c → admin → zstd -d | head -c 5
