@@ -256,14 +256,25 @@ static void node_ws_shutdown(void) {
     /* Give threads time to notice ws_closed and exit */
     sleep(2);
 
-    /* Force-cancel threads that are still alive */
+    /* Wait for threads to exit cooperatively (up to 5s) */
     pthread_mutex_lock(&g_node_ws_lock);
     for (struct node_ws *nw = g_node_ws; nw; nw = nw->next) {
-        if (nw->thread) {
-            pthread_cancel(nw->thread);
-            pthread_join(nw->thread, NULL);
-            nw->thread = 0;
-        }
+        if (!nw->thread) continue;
+        pthread_mutex_unlock(&g_node_ws_lock);
+
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        ts.tv_sec += 5;
+        int rc = pthread_timedjoin_np(nw->thread, NULL, &ts);
+
+        int joined = (rc != EAGAIN);
+        pthread_mutex_lock(&g_node_ws_lock);
+        if (!joined)
+            zep_log_warn("ws: node %s thread did not exit in 5s, abandoning\n", nw->cn);
+        nw->thread = 0;
+
+        if (!joined) continue;
+
         if (nw->pipe_admin_to_node[0] >= 0) close(nw->pipe_admin_to_node[0]);
         if (nw->pipe_admin_to_node[1] >= 0) close(nw->pipe_admin_to_node[1]);
         if (nw->pipe_node_to_admin[0] >= 0) close(nw->pipe_node_to_admin[0]);
