@@ -493,6 +493,220 @@ struct node_ws_thread_ctx {
     struct node_ws *nw;
 };
 
+#define MAX_PENDING 8
+
+static void
+scheduler_run(struct node_ws *nw, const char *cluster_buf,
+    char pending_snaps[][ZEP_MAX_SNAPSHOT_NAME],
+    char pending_labels[][64],
+    int *pending_tail)
+{
+    char cluster_def[4096] = {0};
+    char ckey[128];
+    snprintf(ckey, sizeof(ckey), "cluster_%s", cluster_buf);
+    db_config_get(g_db, ckey, cluster_def, sizeof(cluster_def));
+    if (!cluster_def[0]) return;
+    cJSON *cj = cJSON_Parse(cluster_def);
+    if (!cj || !cJSON_IsObject(cj)) return;
+
+    cJSON *pools = cJSON_GetObjectItem(cj, "pools");
+    cJSON *labels = cJSON_GetObjectItem(cj, "labels");
+    cJSON *fs_arr = cJSON_GetObjectItem(cj, "filesystems");
+    time_t now = time(NULL);
+    struct tm tm_sched;
+    gmtime_r(&now, &tm_sched);
+    char ts_str[16];
+    strftime(ts_str, sizeof(ts_str), "%Y%m%d-%H%M%S", &tm_sched);
+
+    if (pools && cJSON_IsObject(pools)) {
+        cJSON *pool;
+        cJSON_ArrayForEach(pool, pools) {
+            const char *pool_name = pool->string;
+            if (!pool_name || !cJSON_IsObject(pool)) continue;
+            cJSON *dataset;
+            cJSON_ArrayForEach(dataset, pool) {
+                const char *ds_name = dataset->string;
+                if (!ds_name || !cJSON_IsObject(dataset)) continue;
+                cJSON *ds_obj = dataset;
+                cJSON *lbls = cJSON_GetObjectItem(ds_obj, "labels");
+                if (!lbls || !cJSON_IsObject(lbls)) continue;
+
+                char cluster_fs[512];
+                snprintf(cluster_fs, sizeof(cluster_fs), "%s/%s", pool_name, ds_name);
+
+                cJSON *lbl_item;
+                cJSON_ArrayForEach(lbl_item, lbls) {
+                    const char *ln = lbl_item->string;
+                    int interval_sec = lbl_item->valueint;
+                    if (!ln || interval_sec == 0) continue;
+
+                    char cron_key[1024];
+                    snprintf(cron_key, sizeof(cron_key),
+                        "cron_last_%s_%s_%s", cluster_buf, cluster_fs, ln);
+                    char last_str[32] = {0};
+                    db_config_get(g_db, cron_key, last_str, sizeof(last_str));
+
+                    time_t last = 0;
+                    if (last_str[0]) {
+                        struct tm tm = {0};
+                        if (strptime(last_str, "%Y-%m-%dT%H:%M:%SZ", &tm))
+                            last = timegm(&tm);
+                    }
+
+                    if (last > 0 && (now - last) < interval_sec)
+                        continue;
+
+                    char snap_name[1024];
+                    snprintf(snap_name, sizeof(snap_name),
+                        "%s@%s-%s-%s",
+                        cluster_fs, cluster_buf, ln, ts_str);
+
+                    /* Skip if snapshot already exists in DB */
+                    {
+                        sqlite3_stmt *chk = NULL;
+                        char suffix[256];
+                        snprintf(suffix, sizeof(suffix), "@%s-%s-%s",
+                            cluster_buf, ln, ts_str);
+                        char chk_sql[1024];
+                        snprintf(chk_sql, sizeof(chk_sql),
+                            "SELECT 1 FROM snapshots WHERE node=?1 AND snapshot LIKE '%%%s%%'",
+                            suffix);
+                        if (sqlite3_prepare_v2(g_db, chk_sql, -1, &chk, NULL) == SQLITE_OK) {
+                            sqlite3_bind_text(chk, 1, nw->cn, -1, SQLITE_STATIC);
+                            if (sqlite3_step(chk) == SQLITE_ROW) {
+                                sqlite3_finalize(chk);
+                                continue;
+                            }
+                            sqlite3_finalize(chk);
+                        }
+                    }
+
+                    char guid[65];
+                    {
+                        unsigned char bytes[16];
+                        FILE *f = fopen("/dev/urandom", "r");
+                        if (f) {
+                            fread(bytes, 1, 16, f);
+                            fclose(f);
+                        } else {
+                            for (int i = 0; i < 16; i++) bytes[i] = (unsigned char)rand();
+                        }
+                        snprintf(guid, sizeof(guid),
+                            "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                            bytes[0], bytes[1], bytes[2], bytes[3],
+                            bytes[4], bytes[5], bytes[6], bytes[7],
+                            bytes[8], bytes[9], bytes[10], bytes[11],
+                            bytes[12], bytes[13], bytes[14], bytes[15]);
+                    }
+
+                    char task_json[2048];
+                    int n = snprintf(task_json, sizeof(task_json),
+                        "{\"action\":\"create_snap\",\"cluster_fs\":\"%s\",\"label\":\"%s\",\"snapshot\":\"%s\",\"guid\":\"%s\"}",
+                        cluster_fs, ln, snap_name, guid);
+                    if (n > 0 && n < (int)sizeof(task_json)) {
+                        zep_log("scheduler: create_snap %s (label=%s, interval=%ds)\n",
+                            snap_name, ln, interval_sec);
+                        if (*pending_tail < MAX_PENDING) {
+                            snprintf(pending_snaps[*pending_tail], ZEP_MAX_SNAPSHOT_NAME, "%s", snap_name);
+                            snprintf(pending_labels[*pending_tail], sizeof(pending_labels[0]), "%s", ln);
+                            (*pending_tail)++;
+                        }
+                        ws_send_frame_gtls(nw, WS_OP_TEXT,
+                            (unsigned char *)task_json, (size_t)n);
+                    }
+                }
+            }
+        }
+    } else if (labels && cJSON_IsArray(labels) && fs_arr && cJSON_IsArray(fs_arr)) {
+        cJSON *label_item;
+        cJSON_ArrayForEach(label_item, labels) {
+            const char *ln = cJSON_GetStringValue(label_item);
+            if (!ln) continue;
+            int interval_sec = 0;
+            if (strncmp(ln, "min", 3) == 0) {
+                char *end;
+                long val = strtol(ln + 3, &end, 10);
+                interval_sec = (end > ln + 3 && *end == 'N') ? (int)(val * 60) : 60;
+            } else if (strncmp(ln, "hour", 4) == 0) {
+                char *end;
+                long val = strtol(ln + 4, &end, 10);
+                interval_sec = (end > ln + 4 && *end == 'N') ? (int)(val * 3600) : 3600;
+            } else if (strncmp(ln, "day", 3) == 0) {
+                char *end;
+                long val = strtol(ln + 3, &end, 10);
+                interval_sec = (end > ln + 3 && *end == 'N') ? (int)(val * 86400) : 86400;
+            } else if (strncmp(ln, "week", 4) == 0) {
+                char *end;
+                long val = strtol(ln + 4, &end, 10);
+                interval_sec = (end > ln + 4 && *end == 'N') ? (int)(val * 604800) : 7 * 86400;
+            }
+            if (interval_sec == 0) continue;
+
+            cJSON *fs_item;
+            cJSON_ArrayForEach(fs_item, fs_arr) {
+                const char *cluster_fs = cJSON_GetStringValue(fs_item);
+                if (!cluster_fs) continue;
+
+                char cron_key[1024];
+                snprintf(cron_key, sizeof(cron_key),
+                    "cron_last_%s_%s_%s", cluster_buf, cluster_fs, ln);
+                char last_str[32] = {0};
+                db_config_get(g_db, cron_key, last_str, sizeof(last_str));
+
+                time_t last = 0;
+                if (last_str[0]) {
+                    struct tm tm = {0};
+                    if (strptime(last_str, "%Y-%m-%dT%H:%M:%SZ", &tm))
+                        last = timegm(&tm);
+                }
+
+                if (last > 0 && (now - last) < interval_sec)
+                    continue;
+
+                char snap_name[1024];
+                snprintf(snap_name, sizeof(snap_name),
+                    "%s@%s-%s-%s",
+                    cluster_fs, cluster_buf, ln, ts_str);
+
+                char guid[65];
+                {
+                    unsigned char bytes[16];
+                    FILE *f = fopen("/dev/urandom", "r");
+                    if (f) {
+                        fread(bytes, 1, 16, f);
+                        fclose(f);
+                    } else {
+                        for (int i = 0; i < 16; i++) bytes[i] = (unsigned char)rand();
+                    }
+                    snprintf(guid, sizeof(guid),
+                        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                        bytes[0], bytes[1], bytes[2], bytes[3],
+                        bytes[4], bytes[5], bytes[6], bytes[7],
+                        bytes[8], bytes[9], bytes[10], bytes[11],
+                        bytes[12], bytes[13], bytes[14], bytes[15]);
+                }
+
+                char task_json[2048];
+                int n = snprintf(task_json, sizeof(task_json),
+                    "{\"action\":\"create_snap\",\"cluster_fs\":\"%s\",\"label\":\"%s\",\"snapshot\":\"%s\",\"guid\":\"%s\"}",
+                    cluster_fs, ln, snap_name, guid);
+                if (n > 0 && n < (int)sizeof(task_json)) {
+                    zep_log("scheduler: create_snap %s (label=%s, interval=%ds)\n",
+                        snap_name, ln, interval_sec);
+                    if (*pending_tail < MAX_PENDING) {
+                        snprintf(pending_snaps[*pending_tail], ZEP_MAX_SNAPSHOT_NAME, "%s", snap_name);
+                        snprintf(pending_labels[*pending_tail], sizeof(pending_labels[0]), "%s", ln);
+                        (*pending_tail)++;
+                    }
+                    ws_send_frame_gtls(nw, WS_OP_TEXT,
+                        (unsigned char *)task_json, (size_t)n);
+                }
+            }
+        }
+    }
+    cJSON_Delete(cj);
+}
+
 static void *node_ws_thread(void *arg) {
     struct node_ws_thread_ctx *ctx = (struct node_ws_thread_ctx *)arg;
     struct node_ws *nw = ctx->nw;
@@ -510,7 +724,6 @@ static void *node_ws_thread(void *arg) {
     int discovery_done = 0;
 
     /* Pending create_snap task queue (FIFO) */
-    #define MAX_PENDING 8
     char pending_snaps[MAX_PENDING][ZEP_MAX_SNAPSHOT_NAME];
     char pending_labels[MAX_PENDING][64];
     int pending_head = 0, pending_tail = 0;
@@ -535,223 +748,17 @@ static void *node_ws_thread(void *arg) {
         }
     }
 
-    /* Scheduler: check cron_last_* vs label intervals, send create_snap tasks (masters only) */
-    if (strcmp(role_buf, "master") == 0 && cluster_buf[0] && mapping_buf[0]) {
-        char cluster_def[4096] = {0};
-        char ckey[128];
-        snprintf(ckey, sizeof(ckey), "cluster_%s", cluster_buf);
-        db_config_get(g_db, ckey, cluster_def, sizeof(cluster_def));
-        if (cluster_def[0]) {
-            cJSON *cj = cJSON_Parse(cluster_def);
-            if (cj && cJSON_IsObject(cj)) {
-                /* Support both old and new cluster formats:
-                 * New: {"pools":{"pool":{"fs":{"labels":{"min":60,...}}}}}
-                 * Old: {"labels":["min","hour"],"filesystems":["pool/fs"]}
-                 */
-                cJSON *pools = cJSON_GetObjectItem(cj, "pools");
-                cJSON *labels = cJSON_GetObjectItem(cj, "labels");
-                cJSON *fs_arr = cJSON_GetObjectItem(cj, "filesystems");
-                time_t now = time(NULL);
-                struct tm tm_sched;
-                gmtime_r(&now, &tm_sched);
-                char ts_str[16];
-                strftime(ts_str, sizeof(ts_str), "%Y%m%d-%H%M%S", &tm_sched);
-                if (pools && cJSON_IsObject(pools)) {
-                    /* New format: iterate pools → datasets → labels */
-                    cJSON *pool;
-                    cJSON_ArrayForEach(pool, pools) {
-                        const char *pool_name = pool->string; /* pool name */
-                        if (!pool_name || !cJSON_IsObject(pool)) continue;
-                        cJSON *dataset;
-                        cJSON_ArrayForEach(dataset, pool) {
-                            const char *ds_name = dataset->string; /* dataset name */
-                            if (!ds_name || !cJSON_IsObject(dataset)) continue;
-                            cJSON *ds_obj = dataset;
-                            cJSON *lbls = cJSON_GetObjectItem(ds_obj, "labels");
-                            if (!lbls || !cJSON_IsObject(lbls)) continue;
-
-                            char cluster_fs[512];
-                            snprintf(cluster_fs, sizeof(cluster_fs), "%s/%s", pool_name, ds_name);
-
-                            /* Iterate each label */
-                            cJSON *lbl_item;
-                            cJSON_ArrayForEach(lbl_item, lbls) {
-                                const char *ln = lbl_item->string; /* key = label name */
-                                int interval_sec = lbl_item->valueint; /* value = interval in seconds */
-                                if (!ln || interval_sec == 0) continue;
-
-                                char cron_key[1024];
-                                snprintf(cron_key, sizeof(cron_key),
-                                    "cron_last_%s_%s_%s", cluster_buf, cluster_fs, ln);
-                                char last_str[32] = {0};
-                                db_config_get(g_db, cron_key, last_str, sizeof(last_str));
-
-                                time_t last = 0;
-                                if (last_str[0]) {
-                                    struct tm tm = {0};
-                                    if (strptime(last_str, "%Y-%m-%dT%H:%M:%SZ", &tm))
-                                        last = timegm(&tm);
-                                }
-
-                                if (last > 0 && (now - last) < interval_sec)
-                                    continue;
-
-                                char snap_name[1024];
-                                snprintf(snap_name, sizeof(snap_name),
-                                    "%s@%s-%s-%s",
-                                    cluster_fs, cluster_buf, ln, ts_str);
-
-                                /* Skip if snapshot already exists in DB (check by label+timestamp suffix) */
-                                {
-                                    sqlite3_stmt *chk = NULL;
-                                    char suffix[256];
-                                    snprintf(suffix, sizeof(suffix), "@%s-%s-%s",
-                                        cluster_buf, ln, ts_str);
-                                    char chk_sql[1024];
-                                    snprintf(chk_sql, sizeof(chk_sql),
-                                        "SELECT 1 FROM snapshots WHERE node=?1 AND snapshot LIKE '%%%s%%'",
-                                        suffix);
-                                    if (sqlite3_prepare_v2(g_db, chk_sql, -1, &chk, NULL) == SQLITE_OK) {
-                                        sqlite3_bind_text(chk, 1, nw->cn, -1, SQLITE_STATIC);
-                                        if (sqlite3_step(chk) == SQLITE_ROW) {
-                                            sqlite3_finalize(chk);
-                                            continue; /* already exists */
-                                        }
-                                        sqlite3_finalize(chk);
-                                    }
-                                }
-
-                                char guid[65];
-                                {
-                                    unsigned char bytes[16];
-                                    FILE *f = fopen("/dev/urandom", "r");
-                                    if (f) {
-                                        fread(bytes, 1, 16, f);
-                                        fclose(f);
-                                    } else {
-                                        for (int i = 0; i < 16; i++) bytes[i] = (unsigned char)rand();
-                                    }
-                                    snprintf(guid, sizeof(guid),
-                                        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                                        bytes[0], bytes[1], bytes[2], bytes[3],
-                                        bytes[4], bytes[5], bytes[6], bytes[7],
-                                        bytes[8], bytes[9], bytes[10], bytes[11],
-                                        bytes[12], bytes[13], bytes[14], bytes[15]);
-                                }
-
-                                char task_json[2048];
-                                int n = snprintf(task_json, sizeof(task_json),
-                                    "{\"action\":\"create_snap\",\"cluster_fs\":\"%s\",\"label\":\"%s\",\"snapshot\":\"%s\",\"guid\":\"%s\"}",
-                                    cluster_fs, ln, snap_name, guid);
-                                if (n > 0 && n < (int)sizeof(task_json)) {
-                                    zep_log("scheduler: create_snap %s (label=%s, interval=%ds)\n",
-                                        snap_name, ln, interval_sec);
-                                    if (pending_tail < MAX_PENDING) {
-                                        snprintf(pending_snaps[pending_tail], ZEP_MAX_SNAPSHOT_NAME, "%s", snap_name);
-                                        snprintf(pending_labels[pending_tail], sizeof(pending_labels[0]), "%s", ln);
-                                        pending_tail++;
-                                    }
-                                    ws_send_frame_gtls(nw, WS_OP_TEXT,
-                                        (unsigned char *)task_json, (size_t)n);
-                                }
-                            }
-                        }
-                    }
-                } else if (labels && cJSON_IsArray(labels) && fs_arr && cJSON_IsArray(fs_arr)) {
-                    /* Old format (fallback) */
-                    cJSON *label_item;
-                    cJSON_ArrayForEach(label_item, labels) {
-                        const char *ln = cJSON_GetStringValue(label_item);
-                        if (!ln) continue;
-                        int interval_sec = 0;
-                        if (strncmp(ln, "min", 3) == 0) {
-                            char *end;
-                            long val = strtol(ln + 3, &end, 10);
-                            interval_sec = (end > ln + 3 && *end == 'N') ? (int)(val * 60) : 60;
-                        } else if (strncmp(ln, "hour", 4) == 0) {
-                            char *end;
-                            long val = strtol(ln + 4, &end, 10);
-                            interval_sec = (end > ln + 4 && *end == 'N') ? (int)(val * 3600) : 3600;
-                        } else if (strncmp(ln, "day", 3) == 0) {
-                            char *end;
-                            long val = strtol(ln + 3, &end, 10);
-                            interval_sec = (end > ln + 3 && *end == 'N') ? (int)(val * 86400) : 86400;
-                        } else if (strncmp(ln, "week", 4) == 0) {
-                            char *end;
-                            long val = strtol(ln + 4, &end, 10);
-                            interval_sec = (end > ln + 4 && *end == 'N') ? (int)(val * 604800) : 7 * 86400;
-                        }
-                        if (interval_sec == 0) continue;
-
-                        cJSON *fs_item;
-                        cJSON_ArrayForEach(fs_item, fs_arr) {
-                            const char *cluster_fs = cJSON_GetStringValue(fs_item);
-                            if (!cluster_fs) continue;
-
-                            char cron_key[1024];
-                            snprintf(cron_key, sizeof(cron_key),
-                                "cron_last_%s_%s_%s", cluster_buf, cluster_fs, ln);
-                            char last_str[32] = {0};
-                            db_config_get(g_db, cron_key, last_str, sizeof(last_str));
-
-                            time_t last = 0;
-                            if (last_str[0]) {
-                                struct tm tm = {0};
-                                if (strptime(last_str, "%Y-%m-%dT%H:%M:%SZ", &tm))
-                                    last = timegm(&tm);
-                            }
-
-                            if (last > 0 && (now - last) < interval_sec)
-                                continue;
-
-                            char snap_name[1024];
-                            snprintf(snap_name, sizeof(snap_name),
-                                "%s@%s-%s-%s",
-                                cluster_fs, cluster_buf, ln, ts_str);
-
-                            char guid[65];
-                            {
-                                unsigned char bytes[16];
-                                FILE *f = fopen("/dev/urandom", "r");
-                                if (f) {
-                                    fread(bytes, 1, 16, f);
-                                    fclose(f);
-                                } else {
-                                    for (int i = 0; i < 16; i++) bytes[i] = (unsigned char)rand();
-                                }
-                                snprintf(guid, sizeof(guid),
-                                    "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                                    bytes[0], bytes[1], bytes[2], bytes[3],
-                                    bytes[4], bytes[5], bytes[6], bytes[7],
-                                    bytes[8], bytes[9], bytes[10], bytes[11],
-                                    bytes[12], bytes[13], bytes[14], bytes[15]);
-                            }
-
-                            char task_json[2048];
-                            int n = snprintf(task_json, sizeof(task_json),
-                                "{\"action\":\"create_snap\",\"cluster_fs\":\"%s\",\"label\":\"%s\",\"snapshot\":\"%s\",\"guid\":\"%s\"}",
-                                cluster_fs, ln, snap_name, guid);
-                            if (n > 0 && n < (int)sizeof(task_json)) {
-                                zep_log("scheduler: create_snap %s (label=%s, interval=%ds)\n",
-                                    snap_name, ln, interval_sec);
-                                if (pending_tail < MAX_PENDING) {
-                                    snprintf(pending_snaps[pending_tail], ZEP_MAX_SNAPSHOT_NAME, "%s", snap_name);
-                                    snprintf(pending_labels[pending_tail], sizeof(pending_labels[0]), "%s", ln);
-                                    pending_tail++;
-                                }
-                                ws_send_frame_gtls(nw, WS_OP_TEXT,
-                                    (unsigned char *)task_json, (size_t)n);
-                            }
-                        }
-                    }
-                }
-                cJSON_Delete(cj);
-            }
-        }
-    }
+    /* Initial scheduler run */
+    if (strcmp(role_buf, "master") == 0 && cluster_buf[0] && mapping_buf[0])
+        scheduler_run(nw, cluster_buf, pending_snaps, pending_labels, &pending_tail);
 
     time_t last_ping = time(NULL);
+    time_t last_scheduler = time(NULL);
     for (;;) {
+        if (pending_head >= pending_tail) {
+            pending_head = 0;
+            pending_tail = 0;
+        }
         /* Check if pipe is starting — exit so bridge can take over */
         pthread_mutex_lock(&nw->lock);
         int exiting = nw->pipe_starting;
@@ -785,6 +792,14 @@ static void *node_ws_thread(void *arg) {
             ws_send_frame_gtls(nw, WS_OP_PING, NULL, 0);
             zep_log_debug( "ws: -> PING  cn=%s\n", nw->cn);
             last_ping = now;
+        }
+
+        /* Periodic scheduler: check if any labels are due */
+        if (strcmp(role_buf, "master") == 0 && cluster_buf[0] && mapping_buf[0]) {
+            if (now - last_scheduler >= 30) {
+                scheduler_run(nw, cluster_buf, pending_snaps, pending_labels, &pending_tail);
+                last_scheduler = now;
+            }
         }
 
         if (sel > 0 && FD_ISSET(nw->sock, &rfds)) {
