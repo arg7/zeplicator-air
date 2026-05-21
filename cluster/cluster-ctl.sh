@@ -81,6 +81,7 @@ CRON_INTERVAL="${CRON_INTERVAL:-60}"
 START_CLIENTS="${START_CLIENTS:-1}"
 SUDO_NODES="${SUDO_NODES:-0}"
 VERB="${VERB:-}"
+KEY_PASSWORD="${KEY_PASSWORD:-}"
 
 run_as() {
     local user="$1"; shift
@@ -169,12 +170,12 @@ do_start() {
             "$SERV" --logging DEBUG,INFO,WARN,ERROR,AUDIT --port "$SERVER_PORT" \
                 --cert "${PKI_DIR}/server.crt" --key "${PKI_DIR}/server.key" \
                 --ca "${PKI_DIR}/ca.crt" --db "$SERVER_DB" \
-                --storage "$SERVER_STORAGE" >/tmp/zep-server.log 2>&1 &
+                --storage "$SERVER_STORAGE" ${KEY_PASSWORD:+-P "${KEY_PASSWORD}"} >/tmp/zep-server.log 2>&1 &
         else
             "$SERV" --port "$SERVER_PORT" \
                 --cert "${PKI_DIR}/server.crt" --key "${PKI_DIR}/server.key" \
                 --ca "${PKI_DIR}/ca.crt" --db "$SERVER_DB" \
-                --storage "$SERVER_STORAGE" >/tmp/zep-server.log 2>&1 &
+                --storage "$SERVER_STORAGE" ${KEY_PASSWORD:+-P "${KEY_PASSWORD}"} >/tmp/zep-server.log 2>&1 &
         fi
         local new_pid=$!
         wait_for_running "$new_pid" "$SERVER_START_TIMEOUT" "Server" || true

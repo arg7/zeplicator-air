@@ -23,6 +23,7 @@
 #include <gnutls/gnutls.h>
 #include <gnutls/x509.h>
 #include <openssl/sha.h>
+#include <openssl/evp.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -59,6 +60,7 @@ struct node_ws {
     char pipe_cmd[4096];
     int pipe_starting;
     int pipe_thread_exited;
+    int pipe_bridge_active;
     pthread_cond_t pipe_ready;
     /* Pipes for inter-thread data transfer */
     int pipe_admin_to_node[2];
@@ -295,7 +297,8 @@ static void node_ws_unregister(struct node_ws *target) {
 zep_log_debug("ws: node %s unregistered\n", nw->cn);
             pthread_mutex_destroy(&nw->lock);
             pthread_cond_destroy(&nw->pipe_ready);
-            free(nw);
+            if (!nw->pipe_bridge_active)
+                free(nw);
             break;
         }
         prev = nw;
@@ -576,16 +579,34 @@ scheduler_run(struct node_ws *nw, const char *cluster_buf,
                     {
                         sqlite3_stmt *chk = NULL;
                         char chk_sql[2048];
-                        snprintf(chk_sql, sizeof(chk_sql),
-                            "SELECT 1 FROM snapshots WHERE node=?1 AND snapshot=?2");
-                        if (sqlite3_prepare_v2(g_db, chk_sql, -1, &chk, NULL) == SQLITE_OK) {
-                            sqlite3_bind_text(chk, 1, nw->cn, -1, SQLITE_STATIC);
-                            sqlite3_bind_text(chk, 2, snap_name, -1, SQLITE_STATIC);
-                            if (sqlite3_step(chk) == SQLITE_ROW) {
-                                sqlite3_finalize(chk);
-                                continue;
+                        /* Extract the @cluster-label-timestamp suffix from snap_name
+                         * and match against the end of the snapshot column.
+                         * The DB stores actual ZFS names (pool/fs@cluster-label-ts)
+                         * while snap_name uses cluster_fs format. A suffix LIKE match
+                         * covers both. */
+                        const char *at = strchr(snap_name, '@');
+                        if (at) {
+                            int suffix_len = (int)strlen(at);
+                            /* Escape SQL LIKE wildcards in the suffix */
+                            char escaped[1024] = {0};
+                            for (int i = 0; i < suffix_len && i < (int)sizeof(escaped) - 3; i++) {
+                                char c = at[i];
+                                if (c == '%' || c == '_') {
+                                    escaped[strlen(escaped)] = '\\';
+                                }
+                                escaped[strlen(escaped)] = c;
                             }
-                            sqlite3_finalize(chk);
+                            snprintf(chk_sql, sizeof(chk_sql),
+                                "SELECT 1 FROM snapshots WHERE node=?1 AND snapshot LIKE ?2 ESCAPE '\\\\'");
+                            if (sqlite3_prepare_v2(g_db, chk_sql, -1, &chk, NULL) == SQLITE_OK) {
+                                sqlite3_bind_text(chk, 1, nw->cn, -1, SQLITE_STATIC);
+                                sqlite3_bind_text(chk, 2, escaped, -1, SQLITE_STATIC);
+                                if (sqlite3_step(chk) == SQLITE_ROW) {
+                                    sqlite3_finalize(chk);
+                                    continue;
+                                }
+                                sqlite3_finalize(chk);
+                            }
                         }
                     }
 
@@ -1796,6 +1817,9 @@ zep_log_debug("ws: pipe found node %s sock=%d\n", node_cn, nw->sock);
         pthread_mutex_unlock(&nw->lock);
     }
 
+    /* Mark bridge as active so node thread doesn't free nw */
+    nw->pipe_bridge_active = 1;
+
     /* Join the node thread to ensure it is fully dead */
     pthread_join(nw->thread, NULL);
 
@@ -1945,6 +1969,9 @@ zep_log_debug("ws: pipe bridge ended admin=%d node=%d\n", admin_alive, node_aliv
     MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
 
     free(admin_buf); free(node_buf); free(admin_out); free(node_out);
+
+    /* Free nw — node thread skipped free due to pipe_bridge_active */
+    free(nw);
 
     /* Don't unregister node — it reconnects on its own */
 }
@@ -3316,32 +3343,34 @@ static int load_pem(const char *path, char **data) {
     (*data)[r] = '\0';
 
     if (g_key_password[0] && strstr(*data, "ENCRYPTED")) {
-        char tmp_in[256], tmp_out[256], cmd[2048];
-        snprintf(tmp_in, sizeof(tmp_in), "/tmp/zep-key-in-%d", getpid());
-        snprintf(tmp_out, sizeof(tmp_out), "/tmp/zep-key-out-%d", getpid());
-        FILE *tf = fopen(tmp_in, "w");
-        if (tf) { fwrite(*data, 1, r, tf); fclose(tf); }
-      snprintf(cmd, sizeof(cmd),
-             "openssl rsa -in '%s' -passin pass:'%s' -out '%s' 2>/dev/null",
-             tmp_in, g_key_password, tmp_out);
-        int _ossl_rc = system(cmd);
-        audit_log(AUDIT_EVT_EXEC, "serve", cmd, _ossl_rc < 0 ? -127 : WIFEXITED(_ossl_rc) ? WEXITSTATUS(_ossl_rc) : -1);
-        if (_ossl_rc == 0) {
-            FILE *of = fopen(tmp_out, "r");
-            if (of) {
-                fseek(of, 0, SEEK_END);
-                long osz = ftell(of);
-                fseek(of, 0, SEEK_SET);
-                free(*data);
-                *data = malloc((size_t)osz + 1);
-                if (*data) {
-                    size_t or_ = fread(*data, 1, (size_t)osz, of);
-                    (*data)[or_] = '\0';
-                }
-                fclose(of);
-            }
+        EVP_PKEY *pkey = NULL;
+        BIO *bio = BIO_new_mem_buf(*data, (int)r);
+        if (bio) {
+            pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, g_key_password);
+            BIO_free(bio);
         }
-        unlink(tmp_in); unlink(tmp_out);
+        if (!pkey) {
+            zep_log_warn("load_pem: failed to decrypt key from %s\n", path);
+            return -1;
+        }
+        /* Write decrypted key back as PEM */
+        BIO *out = BIO_new(BIO_s_mem());
+        if (out) {
+            PEM_write_bio_PrivateKey_traditional(out, pkey, NULL, NULL, 0, NULL, NULL);
+            char *mem_ptr;
+            long mem_len = BIO_get_mem_ptr(out, &mem_ptr);
+            if (mem_len > 0) {
+                free(*data);
+                *data = malloc((size_t)mem_len + 1);
+                if (*data) {
+                    memcpy(*data, mem_ptr, (size_t)mem_len);
+                    (*data)[mem_len] = '\0';
+                }
+            }
+            BIO_free(out);
+        }
+        EVP_PKEY_free(pkey);
+        if (!*data) return -1;
     }
     return 0;
 }

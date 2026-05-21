@@ -105,12 +105,33 @@ grep -q "${SERVER_HOST}" /etc/hosts 2>/dev/null || \
 ###############################################################################
 say "Generating PKI ..."
 
+# Helper: encrypt a key if KEY_PASSWORD is set
+encrypt_key() {
+    local keyfile="$1"
+    if [[ -n "${KEY_PASSWORD:-}" ]]; then
+        openssl rsa -in "$keyfile" -out "${keyfile}.enc" \
+            -aes-256-cbc -passout "pass:${KEY_PASSWORD}" 2>/dev/null
+        mv "${keyfile}.enc" "$keyfile"
+    fi
+}
+
+# Helper: encrypt a key if KEY_PASSWORD is set
+encrypt_key() {
+    local keyfile="$1"
+    if [[ -n "${KEY_PASSWORD:-}" ]]; then
+        openssl rsa -in "$keyfile" -out "${keyfile}.enc" \
+            -aes-256-cbc -passout "pass:${KEY_PASSWORD}" 2>/dev/null
+        mv "${keyfile}.enc" "$keyfile"
+    fi
+}
+
 # CA
 if [[ ! -f "${PKI_DIR}/ca.crt" ]]; then
     openssl genrsa -out "${PKI_DIR}/ca.key" 4096 2>/dev/null
     openssl req -x509 -new -nodes -key "${PKI_DIR}/ca.key" \
         -sha256 -days "${CA_DAYS:-3650}" -out "${PKI_DIR}/ca.crt" \
         -subj "/CN=${CA_CN:-Zep-CA}" 2>/dev/null
+    encrypt_key "${PKI_DIR}/ca.key"
     chmod 644 "${PKI_DIR}/ca.key"
 fi
 
@@ -124,8 +145,10 @@ basicConstraints=CA:FALSE
 keyUsage=digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth
 XEOF
+    ca_pass_opt=""
+    [[ -n "${KEY_PASSWORD:-}" ]] && ca_pass_opt="-passin pass:${KEY_PASSWORD}"
     openssl x509 -req -in "${PKI_DIR}/server.csr" \
-        -CA "${PKI_DIR}/ca.crt" -CAkey "${PKI_DIR}/ca.key" \
+        -CA "${PKI_DIR}/ca.crt" -CAkey "${PKI_DIR}/ca.key" ${ca_pass_opt} \
         -CAcreateserial -out "${PKI_DIR}/server.crt" \
         -days "${NODE_DAYS:-365}" -sha256 \
         -extfile "${PKI_DIR}/server.ext" 2>/dev/null
@@ -145,7 +168,7 @@ keyUsage=digitalSignature,keyEncipherment
 extendedKeyUsage=clientAuth
 XEOF
     openssl x509 -req -in "${PKI_DIR}/admin.csr" \
-        -CA "${PKI_DIR}/ca.crt" -CAkey "${PKI_DIR}/ca.key" \
+        -CA "${PKI_DIR}/ca.crt" -CAkey "${PKI_DIR}/ca.key" ${ca_pass_opt} \
         -CAcreateserial -out "${PKI_DIR}/admin.crt" \
         -days "${NODE_DAYS:-365}" -sha256 \
         -extfile "${PKI_DIR}/admin.ext" 2>/dev/null
@@ -162,7 +185,7 @@ for entry in ${NODES:-}; do
     openssl req -new -key "${PKI_DIR}/${cn}.key" -out "${PKI_DIR}/${cn}.csr" \
         -subj "/CN=${cn}" 2>/dev/null
     openssl x509 -req -in "${PKI_DIR}/${cn}.csr" \
-        -CA "${PKI_DIR}/ca.crt" -CAkey "${PKI_DIR}/ca.key" \
+        -CA "${PKI_DIR}/ca.crt" -CAkey "${PKI_DIR}/ca.key" ${ca_pass_opt} \
         -CAcreateserial -out "${PKI_DIR}/${cn}.crt" \
         -days "${NODE_DAYS:-365}" -sha256 2>/dev/null
     chmod 644 "${PKI_DIR}/${cn}.key"
@@ -235,7 +258,7 @@ rm -f "$SERVER_DB"
 sudo "$SERV" --setup \
     --cert "${PKI_DIR}/server.crt" --key "${PKI_DIR}/server.key" \
     --ca "${PKI_DIR}/ca.crt" --admin-cert "${PKI_DIR}/admin.crt" \
-    --db "$SERVER_DB" 2>/dev/null
+    --db "$SERVER_DB" ${KEY_PASSWORD:+-P "${KEY_PASSWORD}"} 2>/dev/null
 sudo chown "${OWNER}:${OWNER}" "$SERVER_DB"
 
 ###############################################################################
@@ -250,7 +273,7 @@ else
     "$SERV" --port "$SERVER_PORT" \
         --cert "${PKI_DIR}/server.crt" --key "${PKI_DIR}/server.key" \
         --ca "${PKI_DIR}/ca.crt" --db "$SERVER_DB" \
-        --storage "$SERVER_STORAGE" 2>/dev/null &
+        --storage "$SERVER_STORAGE" ${KEY_PASSWORD:+-P "${KEY_PASSWORD}"} 2>/dev/null &
     SERV_PID=$!
     sleep 2
     if ! kill -0 "$SERV_PID" 2>/dev/null; then
@@ -353,7 +376,7 @@ if [[ "$RESUME_TEST" -eq 1 && "$NO_START" -ne 1 ]]; then
     "$SERV" --port "$SERVER_PORT" \
         --cert "${PKI_DIR}/server.crt" --key "${PKI_DIR}/server.key" \
         --ca "${PKI_DIR}/ca.crt" --db "$SERVER_DB" \
-        --storage "$SERVER_STORAGE" 2>/dev/null &
+        --storage "$SERVER_STORAGE" ${KEY_PASSWORD:+-P "${KEY_PASSWORD}"} 2>/dev/null &
     RESUME_SERV_PID=$!
     sleep 2
     if ! kill -0 "$RESUME_SERV_PID" 2>/dev/null; then
