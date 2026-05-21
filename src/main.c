@@ -365,6 +365,99 @@ static void *ws_node_pipe_thread(void *arg) {
         unsigned char *out = malloc(WS_NODE_FRAME_MAX);
         if (!buf || !out) { free(buf); free(out); ws_node_disconnect(conn); sleep(5); continue; }
 
+        /* Send snapshot discovery to server */
+        if (cfg->node_name[0] && cfg->cluster[0] && cfg->mapping[0]) {
+            /* Collect snapshots for each mapped filesystem */
+            cJSON *snaps = cJSON_CreateArray();
+            const char *mp = cfg->mapping;
+            while (mp && *mp) {
+                while (*mp==' '||*mp=='\t') mp++;
+                if (!*mp) break;
+                const char *colon = strchr(mp, ':');
+                if (!colon) break;
+                size_t cflen = (size_t)(colon - mp);
+                char cfs_buf[512];
+                if (cflen >= sizeof(cfs_buf)) cflen = sizeof(cfs_buf) - 1;
+                memcpy(cfs_buf, mp, cflen);
+                cfs_buf[cflen] = '\0';
+                const char *start = colon + 1;
+                while (*start==' ') start++;
+                const char *end = strchr(start, ',');
+                if (!end) end = start + strlen(start);
+                const char *paren = strchr(start, '(');
+                size_t n = paren ? (size_t)(paren - start) : (size_t)(end - start);
+                char local_fs[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                if (n >= sizeof(local_fs)) n = sizeof(local_fs) - 1;
+                memcpy(local_fs, start, n);
+                local_fs[n] = '\0';
+
+                /* Get snapshots for this filesystem */
+                char cmd[1024];
+                snprintf(cmd, sizeof(cmd),
+                    "zfs list -Hp -t snap -o name,guid '%s' 2>/dev/null", local_fs);
+                FILE *fp = popen(cmd, "r");
+                if (fp) {
+                    char line[ZEP_MAX_SNAPSHOT_NAME];
+                    while (fgets(line, sizeof(line), fp)) {
+                        size_t sl = strlen(line);
+                        while (sl > 0 && (line[sl-1] == '\n' || line[sl-1] == '\r'))
+                            line[--sl] = '\0';
+                        if (!line[0]) continue;
+                        char *at = strchr(line, '@');
+                        if (!at) continue;
+                        /* Check cluster prefix: snapshot format is fs@cluster-label-ts */
+                        size_t clen = strlen(cfg->cluster);
+                        if (sl <= clen + 1 || at[1+clen] != '-' || strncmp(at+1, cfg->cluster, clen) != 0)
+                            continue;
+                        char *d1 = at + 1 + clen;
+                        /* d1 points to '-' after cluster name, skip it */
+                        if (d1[0] == '-') d1++;
+                        char *d2 = strchr(d1, '-');
+                        char label[64] = {0};
+                        if (d2) {
+                            size_t ll = (size_t)(d2 - d1);
+                            if (ll >= sizeof(label)) ll = sizeof(label) - 1;
+                            memcpy(label, d1, ll);
+                            label[ll] = '\0';
+                        }
+                        char guid[ZEP_MAX_GUID_LEN] = {0};
+                        char *tab = strchr(line, '\t');
+                        if (tab) {
+                            *tab = '\0';
+                            snprintf(guid, sizeof(guid), "%s", tab + 1);
+                        }
+                        if (guid[0] && label[0]) {
+                            cJSON *sn = cJSON_CreateObject();
+                            cJSON_AddStringToObject(sn, "guid", guid);
+                            cJSON_AddStringToObject(sn, "snapshot", line);
+                            cJSON_AddStringToObject(sn, "label", label);
+                            cJSON_AddItemToArray(snaps, sn);
+                        }
+                    }
+                    pclose(fp);
+                }
+                /* Move to next mapping */
+                const char *comma = strchr(colon, ',');
+                mp = comma ? comma + 1 : colon + strlen(colon);
+            }
+            int snap_count = cJSON_GetArraySize(snaps);
+            if (snap_count > 0) {
+                cJSON *discovery = cJSON_CreateObject();
+                cJSON_AddStringToObject(discovery, "action", "discovery");
+                cJSON_AddItemToObject(discovery, "snaps", snaps);
+                char *dj = cJSON_PrintUnformatted(discovery);
+                cJSON_Delete(discovery);
+                if (dj) {
+                    zep_log("ws-node: sending discovery %d snaps\n", snap_count);
+                    ws_node_send_frame(conn, WS_NODE_OP_TEXT,
+                        (unsigned char *)dj, strlen(dj));
+                    free(dj);
+                }
+            } else {
+                cJSON_Delete(snaps);
+            }
+        }
+
         /* Wait for pipe task or resume request */
 
         for (;;) {
@@ -725,8 +818,8 @@ zep_log_debug("ws-node: recv fwrite failed\n");
             ssize_t n = ws_node_recv_frame(conn, out, WS_NODE_FRAME_MAX, &buf[0]);
             unsigned char opcode = buf[0] & 0x0F;
 
-            if (n < 0) { zep_log_debug( "ws-node: recv error, reconnecting\n"); break; }
-            if (opcode == WS_NODE_OP_CLOSE) { zep_log_debug( "ws-node: close\n"); break; }
+            if (n < 0) { zep_log_debug( "ws-node: recv error n=%zd op=%02x, reconnecting\n", n, opcode); break; }
+            if (opcode == WS_NODE_OP_CLOSE) { zep_log_debug( "ws-node: close n=%zd\n", n); break; }
             if (opcode == WS_NODE_OP_PING) { zep_log_debug( "ws-node: <- PING\n"); ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)n); continue; }
             if (opcode == WS_NODE_OP_PONG) continue;
             if (opcode == WS_NODE_OP_EOF) continue;
@@ -881,10 +974,9 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                 zep_log_debug( "ws-node: interactive pipe done, child exit=%d\n", WEXITSTATUS(status));
                                 {
                                     unsigned char exit_byte = (unsigned char)WEXITSTATUS(status);
-                                    ws_node_send_frame(conn, WS_NODE_OP_EXIT, &exit_byte, 1);
+                                    ws_node_send_frame(conn, WS_NODE_OP_EXIT, &                                exit_byte, 1);
                                 }
-                                ws_node_send_frame(conn, WS_NODE_OP_CLOSE, NULL, 0);
-                                break;
+                                continue;
                             }
 
                             int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2];
@@ -1056,15 +1148,16 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                             zep_log_debug( "ws-node: pipe done, child exit=%d\n", WEXITSTATUS(status));
                             {
                                 unsigned char exit_byte = (unsigned char)WEXITSTATUS(status);
-                                ws_node_send_frame(conn, WS_NODE_OP_EXIT, &exit_byte, 1);
+                                ws_node_send_frame(conn, WS_NODE_OP_EXIT, &                                exit_byte, 1);
                             }
-                            ws_node_send_frame(conn, WS_NODE_OP_CLOSE, NULL, 0);
-                            break;
+                            continue;
                         }
                     }
                     cJSON_Delete(task);
                 }
             }
+
+            continue;
         }
 
         free(buf); free(out);
@@ -1081,8 +1174,7 @@ static void usage(const char *prog) {
         "Usage: %s <command> [options]\n"
         "\n"
        "Commands:\n"
-         "  cron    Query server for due tasks, execute push/pull\n"
-         "  rotate  Purge old snapshots beyond retention (safe, skips protected)\n"
+         "  cron    Connect to server via WebSocket, handle tasks & rotation\n"
          "  config  Manage configuration\n"
          "  status  Show replication status\n"
          "\n"
@@ -1109,161 +1201,6 @@ static void usage(const char *prog) {
         "  chunk_size       Max blob size in bytes (default: %d)\n",
         ZEP_VERSION, prog, g_db_path, g_db_path, g_db_path, g_db_path, g_db_path, ZEP_DEFAULT_CHUNK_SZ);
 }
-
-static int cmd_rotate(int argc, char *argv[]) {
-    char filesystem[ZEP_MAX_SNAPSHOT_NAME] = {0};
-
-    static struct option opts[] = {
-        {"filesystem", required_argument, 0, 'f'},
-        {"db",         required_argument, 0, 'D'},
-        {"help",       no_argument,       0, 'h'},
-        {0, 0, 0, 0}
-    };
-    int opt;
-    while ((opt = getopt_long(argc, argv, "f:D:h", opts, NULL)) != -1) {
-        switch (opt) {
-            case 'f': snprintf(filesystem, sizeof(filesystem), "%s", optarg); break;
-            case 'D': snprintf(g_db_path, sizeof(g_db_path), "%s", optarg); break;
-            case 'h': usage(argv[0]); return 0;
-            default:  return 1;
-        }
-    }
-
-    sqlite3 *db = NULL;
-    if (db_open(g_db_path, &db) != ZEP_ERR_OK) return 1;
-    db_init_tables(db);
-    zep_config_t cfg;
-    db_config_load(db, &cfg);
-
-    http_config_t http_cfg;
-    memset(&http_cfg, 0, sizeof(http_cfg));
-    snprintf(http_cfg.server_url, sizeof(http_cfg.server_url), "%s", cfg.server_url);
-    snprintf(http_cfg.cert_path, sizeof(http_cfg.cert_path), "%s", cfg.cert_path);
-    snprintf(http_cfg.key_path, sizeof(http_cfg.key_path), "%s", cfg.key_path);
-    snprintf(http_cfg.ca_path, sizeof(http_cfg.ca_path), "%s", cfg.ca_path);
-    snprintf(http_cfg.key_password, sizeof(http_cfg.key_password), "%s", cfg.key_password);
-
-    if (!cfg.cluster[0]) {
-        zep_log( "rotate: no cluster configured\n");
-        db_close(db);
-        return 1;
-    }
-
-    char **protected_guids = NULL;
-    int pcount = 0;
-    {
-        char *protected_url = NULL;
-        if (asprintf(&protected_url, "/v1/cron/protected?%s", cfg.cluster) < 0) {
-            db_close(db);
-            return 1;
-        }
-        char *pj = http_get_json(&http_cfg, protected_url);
-        free(protected_url);
-        if (pj) {
-            cJSON *pa = cJSON_Parse(pj);
-            free(pj);
-            if (pa && cJSON_IsArray(pa)) {
-                pcount = cJSON_GetArraySize(pa);
-                protected_guids = calloc((size_t)pcount, sizeof(char *));
-                for (int i = 0; i < pcount; i++) {
-                    cJSON *item = cJSON_GetArrayItem(pa, i);
-                    if (item && cJSON_IsString(item))
-                        protected_guids[i] = strdup(item->valuestring);
-                }
-                cJSON_Delete(pa);
-            }
-        }
-    }
-
-    char rot_url[256];
-    snprintf(rot_url, sizeof(rot_url), "/v1/cron/rotation?cluster=%s", cfg.cluster);
-    char *rj = http_get_json(&http_cfg, rot_url);
-    int purged = 0;
-    cJSON *deleted = cJSON_CreateArray();
-
-    if (rj) {
-        cJSON *rot = cJSON_Parse(rj);
-        free(rj);
-        if (rot) {
-            cJSON *skip = cJSON_GetObjectItem(rot, "skip");
-            if (!cJSON_IsTrue(skip)) {
-                cJSON *list = cJSON_GetObjectItem(rot, "rotate");
-                if (list && cJSON_IsArray(list)) {
-                    cJSON *item;
-                    cJSON_ArrayForEach(item, list) {
-                        cJSON *sid = cJSON_GetObjectItem(item, "snapshot");
-                        cJSON *sg = cJSON_GetObjectItem(item, "guid");
-                        if (!sid || !cJSON_IsString(sid) ||
-                            !sg || !cJSON_IsString(sg))
-                            continue;
-
-                        int prot = 0;
-                        for (int k = 0; k < pcount; k++)
-                            if (protected_guids[k] &&
-                                strcmp(protected_guids[k], sg->valuestring) == 0)
-                                { prot = 1; break; }
-
-                        if (!prot && cfg.resume) {
-                            cJSON *cf = cJSON_GetObjectItem(item, "cluster_fs");
-                            cJSON *lb = cJSON_GetObjectItem(item, "label");
-                            if (cf && lb && cJSON_IsString(cf) && cJSON_IsString(lb)) {
-                                char skey[320], sval[ZEP_MAX_LINE * 2];
-                                snprintf(skey, sizeof(skey), "push_state_%s_%s",
-                                         cf->valuestring, lb->valuestring);
-                                if (db_config_get(db, skey, sval, sizeof(sval)) == ZEP_ERR_OK && sval[0]) {
-                                    char *save = NULL, *sc = strdup(sval);
-                                    if (sc) {
-                                        strtok_r(sc, ":", &save);
-                                        char *sn = strtok_r(NULL, ":", &save);
-                                        if (sn && strcmp(sn, sid->valuestring) == 0)
-                                            prot = 1;
-                                        free(sc);
-                                    }
-                                }
-                            }
-                        }
-                        if (prot) continue;
-
-                        char dcmd[1024];
-                        snprintf(dcmd, sizeof(dcmd),
-                            "zfs destroy '%s' 2>&1", sid->valuestring);
-                        FILE *dp = popen(dcmd, "r");
-                        if (dp) {
-                            if (pclose(dp) == 0) {
-                                printf("purged: %s (label=%s)\n",
-                                    sid->valuestring,
-                                    cJSON_GetObjectItem(item, "label")
-                                        ? cJSON_GetObjectItem(item, "label")->valuestring : "");
-                                purged++;
-                                cJSON_AddItemToArray(deleted,
-                                    cJSON_CreateString(sg->valuestring));
-                            }
-                        }
-                    }
-                }
-            }
-            cJSON_Delete(rot);
-        }
-    }
-
-    if (cJSON_GetArraySize(deleted) > 0) {
-        cJSON *ack = cJSON_CreateObject();
-        cJSON_AddItemToObject(ack, "deleted", deleted);
-        char *body = cJSON_PrintUnformatted(ack);
-        cJSON_Delete(ack);
-        http_post_json(&http_cfg, "/v1/cron/rotate-ack", body);
-        free(body);
-        deleted = cJSON_CreateArray();
-    }
-    cJSON_Delete(deleted);
-
-    for (int i = 0; i < pcount; i++) free(protected_guids[i]);
-    free(protected_guids);
-    db_close(db);
-    printf("rotate: purged %d snapshots\n", purged);
-    return 0;
-}
-
 static int cmd_cron(int argc, char *argv[]) {
     int daemon_mode = 0;
     int interval = 60;
@@ -1291,14 +1228,6 @@ static int cmd_cron(int argc, char *argv[]) {
     db_init_tables(db);
     zep_config_t cfg;
     db_config_load(db, &cfg);
-
-    http_config_t http_cfg;
-    memset(&http_cfg, 0, sizeof(http_cfg));
-    snprintf(http_cfg.server_url, sizeof(http_cfg.server_url), "%s", cfg.server_url);
-    snprintf(http_cfg.cert_path, sizeof(http_cfg.cert_path), "%s", cfg.cert_path);
-    snprintf(http_cfg.key_path, sizeof(http_cfg.key_path), "%s", cfg.key_path);
-    snprintf(http_cfg.ca_path, sizeof(http_cfg.ca_path), "%s", cfg.ca_path);
-    snprintf(http_cfg.key_password, sizeof(http_cfg.key_password), "%s", cfg.key_password);
     db_close(db);
 
     signal(SIGTERM, daemon_signal_handler);
@@ -1325,428 +1254,9 @@ static int cmd_cron(int argc, char *argv[]) {
         }
     }
 
-    /* In daemon mode, maintain persistent curl handle for connection reuse */
-    if (daemon_mode)
-        http_persistent_start(&http_cfg);
-
-    do {
-        char *json = http_get_json(&http_cfg, "/v1/cron/sync");
-        if (!json) {
-            if (daemon_mode) { sleep((unsigned int)interval); continue; }
-            return 1;
-        }
-
-        cJSON *tasks = cJSON_Parse(json);
-        int task_count = tasks && cJSON_IsArray(tasks) ? cJSON_GetArraySize(tasks) : -1;
-        zep_log( "cron: tasks=%d first=%.*s\n", task_count,
-               (int)(strlen(json) < 200 ? strlen(json) : 200), json);
-        free(json);
-        if (!tasks || !cJSON_IsArray(tasks)) {
-            if (tasks) cJSON_Delete(tasks);
-            if (daemon_mode) { sleep((unsigned int)interval); continue; }
-            return 1;
-        }
-
-        int tasks_done = 0;
-
-        /* Collect push task pointers for batching (no ownership transfer) */
-        cJSON **push_ptrs = NULL;
-        int push_count = 0;
-        {
-            cJSON *item;
-            int total = cJSON_GetArraySize(tasks);
-            push_ptrs = malloc((size_t)total * sizeof(cJSON *));
-            cJSON_ArrayForEach(item, tasks) {
-                cJSON *action = cJSON_GetObjectItem(item, "action");
-                if (!action || !cJSON_IsString(action) || strcmp(action->valuestring, "push") != 0) continue;
-                cJSON *cfs = cJSON_GetObjectItem(item, "cluster_fs");
-                if (!cfs || !cJSON_IsString(cfs)) continue;
-                cJSON *lbl = cJSON_GetObjectItem(item, "label");
-                if (!lbl || !cJSON_IsString(lbl)) continue;
-                push_ptrs[push_count++] = item;
-            }
-        }
-
-        /* Create snapshots for all push tasks that have a cluster,
-         * track last snapshot name.  Always create — the server tells us
-         * which labels are due.  The "create" flag on the first cycle is
-         * just an optimization to avoid redundant creates. */
-        char local_fs_last[ZEP_MAX_SNAPSHOT_NAME] = {0};
-        char cfs_last[ZEP_MAX_PATH] = {0};
-        char label_last[ZEP_MAX_SNAPSHOT_NAME] = {0};
-        char snap_last[ZEP_MAX_PATH] = {0};
-        /* Capture one timestamp for all snapshots (all created within same second) */
-        time_t now = time(NULL);
-        struct tm tm = {0};
-        gmtime_r(&now, &tm);
-        char ts_buf[32];
-        strftime(ts_buf, sizeof(ts_buf), "%Y%m%d%H%M%S", &tm);
-
-        for (int i = 0; i < push_count; i++) {
-            cJSON *p = push_ptrs[i];
-            cJSON *lbl = cJSON_GetObjectItem(p, "label");
-            cJSON *cfs = cJSON_GetObjectItem(p, "cluster_fs");
-            char local_fs[ZEP_MAX_SNAPSHOT_NAME];
-
-            if (db_open(g_db_path, &db) == ZEP_ERR_OK) {
-                db_init_tables(db);
-                zep_config_t cfg2;
-                db_config_load(db, &cfg2);
-                if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
-                                        local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
-                    if (cfg2.cluster[0]) {
-                        char snap_label[128];
-                        snprintf(snap_label, sizeof(snap_label), "%s-%s-%s",
-                                 cfg2.cluster, lbl->valuestring, ts_buf);
-                        char snap_full[512];
-                        snprintf(snap_full, sizeof(snap_full), "%s@%s", local_fs, snap_label);
-
-                        /* Check if snapshot already exists */
-                        char guid_cmd[1024];
-                        snprintf(guid_cmd, sizeof(guid_cmd),
-                                 "zfs get -Hp -o value guid '%s' 2>/dev/null", snap_full);
-                        FILE *_guid_fp = audit_popen(guid_cmd);
-                        if (_guid_fp) {
-                            char _gline[128];
-                            while (fgets(_gline, sizeof(_gline), _guid_fp)) {
-                                char *nl = strchr(_gline, '\n');
-                                if (nl) *nl = '\0';
-                                if (_gline[0]) break;
-                            }
-                            pclose(_guid_fp);
-                            if (_gline[0]) {
-                                /* Snapshot already exists — skip create but still track it */
-                            } else {
-                                /* Does not exist — create it */
-                                char snap_cmd[2048];
-                                snprintf(snap_cmd, sizeof(snap_cmd),
-                                         "zfs snapshot '%s'", snap_full);
-                                zep_log("cron: creating snapshot '%s'\n", snap_label);
-                                char _snap_err[512];
-                                FILE *_snap_fp = audit_popen(snap_cmd);
-                                int _snap_rc = _snap_fp ? audit_popen_result(_snap_fp, _snap_err, sizeof(_snap_err)) : -128;
-                                audit_log_err("snapshot", "zfs", snap_cmd, _snap_rc, _snap_err);
-                            }
-                        }
-
-                        if (i == push_count - 1 && cfg2.cluster[0]) {
-                            snprintf(local_fs_last, sizeof(local_fs_last), "%s", local_fs);
-                            snprintf(cfs_last, sizeof(cfs_last), "%s", cfs->valuestring);
-                            snprintf(label_last, sizeof(label_last), "%s", lbl->valuestring);
-                            snprintf(snap_last, sizeof(snap_last), "%s@%s", local_fs, snap_label);
-                        }
-                    } else {
-                        if (i == push_count - 1) {
-                            snprintf(local_fs_last, sizeof(local_fs_last), "%s", local_fs);
-                            snprintf(cfs_last, sizeof(cfs_last), "%s", cfs->valuestring);
-                            snprintf(label_last, sizeof(label_last), "%s", lbl->valuestring);
-                        }
-                    }
-                }
-                db_close(db);
-            }
-        }
-
-        /* Push only the last task (most recent snapshot), ack all */
-        for (int i = 0; i < push_count; i++) {
-            cJSON *p = push_ptrs[i];
-            cJSON *lbl = cJSON_GetObjectItem(p, "label");
-            cJSON *cfs = cJSON_GetObjectItem(p, "cluster_fs");
-            char local_fs[ZEP_MAX_SNAPSHOT_NAME];
-            if (db_open(g_db_path, &db) == ZEP_ERR_OK) {
-                db_init_tables(db);
-                zep_config_t cfg2;
-                db_config_load(db, &cfg2);
-                if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
-                                        local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
-                    char ext_resume_token[ZEP_MAX_LINE] = {0};
-                    cJSON *rto = cJSON_GetObjectItem(p, "resume_token");
-                    if (rto && cJSON_IsString(rto) && rto->valuestring[0]) {
-                        snprintf(ext_resume_token, sizeof(ext_resume_token),
-                                 "%s", rto->valuestring);
-                    }
-                    if (i == push_count - 1 && cfg2.cluster[0] && snap_last[0]) {
-                        /* Use explicit snapshot name to avoid ZFS -S creation
-                         * tiebreaking when multiple snapshots share the same
-                         * second timestamp */
-                        pipeline_push_ws_explicit(&cfg2, snap_last,
-                                         cfs_last, lbl->valuestring,
-                                         db, ext_resume_token[0] ? ext_resume_token : NULL);
-                    }
-                    tasks_done++;
-                    {
-                        char body[512];
-                        snprintf(body, sizeof(body),
-                                 "{\"label\":\"%s\",\"cluster_fs\":\"%s\"}",
-                                 lbl->valuestring, cfs->valuestring);
-                        http_post_json(&http_cfg, "/v1/cron/ack", body);
-                    }
-                }
-                db_close(db);
-            }
-        }
-
-        free(push_ptrs);
-
-        cJSON *task;
-        cJSON_ArrayForEach(task, tasks) {
-            cJSON *action = cJSON_GetObjectItem(task, "action");
-            cJSON *cfs = cJSON_GetObjectItem(task, "cluster_fs");
-            cJSON *label = cJSON_GetObjectItem(task, "label");
-
-            if (!action || !cJSON_IsString(action)) continue;
-
-            zep_log( "cron: task action=%s cfs=%s\n",
-                   action->valuestring,
-                   (cfs && cJSON_IsString(cfs)) ? cfs->valuestring : "(none)");
-
-            if (strcmp(action->valuestring, "push") == 0 &&
-                cfs && cJSON_IsString(cfs) &&
-                label && cJSON_IsString(label)) {
-                /* Already handled above — skip */
-            } else if (strcmp(action->valuestring, "sync") == 0 &&
-                       cfs && cJSON_IsString(cfs)) {
-                cJSON *donor = cJSON_GetObjectItem(task, "donor");
-                cJSON *snap_list = cJSON_GetObjectItem(task, "snapshots");
-                char local_fs[ZEP_MAX_SNAPSHOT_NAME];
-                if (db_open(g_db_path, &db) == ZEP_ERR_OK) {
-                    db_init_tables(db);
-                    zep_config_t cfg2;
-                    db_config_load(db, &cfg2);
-                    if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
-                                            local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
-                        int nsnaps = (snap_list && cJSON_IsArray(snap_list)) ? cJSON_GetArraySize(snap_list) : 0;
-                        zep_log( "cron: sync action cfs=%s local=%s donor=%s snaps=%d\n",
-                               cfs->valuestring, local_fs,
-                               (donor && cJSON_IsString(donor)) ? donor->valuestring : "",
-                               nsnaps);
-                        if (snap_list && cJSON_IsArray(snap_list) && cJSON_GetArraySize(snap_list) > 0) {
-                            char local_guid[ZEP_MAX_GUID_LEN] = {0};
-                            zfs_get_latest_guid(local_fs, local_guid, sizeof(local_guid));
-                            cJSON *snap;
-                            cJSON_ArrayForEach(snap, snap_list) {
-                                cJSON *g = cJSON_GetObjectItem(snap, "guid");
-                                if (!g || !cJSON_IsString(g)) continue;
-                                zep_log("pull_ws: pulling guid=%s\n", g->valuestring);
-                                pipeline_pull_ws(&cfg2, &http_cfg, local_fs,
-                                    (donor && cJSON_IsString(donor)) ? donor->valuestring : "",
-                                    g->valuestring, local_guid[0] ? local_guid : "", db);
-                                zfs_get_latest_guid(local_fs, local_guid, sizeof(local_guid));
-                            }
-                        }
-                        tasks_done++;
-
-                        char latest[ZEP_MAX_GUID_LEN] = {0};
-                        zfs_get_latest_guid(local_fs, latest, sizeof(latest));
-                        if (latest[0]) {
-                            char body[128];
-                            snprintf(body, sizeof(body), "{\"guid\":\"%s\"}", latest);
-                            http_post_json(&http_cfg, "/v1/cron/ack", body);
-                        }
-                    } else {
-                        zep_log( "cron: resolve_fs FAILED for cfs=%s\n", cfs->valuestring);
-                    }
-                    db_close(db);
-                }
-            } else if (strcmp(action->valuestring, "inventory") == 0 &&
-                       cfs && cJSON_IsString(cfs)) {
-                zep_log( "cron: inventory action cfs=%s\n", cfs->valuestring);
-                char local_fs[ZEP_MAX_SNAPSHOT_NAME];
-                if (db_open(g_db_path, &db) == ZEP_ERR_OK) {
-                    db_init_tables(db);
-                    zep_config_t cfg2;
-                    db_config_load(db, &cfg2);
-                    if (pipeline_resolve_fs(cfs->valuestring, cfg2.mapping,
-                                            local_fs, sizeof(local_fs)) == ZEP_ERR_OK) {
-                        cJSON *snaps = cJSON_CreateArray();
-                        char cmd[1024];
-                        snprintf(cmd, sizeof(cmd),
-                            "zfs list -Hp -t snapshot -o name '%s' 2>/dev/null",
-                            local_fs);
-                        FILE *fp = popen(cmd, "r");
-                        if (fp) {
-                            char line[ZEP_MAX_SNAPSHOT_NAME];
-                            while (fgets(line, sizeof(line), fp)) {
-                                size_t sl = strlen(line);
-                                while (sl > 0 && (line[sl-1] == '\n' || line[sl-1] == '\r'))
-                                    line[--sl] = '\0';
-                                if (!line[0]) continue;
-                                char label[64] = {0};
-                                char *at = strchr(line, '@');
-                                if (at) {
-                                    char *d1 = strchr(at + 1, '-');
-                                    char *d2 = d1 ? strchr(d1 + 1, '-') : NULL;
-                                    if (d2) {
-                                        size_t ll = (size_t)(d2 - (at + 1));
-                                        if (ll >= sizeof(label)) ll = sizeof(label) - 1;
-                                        memcpy(label, at + 1, ll);
-                                        label[ll] = '\0';
-                                    }
-                                }
-                                char gbuf[ZEP_MAX_GUID_LEN] = {0};
-                                char guid_cmd[2048], _guid_err[512];
-                                snprintf(guid_cmd, sizeof(guid_cmd),
-                                    "zfs get -Hp -o value guid '%s' 2>/dev/null", line);
-                                FILE *gp = audit_popen(guid_cmd);
-                                if (gp) {
-                                    if (fgets(gbuf, sizeof(gbuf), gp)) {
-                                        size_t gl = strlen(gbuf);
-                                        while (gl > 0 && (gbuf[gl-1] == '\n' || gbuf[gl-1] == '\r'))
-                                            gbuf[--gl] = '\0';
-                                    }
-                                    int _guid_rc = audit_popen_result(gp, _guid_err, sizeof(_guid_err));
-                                    audit_log_err("inventory_guid", "zfs", guid_cmd, _guid_rc, _guid_err);
-                                }
-                                cJSON *sn = cJSON_CreateObject();
-                                cJSON_AddStringToObject(sn, "guid", gbuf);
-                                cJSON_AddStringToObject(sn, "snapshot", line);
-                                cJSON_AddStringToObject(sn, "label", label);
-                                cJSON_AddItemToArray(snaps, sn);
-                            }
-                            int list_rc = pclose(fp);
-                            audit_log("inventory_list", "zfs", cmd, WIFEXITED(list_rc) ? WEXITSTATUS(list_rc) : -128);
-                            }
-                        cJSON *inv = cJSON_CreateObject();
-                        cJSON_AddStringToObject(inv, "cluster_fs", cfs->valuestring);
-                        cJSON_AddItemToObject(inv, "snapshots", snaps);
-                        char *body = cJSON_PrintUnformatted(inv);
-                        cJSON_Delete(inv);
-                        http_post_json(&http_cfg, "/v1/cron/inventory", body);
-                        free(body);
-                        tasks_done++;
-                    }
-                    db_close(db);
-                }
-            }
-        }
-        cJSON_Delete(tasks);
-
-        if (cfg.cluster[0]) {
-            char rot_url[256];
-            snprintf(rot_url, sizeof(rot_url), "/v1/cron/rotation?cluster=%s", cfg.cluster);
-            char *rj = http_get_json(&http_cfg, rot_url);
-            if (rj) {
-                cJSON *rot = cJSON_Parse(rj);
-                free(rj);
-                if (rot) {
-                    cJSON *skip = cJSON_GetObjectItem(rot, "skip");
-                     if (!cJSON_IsTrue(skip)) {
-                        cJSON *list = cJSON_GetObjectItem(rot, "rotate");
-                        cJSON *deleted = cJSON_CreateArray();
-                        if (list && cJSON_IsArray(list)) {
-                            cJSON *item;
-                            cJSON_ArrayForEach(item, list) {
-                                cJSON *sid = cJSON_GetObjectItem(item, "snapshot");
-                                cJSON *sg = cJSON_GetObjectItem(item, "guid");
-                                if (sid && cJSON_IsString(sid) &&
-                                    sg && cJSON_IsString(sg)) {
-                                    /* protect snapshot if push is in progress (resume) */
-                                    int prot2 = 0;
-                                    if (cfg.resume) {
-                                        cJSON *cf2 = cJSON_GetObjectItem(item, "cluster_fs");
-                                        cJSON *lb2 = cJSON_GetObjectItem(item, "label");
-                                        if (cf2 && lb2 && cJSON_IsString(cf2) && cJSON_IsString(lb2)) {
-                                            char skey[320], sval[ZEP_MAX_LINE * 2];
-                                            snprintf(skey, sizeof(skey), "push_state_%s_%s",
-                                                     cf2->valuestring, lb2->valuestring);
-                                            sqlite3 *rdb = NULL;
-                                            if (db_open(g_db_path, &rdb) == ZEP_ERR_OK) {
-                                                if (db_config_get(rdb, skey, sval, sizeof(sval)) == ZEP_ERR_OK && sval[0]) {
-                                                    char *save = NULL, *sc = strdup(sval);
-                                                    if (sc) {
-                                                        strtok_r(sc, ":", &save);
-                                                        char *sn = strtok_r(NULL, ":", &save);
-                                                        if (sn && strcmp(sn, sid->valuestring) == 0)
-                                                            prot2 = 1;
-                                                        free(sc);
-                                                    }
-                                                }
-                                                db_close(rdb);
-                                            }
-                                        }
-                                    }
-                                    if (prot2) continue;
-                                    char dcmd[1024];
-                                    snprintf(dcmd, sizeof(dcmd),
-                                        "zfs destroy '%s' 2>/dev/null", sid->valuestring);
-                                    char _dest_err[512];
-                                    FILE *_dest_fp = audit_popen(dcmd);
-                                    int _dest_rc = _dest_fp ? audit_popen_result(_dest_fp, _dest_err, sizeof(_dest_err)) : -128;
-                                    audit_log_err("destroy", "zfs", dcmd, _dest_rc, _dest_err);
-                                    int rc = _dest_rc;
-                                    if (rc == 0) {
-                                        cJSON_AddItemToArray(deleted,
-                                            cJSON_CreateString(sg->valuestring));
-                                        tasks_done++;
-                                    }
-                                }
-                            }
-                            cJSON *remaining = cJSON_CreateArray();
-                            cJSON *seen = cJSON_CreateObject();
-                            cJSON *item2;
-                            cJSON_ArrayForEach(item2, list) {
-                                cJSON *cf = cJSON_GetObjectItem(item2, "cluster_fs");
-                                cJSON *lb = cJSON_GetObjectItem(item2, "label");
-                                if (!cf || !lb) continue;
-                                char key[256];
-                                snprintf(key, sizeof(key), "%s:%s",
-                                    cf->valuestring, lb->valuestring);
-                                if (!cJSON_GetObjectItem(seen, key)) {
-                                    cJSON_AddTrueToObject(seen, key);
-                                    char local_fs[ZEP_MAX_SNAPSHOT_NAME];
-                                    if (pipeline_resolve_fs(cf->valuestring,
-                                            cfg.mapping, local_fs,
-                                            sizeof(local_fs)) == ZEP_ERR_OK) {
-                                        char cmd[1024];
-                                        snprintf(cmd, sizeof(cmd),
-                                            "zfs list -H -t snapshot '%s' 2>/dev/null | grep '@.*%s-' | wc -l",
-                                            local_fs, lb->valuestring);
-                                        FILE *fp = popen(cmd, "r");
-                                        int count = 0;
-                                        if (fp) {
-                                            if (fscanf(fp, "%d", &count) != 1)
-                                                count = 0;
-                                            pclose(fp);
-                                        }
-                                        cJSON *r = cJSON_CreateObject();
-                                        cJSON_AddStringToObject(r, "cluster_fs",
-                                            cf->valuestring);
-                                        cJSON_AddStringToObject(r, "label",
-                                            lb->valuestring);
-                                        cJSON_AddNumberToObject(r, "count", count);
-                                        cJSON_AddItemToArray(remaining, r);
-                                    }
-                                }
-                            }
-                            cJSON_Delete(seen);
-                            {
-                                cJSON *ack = cJSON_CreateObject();
-                                cJSON_AddItemToObject(ack, "deleted", deleted);
-                                cJSON_AddItemToObject(ack, "remaining", remaining);
-                                char *body = cJSON_PrintUnformatted(ack);
-                                cJSON_Delete(ack);
-                                http_post_json(&http_cfg, "/v1/cron/rotate-ack", body);
-                                free(body);
-                                deleted = cJSON_CreateArray();
-                            }
-                        } else {
-                            cJSON_Delete(deleted);
-                        }
-                    }
-                    cJSON_Delete(rot);
-                }
-            }
-        }
-
-        if (daemon_mode) {
-            for (int s = 0; s < interval && g_daemon_running; s++)
-                sleep(1);
-        }
-    } while (daemon_mode && g_daemon_running);
-
-    if (daemon_mode)
-        http_persistent_stop(&http_cfg);
-
+    if (daemon_mode) {
+        while (g_daemon_running) sleep(1);
+    }
     return 0;
 }
 
@@ -1880,8 +1390,7 @@ int main(int argc, char *argv[]) {
     int sub_argc = argc2 - 1;
     int rc = 1;
 
-    if (strcmp(cmd, "rotate") == 0) rc = cmd_rotate(sub_argc, sub_argv);
-    else if (strcmp(cmd, "cron") == 0)   rc = cmd_cron(sub_argc, sub_argv);
+    if (strcmp(cmd, "cron") == 0)   rc = cmd_cron(sub_argc, sub_argv);
     else if (strcmp(cmd, "config") == 0) rc = cmd_config(sub_argc, sub_argv);
     else if (strcmp(cmd, "status") == 0) rc = cmd_status(sub_argc, sub_argv);
     else {

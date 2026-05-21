@@ -487,13 +487,11 @@ static void ws_set_keepalive(int fd) {
 
 struct node_ws_thread_ctx {
     struct node_ws *nw;
-    struct MHD_UpgradeResponseHandle *urh;
 };
 
 static void *node_ws_thread(void *arg) {
     struct node_ws_thread_ctx *ctx = (struct node_ws_thread_ctx *)arg;
     struct node_ws *nw = ctx->nw;
-    struct MHD_UpgradeResponseHandle *urh = ctx->urh;
     free(ctx);
 
     unsigned char *buf = malloc(WS_SUBCHUNK + 256);
@@ -503,6 +501,9 @@ static void *node_ws_thread(void *arg) {
     if (g_logging & LOG_LEVEL_DEBUG) {
         zep_log_debug("ws: node %s listening sock=%d\n", nw->cn, nw->sock);
     }
+
+    /* Track if discovery has been received from node */
+    int discovery_done = 0;
 
     time_t last_ping = time(NULL);
     for (;;) {
@@ -655,11 +656,118 @@ static void *node_ws_thread(void *arg) {
                                 sqlite3_finalize(st);
                             }
                         }
-                        cJSON_Delete(msg);
-                         break;
-                     }
-                     if (action && cJSON_IsString(action) &&
-                         strcmp(action->valuestring, "pull") == 0) {
+                      cJSON_Delete(msg);
+                          break;
+                      }
+                      /* Node-initiated snapshot discovery */
+                      if (!discovery_done && action && cJSON_IsString(action) &&
+                          strcmp(action->valuestring, "discovery") == 0) {
+                          cJSON *snaps = cJSON_GetObjectItem(msg, "snaps");
+                          char role_buf[16] = {0}, cluster_buf[64] = {0}, mapping_buf[2048] = {0};
+                          if (snaps && cJSON_IsArray(snaps)) {
+                              sqlite3_stmt *role_st = NULL;
+                              if (sqlite3_prepare_v2(g_db,
+                                      "SELECT role, cluster, mapping FROM auth WHERE cn = ?1",
+                                      -1, &role_st, NULL) == SQLITE_OK) {
+                                  sqlite3_bind_text(role_st, 1, nw->cn, -1, SQLITE_STATIC);
+                                  if (sqlite3_step(role_st) == SQLITE_ROW) {
+                                      const char *r = (const char *)sqlite3_column_text(role_st, 0);
+                                      const char *c = (const char *)sqlite3_column_text(role_st, 1);
+                                      const char *m = (const char *)sqlite3_column_text(role_st, 2);
+                                      if (r) snprintf(role_buf, sizeof(role_buf), "%s", r);
+                                      if (c) snprintf(cluster_buf, sizeof(cluster_buf), "%s", c);
+                                      if (m) snprintf(mapping_buf, sizeof(mapping_buf), "%s", m);
+                                  }
+                                  sqlite3_finalize(role_st);
+                              }
+                              int total = 0, regd = 0, existing = 0;
+                              if (strcmp(role_buf, "master") == 0 && cluster_buf[0]) {
+                                  cJSON *snap;
+                                  cJSON_ArrayForEach(snap, snaps) {
+                                      cJSON *g = cJSON_GetObjectItem(snap, "guid");
+                                      cJSON *snapname = cJSON_GetObjectItem(snap, "snapshot");
+                                      cJSON *lbl = cJSON_GetObjectItem(snap, "label");
+                                      if (!g || !cJSON_IsString(g)) continue;
+                                      if (!snapname || !cJSON_IsString(snapname)) continue;
+                                      if (!lbl || !cJSON_IsString(lbl)) continue;
+                                      total++;
+                                      /* Resolve cluster_fs from mapping */
+                                      char cluster_fs[512] = {0};
+                                      {
+                                          const char *mp = mapping_buf;
+                                          const char *snap_str = snapname->valuestring;
+                                          const char *at = strchr(snap_str, '@');
+                                          if (at) {
+                                              size_t fslen = (size_t)(at - snap_str);
+                                              char local_fs[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                                              if (fslen >= sizeof(local_fs)) fslen = sizeof(local_fs) - 1;
+                                              memcpy(local_fs, snap_str, fslen);
+                                              local_fs[fslen] = '\0';
+                                              const char *cm = mp;
+                                              while (cm && *cm) {
+                                                  while (*cm==' '||*cm=='\t') cm++;
+                                                  if (!*cm) break;
+                                                  const char *colon = strchr(cm, ':');
+                                                  if (!colon) break;
+                                                  size_t cflen = (size_t)(colon - cm);
+                                                  char cfs_buf[512];
+                                                  if (cflen >= sizeof(cfs_buf)) cflen = sizeof(cfs_buf) - 1;
+                                                  memcpy(cfs_buf, cm, cflen);
+                                                  cfs_buf[cflen] = '\0';
+                                                  const char *start = colon + 1;
+                                                  while (*start==' ') start++;
+                                                  const char *end = strchr(start, ',');
+                                                  if (!end) end = start + strlen(start);
+                                                  const char *paren = strchr(start, '(');
+                                                  size_t n = paren ? (size_t)(paren - start) : (size_t)(end - start);
+                                                  char resolved[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                                                  if (n >= sizeof(resolved)) n = sizeof(resolved) - 1;
+                                                  memcpy(resolved, start, n);
+                                                  resolved[n] = '\0';
+                                                  if (strcmp(local_fs, resolved) == 0) {
+                                                      snprintf(cluster_fs, sizeof(cluster_fs), "%s", cfs_buf);
+                                                      break;
+                                                  }
+                                                  const char *comma = strchr(colon, ',');
+                                                  cm = comma ? comma + 1 : colon + strlen(colon);
+                                              }
+                                          }
+                                      }
+                                      if (!cluster_fs[0]) continue;
+                                      sqlite3_stmt *ck = NULL;
+                                      if (sqlite3_prepare_v2(g_db,
+                                              "SELECT 1 FROM snapshots WHERE node=?1 AND guid=?2",
+                                              -1, &ck, NULL) == SQLITE_OK) {
+                                          sqlite3_bind_text(ck, 1, nw->cn, -1, SQLITE_STATIC);
+                                          sqlite3_bind_text(ck, 2, g->valuestring, -1, SQLITE_STATIC);
+                                          if (sqlite3_step(ck) != SQLITE_ROW) {
+                                              db_snapshot_insert(g_db, cluster_buf, nw->cn,
+                                                  g->valuestring, "", snapname->valuestring,
+                                                  lbl->valuestring, cluster_fs, 0, 0,
+                                                  "push", "", "pending");
+                                              regd++;
+                                              zep_log("discovery: registered %s guid=%s lbl=%s\n",
+                                                  snapname->valuestring, g->valuestring, lbl->valuestring);
+                                          } else {
+                                              existing++;
+                                          }
+                                          sqlite3_finalize(ck);
+                                      }
+                                  }
+                                  zep_log("discovery: %s total=%d new=%d existing=%d\n",
+                                      cluster_buf, total, regd, existing);
+                              } else {
+                                  zep_log("discovery: node=%s role=%s — skipping (not master)\n",
+                                      nw->cn, role_buf[0] ? role_buf : "(none)");
+                              }
+                              discovery_done = 1;
+                              zep_log("discovery: phase 1 complete\n");
+                          }
+                          cJSON_Delete(msg);
+                          continue;
+                      }
+                      if (action && cJSON_IsString(action) &&
+                          strcmp(action->valuestring, "pull") == 0) {
                          cJSON *guid_j = cJSON_GetObjectItem(msg, "guid");
                          cJSON *lguid_j = cJSON_GetObjectItem(msg, "local_guid");
                          if (guid_j && cJSON_IsString(guid_j)) {
@@ -1098,7 +1206,6 @@ if (g_logging & LOG_LEVEL_DEBUG) {
 
     /* Always clean up our nw entry */
     node_ws_unregister(nw);
-    MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
     return NULL;
 }
 
@@ -1123,7 +1230,6 @@ static void ws_node_upgrade_handler(void *cls, struct MHD_Connection *conn,
      * plaintext — our thread never touches GnuTLS, avoiding the data race. */
     struct node_ws_thread_ctx *ctx = malloc(sizeof(*ctx));
     ctx->nw = nw;
-    ctx->urh = urh;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED);
@@ -1684,7 +1790,12 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
                 }
 
                 zep_log("auth: fp=%.4s cn=%s role=%s %s %s\n",
-                        fp_hex, ctx->node[0] ? ctx->node : "?", role, method, url);
+                         fp_hex, ctx->node[0] ? ctx->node : "?", role, method, url);
+
+                if (client_cert) {
+                    gnutls_x509_crt_deinit(client_cert);
+                    client_cert = NULL;
+                }
 
                 if (strncmp(ctx->target_url, "/v1/admin", 9) == 0 &&
                     strcmp(role, "admin") != 0) {
