@@ -116,8 +116,8 @@ int audit_log_write2(const char *event, const char *type,
     return 0;
 }
 
-/* Global thread-local temp file path for audit_popen pairing */
-static char g_audit_tmp[512] = {0};
+/* Thread-local temp file path for audit_popen pairing */
+static __thread char g_audit_tmp[512] = {0};
 
 FILE *audit_popen(const char *cmd) {
     if (!cmd) return NULL;
