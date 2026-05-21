@@ -564,15 +564,12 @@ scheduler_run(struct node_ws *nw, const char *cluster_buf,
                     /* Skip if snapshot already exists in DB */
                     {
                         sqlite3_stmt *chk = NULL;
-                        char suffix[256];
-                        snprintf(suffix, sizeof(suffix), "@%s-%s-%s",
-                            cluster_buf, ln, ts_str);
-                        char chk_sql[1024];
+                        char chk_sql[2048];
                         snprintf(chk_sql, sizeof(chk_sql),
-                            "SELECT 1 FROM snapshots WHERE node=?1 AND snapshot LIKE '%%%s%%'",
-                            suffix);
+                            "SELECT 1 FROM snapshots WHERE node=?1 AND snapshot=?2");
                         if (sqlite3_prepare_v2(g_db, chk_sql, -1, &chk, NULL) == SQLITE_OK) {
                             sqlite3_bind_text(chk, 1, nw->cn, -1, SQLITE_STATIC);
+                            sqlite3_bind_text(chk, 2, snap_name, -1, SQLITE_STATIC);
                             if (sqlite3_step(chk) == SQLITE_ROW) {
                                 sqlite3_finalize(chk);
                                 continue;
@@ -3035,48 +3032,40 @@ zep_log_debug("config set: key=%s body_len=%zu body=%.*s\n",
             if (snaps && cJSON_IsArray(snaps) && cfs &&
                 cJSON_IsString(cfs) && cl_buf[0]) {
 
-                /* build comma-separated guid list for NOT IN clause */
-                char guid_list[65536] = {0};
-                char *glp = guid_list;
-                size_t gl_rem = sizeof(guid_list) - 1;
+                /* count GUIDs for parameterized NOT IN clause */
+                int guid_count = 0;
                 cJSON *sn;
                 cJSON_ArrayForEach(sn, snaps) {
                     cJSON *g = cJSON_GetObjectItem(sn, "guid");
-                    if (!g || !cJSON_IsString(g)) continue;
-                    if (glp != guid_list) {
-                        if (gl_rem > 2) {
-                            *glp++ = ','; *glp++ = '\'';
-                            gl_rem -= 2;
-                        } else break;
-                    } else {
-                        if (gl_rem > 1) {
-                            *glp++ = '\'';
-                            gl_rem -= 1;
-                        }
-                    }
-                    size_t gn = strlen(g->valuestring);
-                    if (gn > gl_rem - 1) gn = gl_rem - 1;
-                    memcpy(glp, g->valuestring, gn);
-                    glp += gn;
-                    gl_rem -= gn;
-                    if (gl_rem > 1) {
-                        *glp++ = '\'';
-                        gl_rem -= 1;
-                    }
+                    if (g && cJSON_IsString(g))
+                        guid_count++;
                 }
-                *glp = '\0';
 
-                char del_sql[66000];
-                snprintf(del_sql, sizeof(del_sql),
+                /* build parameterized DELETE with ? placeholders */
+                char del_sql[65536];
+                int pos = 0;
+                pos += snprintf(del_sql + pos, sizeof(del_sql) - (size_t)pos,
                     "DELETE FROM snapshots "
-                    "WHERE node = '%s' AND cluster = '%s' "
-                    "  AND cluster_fs = '%s' "
-                    "  AND guid NOT IN (%s)",
-                    ctx->node, cl_buf, cfs->valuestring,
-                    guid_list[0] ? guid_list : "''");
+                    "WHERE node = ?1 AND cluster = ?2 "
+                    "  AND cluster_fs = ?3");
+                for (int i = 0; i < guid_count; i++) {
+                    pos += snprintf(del_sql + pos, sizeof(del_sql) - (size_t)pos,
+                        " AND guid != ?%d", i + 4);
+                }
+
                 sqlite3_stmt *del = NULL;
                 sqlite3_prepare_v2(g_db, del_sql, -1, &del, NULL);
                 if (del) {
+                    sqlite3_bind_text(del, 1, ctx->node, -1, SQLITE_STATIC);
+                    sqlite3_bind_text(del, 2, cl_buf, -1, SQLITE_STATIC);
+                    sqlite3_bind_text(del, 3, cfs->valuestring, -1, SQLITE_STATIC);
+                    int gi = 0;
+                    cJSON_ArrayForEach(sn, snaps) {
+                        cJSON *g = cJSON_GetObjectItem(sn, "guid");
+                        if (!g || !cJSON_IsString(g)) continue;
+                        sqlite3_bind_text(del, 4 + gi, g->valuestring, -1, SQLITE_STATIC);
+                        gi++;
+                    }
                     sqlite3_step(del);
                     sqlite3_finalize(del);
                 }
