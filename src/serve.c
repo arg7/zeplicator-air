@@ -581,28 +581,10 @@ scheduler_run(struct node_ws *nw, const char *cluster_buf,
                         }
                     }
 
-                    char guid[65];
-                    {
-                        unsigned char bytes[16];
-                        FILE *f = fopen("/dev/urandom", "r");
-                        if (f) {
-                            fread(bytes, 1, 16, f);
-                            fclose(f);
-                        } else {
-                            for (int i = 0; i < 16; i++) bytes[i] = (unsigned char)rand();
-                        }
-                        snprintf(guid, sizeof(guid),
-                            "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                            bytes[0], bytes[1], bytes[2], bytes[3],
-                            bytes[4], bytes[5], bytes[6], bytes[7],
-                            bytes[8], bytes[9], bytes[10], bytes[11],
-                            bytes[12], bytes[13], bytes[14], bytes[15]);
-                    }
-
                     char task_json[2048];
                     int n = snprintf(task_json, sizeof(task_json),
-                        "{\"action\":\"create_snap\",\"cluster_fs\":\"%s\",\"label\":\"%s\",\"snapshot\":\"%s\",\"guid\":\"%s\"}",
-                        cluster_fs, ln, snap_name, guid);
+                        "{\"action\":\"create_snap\",\"cluster_fs\":\"%s\",\"label\":\"%s\",\"snapshot\":\"%s\",\"guid\":\"\"}",
+                        cluster_fs, ln, snap_name);
                     if (n > 0 && n < (int)sizeof(task_json)) {
                         zep_log("scheduler: create_snap %s (label=%s, interval=%ds)\n",
                             snap_name, ln, interval_sec);
@@ -668,28 +650,10 @@ scheduler_run(struct node_ws *nw, const char *cluster_buf,
                     "%s@%s-%s-%s",
                     cluster_fs, cluster_buf, ln, ts_str);
 
-                char guid[65];
-                {
-                    unsigned char bytes[16];
-                    FILE *f = fopen("/dev/urandom", "r");
-                    if (f) {
-                        fread(bytes, 1, 16, f);
-                        fclose(f);
-                    } else {
-                        for (int i = 0; i < 16; i++) bytes[i] = (unsigned char)rand();
-                    }
-                    snprintf(guid, sizeof(guid),
-                        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                        bytes[0], bytes[1], bytes[2], bytes[3],
-                        bytes[4], bytes[5], bytes[6], bytes[7],
-                        bytes[8], bytes[9], bytes[10], bytes[11],
-                        bytes[12], bytes[13], bytes[14], bytes[15]);
-                }
-
                 char task_json[2048];
                 int n = snprintf(task_json, sizeof(task_json),
-                    "{\"action\":\"create_snap\",\"cluster_fs\":\"%s\",\"label\":\"%s\",\"snapshot\":\"%s\",\"guid\":\"%s\"}",
-                    cluster_fs, ln, snap_name, guid);
+                    "{\"action\":\"create_snap\",\"cluster_fs\":\"%s\",\"label\":\"%s\",\"snapshot\":\"%s\",\"guid\":\"\"}",
+                    cluster_fs, ln, snap_name);
                 if (n > 0 && n < (int)sizeof(task_json)) {
                     zep_log("scheduler: create_snap %s (label=%s, interval=%ds)\n",
                         snap_name, ln, interval_sec);
