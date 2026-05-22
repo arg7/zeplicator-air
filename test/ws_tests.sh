@@ -406,10 +406,103 @@ else
 fi
 
 ###############################################################################
-# 8. Dump full server log for debugging
+# 8. Test push pull (phase 3) — master push to serve storage
 ###############################################################################
-echo -e "${CYAN}=== Step 8: Discovery+scheduler log entries ===${NC}"
-grep -iE "discovery|create_snap|scheduler" /tmp/zep-server.log 2>/dev/null | while IFS= read -r line; do
+echo -e "${CYAN}=== Step 8: Test push pull (phase 3) ===${NC}"
+
+# Wait for pull to complete
+PULL_TIMEOUT=120
+elapsed=0
+while [[ $elapsed -lt $PULL_TIMEOUT ]]; do
+    if grep -q "push: phase 3 complete" /tmp/zep-server.log 2>/dev/null; then
+        echo "  Phase 3 complete after ${elapsed}s"
+        break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+
+if [[ $elapsed -ge $PULL_TIMEOUT ]]; then
+    bad "push: phase 3 complete NOT found within ${PULL_TIMEOUT}s"
+else
+    ok "push: phase 3 complete detected"
+fi
+
+# Count total master snapshots (should be 3: hourly + min + server-generated)
+total_master=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT COUNT(*) FROM snapshots WHERE node='za-master';" 2>/dev/null || echo 0)
+
+if [[ "$total_master" -ge 3 ]]; then
+    ok "DB: $total_master master snapshots in DB (>= 3 expected)"
+else
+    bad "DB: expected >= 3 master snapshots, got $total_master"
+fi
+
+# The last (most recent) snapshot was the one actually pulled
+last_snap=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT snapshot FROM snapshots WHERE node='za-master' ORDER BY snapshot DESC LIMIT 1;" 2>/dev/null || echo "")
+
+if [[ -n "$last_snap" ]]; then
+    ok "Last pulled snapshot: $last_snap"
+else
+    bad "Could not determine last snapshot"
+fi
+
+# Check DB: ALL 3 master snapshots should have push_status='verified'
+verified_count=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT COUNT(*) FROM snapshots WHERE node='za-master' AND push_status='verified';" 2>/dev/null || echo 0)
+
+if [[ "$verified_count" -ge 3 ]]; then
+    ok "DB: $verified_count master snapshots have push_status='verified' (all 3 updated)"
+else
+    bad "DB: expected >= 3 verified snapshots, got $verified_count"
+fi
+
+# Check DB: no pending or failed push_status
+pending_count=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT COUNT(*) FROM snapshots WHERE node='za-master' AND push_status='pending';" 2>/dev/null || echo 0)
+
+if [[ "$pending_count" -eq 0 ]]; then
+    ok "DB: 0 master snapshots still in pending state"
+else
+    bad "DB: $pending_count master snapshots still pending (pull may have failed)"
+fi
+
+failed_count=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT COUNT(*) FROM snapshots WHERE node='za-master' AND push_status='failed';" 2>/dev/null || echo 0)
+
+if [[ "$failed_count" -eq 0 ]]; then
+    ok "DB: 0 master snapshots in failed state"
+else
+    bad "DB: $failed_count master snapshots in failed state"
+fi
+
+# Check storage: stream.zfs should exist in store/za-master/
+store_dir="/var/lib/zep-air/store/za-master"
+stream_files=$($SUDO find "$store_dir" -name "stream.zfs" 2>/dev/null | wc -l)
+
+if [[ "$stream_files" -ge 1 ]]; then
+    stream_path=$($SUDO find "$store_dir" -name "stream.zfs" 2>/dev/null | head -1)
+    stream_size=$($SUDO stat -c%s "$stream_path" 2>/dev/null || echo 0)
+    ok "storage: stream.zfs found at $stream_path (size=$stream_size)"
+else
+    bad "storage: no stream.zfs found in $store_dir"
+fi
+
+# Check storage: no leftover .stream partial files
+partial_streams=$($SUDO find "$store_dir" -name "*.stream" ! -name "stream.zfs" 2>/dev/null | wc -l)
+
+if [[ "$partial_streams" -eq 0 ]]; then
+    ok "storage: no leftover partial .stream files"
+else
+    bad "storage: $partial_streams leftover partial .stream files (join may have failed)"
+fi
+
+###############################################################################
+# 9. Dump full server log for debugging
+###############################################################################
+echo -e "${CYAN}=== Step 9: Discovery+scheduler+pull log entries ===${NC}"
+grep -iE "discovery|create_snap|scheduler|pull|push:" /tmp/zep-server.log 2>/dev/null | while IFS= read -r line; do
     echo "  $line"
 done
 
