@@ -7,8 +7,8 @@ tmux set-option -g mouse on 2>/dev/null
 
 # Calculate dimensions
 TOTAL_LINES=$(tput lines)
-PANEL_LINES=$(( (TOTAL_LINES - 2) / 2 ))
-TAIL_LINES=$(( PANEL_LINES - 2 ))
+PANEL_LINES=$(( TOTAL_LINES / 2 ))
+TAIL_LINES=$(( PANEL_LINES - 5 ))
 
 # Kill existing tmux session if it exists
 tmux kill-session -t zep-watch 2>/dev/null

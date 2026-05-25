@@ -78,6 +78,8 @@ err_t db_init_tables(sqlite3 *db) {
         "  blob_size    INTEGER NOT NULL DEFAULT 0,"
         "  direction    TEXT NOT NULL DEFAULT 'push',"
         "  storage_base TEXT NOT NULL,"
+        "  push_status  TEXT NOT NULL DEFAULT 'pending',"
+        "  push_err     TEXT NOT NULL DEFAULT '',"
         "  recorded_at  TEXT NOT NULL DEFAULT (datetime('now')),"
         "  UNIQUE(node, guid)"
         ");"
@@ -106,6 +108,18 @@ err_t db_init_tables(sqlite3 *db) {
         sqlite3_exec(db, "ALTER TABLE snapshots ADD COLUMN created_at TEXT",
                      NULL, NULL, &merr);
         if (merr) sqlite3_free(merr); /* ignore "duplicate column" */
+    }
+    /* One-shot migration: add push_status, push_err to snapshots if not exists */
+    {
+        char *merr = NULL;
+        sqlite3_exec(db,
+                     "ALTER TABLE snapshots ADD COLUMN push_status TEXT NOT NULL DEFAULT 'pending'",
+                     NULL, NULL, &merr);
+        if (merr) sqlite3_free(merr);
+        sqlite3_exec(db,
+                     "ALTER TABLE snapshots ADD COLUMN push_err TEXT NOT NULL DEFAULT ''",
+                     NULL, NULL, &merr);
+        if (merr) sqlite3_free(merr);
     }
     return ZEP_ERR_OK;
 }

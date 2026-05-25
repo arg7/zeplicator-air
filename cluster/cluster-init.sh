@@ -221,6 +221,19 @@ if [[ "$DO_ZFS" -eq 1 && -n "${ZFS_POOLS:-}" ]]; then
         say "  Created dataset: $pool/$ds"
     done
 
+    # Mount datasets
+    say "Mounting ZFS datasets ..."
+    for entry in ${NODES:-}; do
+        IFS=':' read -r cn role poolfs <<< "$entry"
+        pool="${poolfs%%/*}"
+        ds="${poolfs#*/}"
+        local_mnt="${ZEP_BASE}/mnt/${pool}/${ds}"
+        zfs set mountpoint="${local_mnt}" "${pool}/${ds}" 2>/dev/null || true
+        zfs mount "${pool}/${ds}" 2>/dev/null || true
+        chown "${cn}:${cn}" "${local_mnt}" 2>/dev/null || true
+        say "  Mounted: ${pool}/${ds} -> ${local_mnt}"
+    done
+
     say "Creating node user accounts and ZFS permissions ..."
     for entry in ${NODES:-}; do
         IFS=':' read -r cn role poolfs <<< "$entry"
@@ -229,24 +242,143 @@ if [[ "$DO_ZFS" -eq 1 && -n "${ZFS_POOLS:-}" ]]; then
             useradd -r -s /bin/bash -d "${ZEP_BASE}/home/${cn}" -m "$cn" 2>/dev/null
             say "  Created user: $cn"
         }
-        zfs allow -u "$cn" clone,create,destroy,mount,promote,receive,rollback,send,snapshot "$pool" 2>/dev/null || true
+       zfs allow -u "$cn" clone,create,destroy,mount,promote,receive,rollback,send,snapshot "$pool" 2>/dev/null || true
         img="${ZEP_BASE}/${pool}.img"
         [[ -f "$img" ]] && chown "${cn}:${cn}" "$img" 2>/dev/null || true
     done
 
+    # Grant current user full ZFS permissions on all pools
+    OP_USER="${OWNER:-$(whoami)}"
+    for pool in ${ZFS_POOLS:-}; do
+        zfs allow -u "$OP_USER" clone,create,destroy,mount,promote,receive,rollback,send,snapshot "$pool" 2>/dev/null || true
+    done
+
+    # Create za-serve account for server-side SSH mesh access
+    id "za-serve" &>/dev/null || {
+        useradd -r -s /bin/bash -d "${ZEP_BASE}/home/za-serve" -m za-serve 2>/dev/null
+        say "  Created user: za-serve"
+    }
+
+   # SSH mesh: passwordless SSH between all node accounts + za-serve
+    say "Setting up SSH mesh between nodes ..."
+    SSH_DIR="${ZEP_BASE}/ssh"
+    sudo mkdir -p "$SSH_DIR"
+    SSH_KEY="${SSH_DIR}/mesh_key"
+
+    # Add all mesh participant names to /etc/hosts so ssh <name> resolves
+    for entry in ${NODES:-}; do
+        IFS=':' read -r cn _ _ <<< "$entry"
+        grep -q "${cn}" /etc/hosts 2>/dev/null || \
+            echo "127.0.1.1 ${cn}" | sudo tee -a /etc/hosts >/dev/null
+    done
+    grep -q "za-serve" /etc/hosts 2>/dev/null || \
+        echo "127.0.1.1 za-serve" | sudo tee -a /etc/hosts >/dev/null
+
+    # Create shared group for mesh key access
+    sudo groupadd -f zep-mesh 2>/dev/null || true
+    for entry in ${NODES}; do
+        IFS=':' read -r node_cn _ _ <<< "$entry"
+        id "$node_cn" &>/dev/null && sudo usermod -aG zep-mesh "$node_cn" 2>/dev/null || true
+    done
+    id "za-serve" &>/dev/null && sudo usermod -aG zep-mesh za-serve 2>/dev/null || true
+    # Add current user to mesh group
+    sudo usermod -aG zep-mesh "${OWNER:-$(whoami)}" 2>/dev/null || true
+
+    if [[ ! -f "$SSH_KEY" ]]; then
+        ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -C "zep-air-mesh" >/dev/null 2>&1
+        sudo chown root:zep-mesh "$SSH_KEY"
+        sudo chmod 640 "$SSH_KEY"
+        sudo chmod 644 "${SSH_KEY}.pub"
+    fi
+    SSH_PUB="$(cat "${SSH_KEY}.pub")"
+
+    # Collect all mesh participants: nodes + za-serve
+    MESH_USERS=()
+    for entry in ${NODES}; do
+        IFS=':' read -r node_cn _ _ <<< "$entry"
+        MESH_USERS+=("$node_cn")
+    done
+    MESH_USERS+=("za-serve")
+
+    # Collect operator's public key for mesh access
+    OP_SSH_PUB=""
+    if [[ -f "${HOME:-/root}/.ssh/id_ed25519.pub" ]]; then
+        OP_SSH_PUB="$(cat "${HOME:-/root}/.ssh/id_ed25519.pub")"
+    elif [[ -f "${HOME:-/root}/.ssh/id_rsa.pub" ]]; then
+        OP_SSH_PUB="$(cat "${HOME:-/root}/.ssh/id_rsa.pub")"
+    fi
+
+    for node_cn in "${MESH_USERS[@]}"; do
+        local_home="${ZEP_BASE}/home/${node_cn}"
+        sudo mkdir -p "${local_home}/.ssh"
+        # authorized_keys: mesh key + operator key
+        echo "$SSH_PUB" | sudo tee -a "${local_home}/.ssh/authorized_keys" >/dev/null
+        if [[ -n "$OP_SSH_PUB" ]]; then
+            echo "$OP_SSH_PUB" | sudo tee -a "${local_home}/.ssh/authorized_keys" >/dev/null
+        fi
+        sudo chmod 600 "${local_home}/.ssh/authorized_keys"
+
+        # Per-user SSH config: use the shared mesh key, skip host key checks
+        cat > "${local_home}/.ssh/config" << SSHEOF
+Host 127.0.1.1
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+Host *.zep.lan zep.lan za-master za-client-1 za-client-2 za-serve
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    IdentityFile ${SSH_KEY}
+    IdentitiesOnly yes
+    LogLevel ERROR
+SSHEOF
+        sudo chmod 600 "${local_home}/.ssh/config"
+
+        # known_hosts: empty, we skip verification via config above
+        > "${local_home}/.ssh/known_hosts"
+        sudo chmod 644 "${local_home}/.ssh/known_hosts"
+
+        id "$node_cn" &>/dev/null && sudo chown -R "${node_cn}:${node_cn}" "${local_home}/.ssh" 2>/dev/null || true
+    done
+
+    # Deploy SSH config for the current (root/operating) user
+    OP_USER="${OWNER:-$(whoami)}"
+    mkdir -p "${HOME:-/root}/.ssh"
+
+    # Set up operator's own authorized_keys for ssh <opuser>@<node>
+    if [[ -n "$OP_SSH_PUB" ]]; then
+        mkdir -p "/home/${OP_USER}/.ssh" 2>/dev/null || true
+        if [[ -d "/home/${OP_USER}/.ssh" ]]; then
+            echo "$OP_SSH_PUB" > "/home/${OP_USER}/.ssh/authorized_keys"
+            chmod 600 "/home/${OP_USER}/.ssh/authorized_keys"
+            chown -R "${OP_USER}:${OP_USER}" "/home/${OP_USER}/.ssh" 2>/dev/null || true
+        fi
+    fi
+
+    # Operator SSH config: skip host key checks (uses default keys)
+    cat > "${HOME:-/root}/.ssh/config" << 'SSHEOF'
+Host 127.0.1.1
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+Host za-master za-client-1 za-client-2 za-serve
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+SSHEOF
+    chmod 600 "${HOME:-/root}/.ssh/config"
+
+    # Create /etc/ssh/ssh_config.d/ for system-wide known_hosts bypass
+    sudo mkdir -p /etc/ssh/ssh_config.d
+    cat > /etc/ssh/ssh_config.d/zep-air-mesh.conf << 'SSHEOF'
+Host 127.0.1.1
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+SSHEOF
+
     # Create 1MB test file on master dataset (only for resume-test)
     if [[ "$RESUME_TEST" -eq 1 ]]; then
         local_mnt="${ZEP_BASE}/mnt/za-master-pool/master"
-        # Mount the dataset properly so ZFS tracks the file
-        zfs set mountpoint="${local_mnt}" za-master-pool/master 2>/dev/null || true
         zfs mount za-master-pool/master 2>/dev/null || true
-        # Ensure ownership
         chown za-master:za-master "${local_mnt}" 2>/dev/null || true
         sudo -u za-master dd if=/dev/urandom of="${local_mnt}/testfile" bs=1M count=1 2>/dev/null
         say "  Created 1MB test file at ${local_mnt}/testfile"
-        # Reset mountpoint
-        zfs umount za-master-pool/master 2>/dev/null || true
-        zfs set mountpoint=none za-master-pool/master 2>/dev/null || true
     fi
 fi
 
@@ -286,7 +418,7 @@ else
     # Cluster definition
     say "Setting cluster definition ..."
     cat > /tmp/zep-cluster-$$.json << JSONEOF
-{"name":"${CLUSTER_NAME}","pools":{"${CLUSTER_POOL:-za-pool-1}":{"${CLUSTER_FS:-za-data-1}":{"labels":${CLUSTER_LABELS:-"{\"hourly\":60}"}}}}}
+{"name":"${CLUSTER_NAME}","pools":{"${CLUSTER_POOL:-za-pool-1}":{"${CLUSTER_FS:-za-data-1}":{"labels":${CLUSTER_LABELS:-"{\"hour\":60}"}}}}}
 JSONEOF
     "$ADMIN" $ADMIN_BASE cluster set --file /tmp/zep-cluster-$$.json >/dev/null
     rm -f /tmp/zep-cluster-$$.json

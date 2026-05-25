@@ -16,6 +16,7 @@ for user in za-master za-client-1 za-client-2; do
     id "$user" &>/dev/null || sudo useradd -r -s /bin/bash -d "/tmp/zep-air/home/$user" -m "$user" 2>/dev/null
 done
 hosts_add master.zep.lan client1.zep.lan client2.zep.lan
+hosts_add za-master za-client-1 za-client-2
 
 # ---- cleanup previous state ----
 for pool in za-master-pool za-client-1-pool za-client-2-pool; do
@@ -98,14 +99,14 @@ ZCMD="--db"
 
 # test 1
 echo -e "${CYAN}Test 1: master push full (HTTP)${NC}"
-out=$(sudo -u za-master "$ZEP" $ZCMD "$TMP/za-master.db" push -f za-master-pool/master -l hourly 2>&1)
+out=$(sudo -u za-master "$ZEP" $ZCMD "$TMP/za-master.db" push -f za-master-pool/master -l hour 2>&1)
 echo "$out" | grep -q "Push complete" && ok "push succeeded" || bad "push failed"
 echo "$out" | grep -q "full base" && ok "full send detected" || bad "not full send"
 
 # test 2
 echo -e "${CYAN}Test 2: master push incremental (HTTP)${NC}"
 sleep 1
-out=$(sudo -u za-master "$ZEP" $ZCMD "$TMP/za-master.db" push -f za-master-pool/master -l hourly 2>&1)
+out=$(sudo -u za-master "$ZEP" $ZCMD "$TMP/za-master.db" push -f za-master-pool/master -l hour 2>&1)
 echo "$out" | grep -q "Push complete" && ok "push succeeded" || bad "push failed"
 echo "$out" | grep -q "incremental" && ok "incremental send detected" || bad "not incremental"
 
@@ -133,7 +134,7 @@ diff -q <(echo "$g_master") <(echo "$g_c2") && ok "client-2 GUIDs match" || bad 
 echo -e "${CYAN}Test 6: replica chain via HTTP (c1 -> c2)${NC}"
 sudo zfs create -o mountpoint=none za-client-1-pool/master 2>/dev/null || true
 sudo zfs allow -u za-client-1 clone,create,destroy,mount,promote,receive,rollback,send,snapshot za-client-1-pool 2>/dev/null || true
-sudo -u za-client-1 "$ZEP" $ZCMD "$TMP/za-client-1.db" push -f za-client-1-pool/master -l hourly >/dev/null 2>&1
+sudo -u za-client-1 "$ZEP" $ZCMD "$TMP/za-client-1.db" push -f za-client-1-pool/master -l hour >/dev/null 2>&1
 sudo zfs create -o mountpoint=none za-client-2-pool/slave2 2>/dev/null || true
 sudo -u za-client-2 "$ZEP" $ZCMD "$TMP/za-client-2.db" pull -f za-client-2-pool/slave2 -d za-client-1 >/dev/null 2>&1
 snaps=$(sudo zfs list -r -t snap za-client-2-pool/slave2 2>/dev/null | grep -c '@' | tr -d '[:space:]' || echo 0)
@@ -196,6 +197,50 @@ pipe_allow "zfs,head"
 out=$(echo "hello world!" | zstd -c | timeout 12s "$ADMIN" $PIPE_ADM pipe --node za-master "zstd -d | head -c 5" 2>/dev/null)
 echo "$out" | grep -q "hello" && ok "pipe recv pipeline returned 'hello'" || bad "pipe recv pipeline failed: got '$out'"
 pipe_allow zfs
+
+# ---- SSH mesh: passwordless SSH between test accounts ----
+SSH_KEY="/tmp/zep-air/ssh/mesh_key"
+mkdir -p /tmp/zep-air/ssh
+ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -C "zep-air-mesh" >/dev/null 2>&1
+# Create shared group for mesh key access
+sudo groupadd -f zep-mesh 2>/dev/null || true
+for user in za-master za-client-1 za-client-2; do
+    id "$user" &>/dev/null && sudo usermod -aG zep-mesh "$user" 2>/dev/null || true
+done
+sudo chown root:zep-mesh "$SSH_KEY"
+sudo chmod 640 "$SSH_KEY"
+sudo chmod 644 "${SSH_KEY}.pub"
+SSH_PUB="$(cat "${SSH_KEY}.pub")"
+for user in za-master za-client-1 za-client-2; do
+    sudo mkdir -p "/tmp/zep-air/home/$user/.ssh"
+    echo "$SSH_PUB" | sudo tee "/tmp/zep-air/home/$user/.ssh/authorized_keys" >/dev/null
+    sudo chmod 700 "/tmp/zep-air/home/$user/.ssh"
+    sudo chmod 600 "/tmp/zep-air/home/$user/.ssh/authorized_keys"
+    # Per-user SSH config: use shared mesh key, skip host key checks
+    cat > "/tmp/zep-air/home/$user/.ssh/config" << SSHEOF
+Host 127.0.1.1
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+Host *.zep.lan zep.lan za-master za-client-1 za-client-2
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    IdentityFile $SSH_KEY
+    IdentitiesOnly yes
+    LogLevel ERROR
+SSHEOF
+    sudo chmod 600 "/tmp/zep-air/home/$user/.ssh/config"
+    # known_hosts: empty, verification skipped via config
+    > "/tmp/zep-air/home/$user/.ssh/known_hosts"
+    sudo chmod 644 "/tmp/zep-air/home/$user/.ssh/known_hosts"
+    sudo chown -R "$user:$user" "/tmp/zep-air/home/$user/.ssh"
+done
+# System-wide known_hosts bypass for root
+sudo mkdir -p /etc/ssh/ssh_config.d
+cat > /etc/ssh/ssh_config.d/zep-air-mesh.conf << 'SSHEOF'
+Host 127.0.1.1
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+SSHEOF
 
 # ---- cleanup ----
 cron_kill_all

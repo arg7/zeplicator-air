@@ -133,39 +133,37 @@ fi
 echo -e "${CYAN}=== Step 4: Create snapshots ===${NC}"
 
 # Properly-named snapshots: <fs>@<cluster>-<label>-<timestamp>
-# Format: za-master-pool/master@test-hourly-<YYYYMMDD-hhmmss>
+# Format: za-master-pool/master@test-hour-<YYYYMMDD-hhmmss>
 
-NOW=$(date +%Y%m%d-%H%M%S)
+NOW="20250101-000000"
 
-# Proper snapshot 1 (hourly label)
-$SUDO zfs snapshot za-master-pool/master@test-hourly-${NOW}
-echo "Created: za-master-pool/master@test-hourly-${NOW}"
+# Proper snapshot 1 (hour label)
+$SUDO zfs snapshot za-master-pool/master@test-hour-${NOW}
+echo "Created: za-master-pool/master@test-hour-${NOW}"
 
-# Proper snapshot 2 (min label)
-NOW2=$(date +%Y%m%d-%H%M%S)
-$SUDO zfs snapshot za-master-pool/master@test-min-${NOW2}
-echo "Created: za-master-pool/master@test-min-${NOW2}"
+$SUDO zfs snapshot za-master-pool/master@test-min-${NOW}
+echo "Created: za-master-pool/master@test-min-${NOW}"
 
 # Improper snapshots — these should be FILTERED OUT by the node agent
 # 1. Wrong cluster prefix
-$SUDO zfs snapshot za-master-pool/master@wrongcluster-hourly-${NOW}
-echo "Created: za-master-pool/master@wrongcluster-hourly-${NOW} (improper: wrong cluster)"
+$SUDO zfs snapshot za-master-pool/master@wrongcluster-hour-${NOW}
+echo "Created: za-master-pool/master@wrongcluster-hour-${NOW} (improper: wrong cluster)"
 
 # 2. No cluster prefix at all (just label)
-$SUDO zfs snapshot za-master-pool/master@hourly-${NOW}
-echo "Created: za-master-pool/master@hourly-${NOW} (improper: no cluster prefix)"
+$SUDO zfs snapshot za-master-pool/master@hour-${NOW}
+echo "Created: za-master-pool/master@hour-${NOW} (improper: no cluster prefix)"
 
 # 3. Cluster prefix without dash separator
-$SUDO zfs snapshot za-master-pool/master@test_hourly_${NOW}
-echo "Created: za-master-pool/master@test_hourly_${NOW} (improper: underscore instead of dash)"
+$SUDO zfs snapshot za-master-pool/master@test_hour_${NOW}
+echo "Created: za-master-pool/master@test_hour_${NOW} (improper: underscore instead of dash)"
 
 # 4. Cluster prefix with no label (just cluster-timestamp)
 $SUDO zfs snapshot za-master-pool/master@test-${NOW}
 echo "Created: za-master-pool/master@test-${NOW} (improper: no label between cluster and timestamp)"
 
 # 5. Snapshot on a different filesystem not in mapping
-$SUDO zfs snapshot za-master-pool/slave@test-hourly-${NOW} 2>/dev/null || true
-echo "Created: za-master-pool/slave@test-hourly-${NOW} (improper: not in mapping)"
+$SUDO zfs snapshot za-master-pool/slave@test-hour-${NOW} 2>/dev/null || true
+echo "Created: za-master-pool/slave@test-hour-${NOW} (improper: not in mapping)"
 
 echo ""
 echo "Snapshot inventory:"
@@ -262,9 +260,9 @@ else
 
     # Check that improperly-named snapshots were NOT registered (no "registered" log for them)
     improper_names=(
-        "wrongcluster-hourly"
-        "@hourly-"
-        "test_hourly"
+        "wrongcluster-hour"
+        "@hour-"
+        "test_hour"
         "test-${NOW}"
     )
     for iname in "${improper_names[@]}"; do
@@ -312,7 +310,7 @@ fi
 
 # Count registered improper snapshots (should be 0)
 improper_count=$($SUDO sqlite3 "$SERVER_DB" \
-    "SELECT COUNT(*) FROM snapshots WHERE node='za-master' AND (snapshot LIKE '%wrongcluster%' OR snapshot LIKE '%@hourly-%' OR snapshot LIKE '%test[%]hourly%');" 2>/dev/null || echo 0)
+    "SELECT COUNT(*) FROM snapshots WHERE node='za-master' AND (snapshot LIKE '%wrongcluster%' OR snapshot LIKE '%@hour-%' OR snapshot LIKE '%test[%]hour%');" 2>/dev/null || echo 0)
 
 if [[ "$improper_count" -eq 0 ]]; then
     ok "DB: 0 improperly-named snapshots registered"
@@ -331,13 +329,13 @@ else
 fi
 
 # Verify labels are correct
-hourly_label=$($SUDO sqlite3 "$SERVER_DB" \
-    "SELECT label FROM snapshots WHERE node='za-master' AND snapshot LIKE '%test-hourly-%' LIMIT 1;" 2>/dev/null || echo "")
+hour_label=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT label FROM snapshots WHERE node='za-master' AND snapshot LIKE '%test-hour-%' LIMIT 1;" 2>/dev/null || echo "")
 
-if [[ "$hourly_label" == "hourly" ]]; then
-    ok "label 'hourly' correctly extracted from snapshot name"
+if [[ "$hour_label" == "hour" ]]; then
+    ok "label 'hour' correctly extracted from snapshot name"
 else
-    bad "expected label='hourly', got label='$hourly_label'"
+    bad "expected label='hour', got label='$hour_label'"
 fi
 
 min_label=$($SUDO sqlite3 "$SERVER_DB" \
@@ -384,7 +382,7 @@ fi
 # The 'min' label has a 60s interval, cron_last_* is unset on fresh cache → fires
 # Check that a server-generated snapshot was registered
 server_snap_count=$($SUDO sqlite3 "$SERVER_DB" \
-    "SELECT COUNT(*) FROM snapshots WHERE node='za-master' AND snapshot LIKE '%test-min-%' AND snapshot NOT LIKE '%test-hourly-%';" 2>/dev/null || echo 0)
+    "SELECT COUNT(*) FROM snapshots WHERE node='za-master' AND snapshot LIKE '%test-min-%' AND snapshot NOT LIKE '%test-hour-%';" 2>/dev/null || echo 0)
 
 # We have at least 2 snapshots with 'min' in the name:
 # 1. Locally created: za-master-pool/master@test-min-<YYYYMMDD-hhmmss> (from discovery)
@@ -428,7 +426,7 @@ else
     ok "push: phase 3 complete detected"
 fi
 
-# Count total master snapshots (should be 3: hourly + min + server-generated)
+# Count total master snapshots (should be 3: hour + min + server-generated)
 total_master=$($SUDO sqlite3 "$SERVER_DB" \
     "SELECT COUNT(*) FROM snapshots WHERE node='za-master';" 2>/dev/null || echo 0)
 

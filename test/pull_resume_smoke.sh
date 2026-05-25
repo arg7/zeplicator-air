@@ -78,7 +78,7 @@ node_config_set "$TMP/client.db" pull_buf_cmd "head -c 1000000"
 
 echo ""
 echo "=== Test 1: Push ==="
-out=$("$ZEP" $ZCMD "$TMP/master.db" push -f rpool -l hourly 2>&1)
+out=$("$ZEP" $ZCMD "$TMP/master.db" push -f rpool -l hour 2>&1)
 echo "$out" | grep -q "Push complete" && ok "push succeeded" || bad "push failed"
 
 echo ""
@@ -89,7 +89,7 @@ echo "==="
 echo "$out"
 echo "==="
 
-state=$("$ZEP" $ZCMD "$TMP/client.db" config get pull_state_rclient_hourly 2>/dev/null)
+state=$("$ZEP" $ZCMD "$TMP/client.db" config get pull_state_rclient_hour 2>/dev/null)
 [[ "$state" != "(not set)" && -n "$state" ]] && ok "pull_state: $state" || bad "pull_state: $state"
 
 tok=$(zfs get -Hp -o value receive_resume_token rclient 2>/dev/null)

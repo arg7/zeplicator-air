@@ -183,9 +183,9 @@ Commands:
 
 **`push`**
 ```
-zep-air push --label hourly                              # all mapped filesystems
-zep-air push --label hourly tank-prod/data               # cluster fs name via mapping
-zep-air push -f rpool/master --label hourly              # direct local fs
+zep-air push --label hour                              # all mapped filesystems
+zep-air push --label hour tank-prod/data               # cluster fs name via mapping
+zep-air push -f rpool/master --label hour              # direct local fs
 ```
 
 **`pull`**
@@ -197,9 +197,9 @@ zep-air pull -f vault/data -d za-master                  # direct local fs
 
 **`snap`**
 ```
-zep-air snap --label hourly                              # all mapped (cluster-aware naming)
-zep-air snap --label hourly tank-prod/data               # specific
-zep-air snap -f rpool/master --label hourly              # direct
+zep-air snap --label hour                              # all mapped (cluster-aware naming)
+zep-air snap --label hour tank-prod/data               # specific
+zep-air snap -f rpool/master --label hour              # direct
 
 # Snapshot name: <pool/fs>@<cluster>-<label>-<timestamp>
 # Example: rpool/master@prod-min-2026-05-06-153045
