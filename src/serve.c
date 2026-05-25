@@ -449,38 +449,58 @@ static ssize_t ws_recv_node(struct node_ws *nw, unsigned char *buf, size_t buf_s
     }
 }
 
+/* Thread-local buffer for leftover WS frame data between calls.
+ * When multiple frames arrive in one TCP packet, we parse one,
+ * keep the rest, and continue on the next call. */
+static __thread size_t lt_buf_used = 0;
+static __thread unsigned char lt_buf[128 * 1024 + 256];
+
 static ssize_t ws_recv_frame_full(struct node_ws *nw, unsigned char *buf, size_t buf_size,
                                    unsigned char *out, size_t out_size,
                                    unsigned char *opcode_out) {
-    size_t buf_used = 0;
+    (void)buf; (void)buf_size;
+    size_t total_used = lt_buf_used;
     for (;;) {
-        if (buf_used >= 2) {
-            uint64_t plen = buf[1] & 0x7F;
+        if (total_used >= 2) {
+            uint64_t plen = lt_buf[1] & 0x7F;
             size_t need = 2;
             if (plen == 126) need = 4;
             else if (plen == 127) need = 10;
-            if (buf_used >= need) {
-                int masked = (buf[1] >> 7) & 1;
+            if (total_used >= need) {
+                int masked = (lt_buf[1] >> 7) & 1;
                 size_t header_len = need;
                 if (plen == 126)
-                    plen = (buf[2] << 8) | buf[3];
+                    plen = (lt_buf[2] << 8) | lt_buf[3];
                 else if (plen == 127) {
                     plen = 0;
                     for (int i = 0; i < 8; i++)
-                        plen = (plen << 8) | buf[2 + i];
+                        plen = (plen << 8) | lt_buf[2 + i];
                 }
                 if (masked) header_len += 4;
-                if (plen <= (uint64_t)out_size && header_len + (size_t)plen <= buf_used) {
-                    ssize_t r = ws_parse_frame(buf, buf_used, out, out_size, opcode_out);
-                    if (r >= 0) return r;
+                if (plen <= (uint64_t)out_size && header_len + (size_t)plen <= total_used) {
+                    ssize_t r = ws_parse_frame(lt_buf, total_used, out, out_size, opcode_out);
+                    if (r >= 0) {
+                        size_t consumed = header_len + (size_t)r;
+                        total_used -= consumed;
+                        if (total_used > 0)
+                            memmove(lt_buf, lt_buf + consumed, total_used);
+                        lt_buf_used = total_used;
+                        return r;
+                    }
                     return -1;
                 }
             }
         }
-        if (buf_used == buf_size) return -1;
-        ssize_t n = ws_recv_node(nw, buf + buf_used, buf_size - buf_used);
-        if (n <= 0) return n;
-        buf_used += (size_t)n;
+        if (total_used == sizeof(lt_buf)) {
+            lt_buf_used = 0;
+            return -1;
+        }
+        ssize_t n = ws_recv_node(nw, lt_buf + total_used, sizeof(lt_buf) - total_used);
+        if (n <= 0) {
+            lt_buf_used = total_used;
+            return n;
+        }
+        total_used += (size_t)n;
     }
 }
 
@@ -551,8 +571,30 @@ scheduler_run(struct node_ws *nw, const char *cluster_buf,
                 cJSON *lbl_item;
                 cJSON_ArrayForEach(lbl_item, lbls) {
                     const char *ln = lbl_item->string;
-                    int interval_sec = lbl_item->valueint;
-                    if (!ln || interval_sec == 0) continue;
+                    int interval_sec = 60; /* default: "min" */
+                      if (ln) {
+                        char *end;
+                        if (strncmp(ln, "min", 3) == 0) {
+                            long val = strtol(ln + 3, &end, 10);
+                            interval_sec = (end > ln + 3) ? (int)(val * 60) : 60;
+                        } else if (strncmp(ln, "hour", 4) == 0) {
+                            long val = strtol(ln + 4, &end, 10);
+                            interval_sec = (end > ln + 4) ? (int)(val * 3600) : 3600;
+                        } else if (strncmp(ln, "day", 3) == 0) {
+                            long val = strtol(ln + 3, &end, 10);
+                            interval_sec = (end > ln + 3) ? (int)(val * 86400) : 86400;
+                        } else if (strncmp(ln, "week", 4) == 0) {
+                            long val = strtol(ln + 4, &end, 10);
+                            interval_sec = (end > ln + 4) ? (int)(val * 7 * 86400) : 7 * 86400;
+                        } else if (strncmp(ln, "month", 5) == 0) {
+                            long val = strtol(ln + 5, &end, 10);
+                            interval_sec = (end > ln + 5) ? (int)(val * 30 * 86400) : 30 * 86400;
+                        } else if (strncmp(ln, "year", 4) == 0) {
+                            long val = strtol(ln + 4, &end, 10);
+                            interval_sec = (end > ln + 4) ? (int)(val * 365 * 86400) : 365 * 86400;
+                        }
+                    }
+                    if (!ln) continue;
 
                     char cron_key[1024];
                     snprintf(cron_key, sizeof(cron_key),
@@ -2615,19 +2657,27 @@ zep_log_debug("config set: key=%s body_len=%zu body=%.*s\n",
                                         int interval_sec = 60; /* default: "min" */
                                         const char *ln = lbl->string;
                                         if (ln) {
-                                            if (strncmp(ln, "min", 3) == 0) {
-                                                if (ln[3] >= '0' && ln[3] <= '9')
-                                                    interval_sec = atoi(ln + 3) * 60;
-                                                else
-                                                    interval_sec = 60;
-                                            } else if (strncmp(ln, "hour", 4) == 0) {
-                                                interval_sec = 3600;
-                                            } else if (strncmp(ln, "day", 3) == 0) {
-                                                interval_sec = 86400;
-                                            } else if (strncmp(ln, "week", 4) == 0) {
-                                                interval_sec = 7 * 86400;
-                                            }
-                                        }
+                                             char *end;
+                                             if (strncmp(ln, "min", 3) == 0) {
+                                                 long val = strtol(ln + 3, &end, 10);
+                                                 interval_sec = (end > ln + 3) ? (int)(val * 60) : 60;
+                                             } else if (strncmp(ln, "hour", 4) == 0) {
+                                                 long val = strtol(ln + 4, &end, 10);
+                                                 interval_sec = (end > ln + 4) ? (int)(val * 3600) : 3600;
+                                             } else if (strncmp(ln, "day", 3) == 0) {
+                                                 long val = strtol(ln + 3, &end, 10);
+                                                 interval_sec = (end > ln + 3) ? (int)(val * 86400) : 86400;
+                                             } else if (strncmp(ln, "week", 4) == 0) {
+                                                 long val = strtol(ln + 4, &end, 10);
+                                                 interval_sec = (end > ln + 4) ? (int)(val * 7 * 86400) : 7 * 86400;
+                                             } else if (strncmp(ln, "month", 5) == 0) {
+                                                 long val = strtol(ln + 5, &end, 10);
+                                                 interval_sec = (end > ln + 5) ? (int)(val * 30 * 86400) : 30 * 86400;
+                                             } else if (strncmp(ln, "year", 4) == 0) {
+                                                 long val = strtol(ln + 4, &end, 10);
+                                                 interval_sec = (end > ln + 4) ? (int)(val * 365 * 86400) : 365 * 86400;
+                                             }
+                                         }
                                         (void)save_count; /* retention count used by rotation (TBD) */
                                         char cron_key[1020];
                                         snprintf(cron_key, sizeof(cron_key),
