@@ -475,25 +475,66 @@ else
     bad "DB: $failed_count master snapshots in failed state"
 fi
 
-# Check storage: stream.zfs should exist in store/za-master/
+# Check storage: .stream files should exist in store/za-master/
 store_dir="/var/lib/zep-air/store/za-master"
-stream_files=$($SUDO find "$store_dir" -name "stream.zfs" 2>/dev/null | wc -l)
+stream_files=$($SUDO find "$store_dir" -name "*.stream" 2>/dev/null | wc -l)
 
 if [[ "$stream_files" -ge 1 ]]; then
-    stream_path=$($SUDO find "$store_dir" -name "stream.zfs" 2>/dev/null | head -1)
+    stream_path=$($SUDO find "$store_dir" -name "*.stream" 2>/dev/null | head -1)
     stream_size=$($SUDO stat -c%s "$stream_path" 2>/dev/null || echo 0)
-    ok "storage: stream.zfs found at $stream_path (size=$stream_size)"
+    ok "storage: .stream file found at $stream_path (size=$stream_size)"
 else
-    bad "storage: no stream.zfs found in $store_dir"
+    bad "storage: no .stream files found in $store_dir"
 fi
 
-# Check storage: no leftover .stream partial files
-partial_streams=$($SUDO find "$store_dir" -name "*.stream" ! -name "stream.zfs" 2>/dev/null | wc -l)
+# Check fs table: should have entries for the cluster/fs
+fs_count=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT COUNT(*) FROM fs;" 2>/dev/null || echo 0)
 
-if [[ "$partial_streams" -eq 0 ]]; then
-    ok "storage: no leftover partial .stream files"
+if [[ "$fs_count" -ge 1 ]]; then
+    ok "fs table has $fs_count entries"
 else
-    bad "storage: $partial_streams leftover partial .stream files (join may have failed)"
+    bad "fs table is empty (expected >= 1)"
+fi
+
+# Check fs table: last_pushed_guid should be non-empty for test cluster
+pushed_guid=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT last_pushed_guid FROM fs WHERE cluster='test' AND push_status='pushed' LIMIT 1;" 2>/dev/null || echo "")
+
+if [[ -n "$pushed_guid" && "$pushed_guid" != "" ]]; then
+    ok "fs table: pushed_guid set for test cluster ($pushed_guid)"
+else
+    bad "fs table: no pushed_guid for test cluster"
+fi
+
+# Check fs table: push_status should be 'pushed' (not 'pending' or 'resuming')
+pushed_status=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT COUNT(*) FROM fs WHERE cluster='test' AND push_status='pushed';" 2>/dev/null || echo 0)
+
+if [[ "$pushed_status" -ge 1 ]]; then
+    ok "fs table: push_status='pushed' for test cluster"
+else
+    bad "fs table: push_status is not 'pushed' for test cluster"
+fi
+
+# Check fs table: push_bytes_recv should be 0 after completion
+bytes_recv=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT push_bytes_recv FROM fs WHERE cluster='test' AND push_status='pushed' LIMIT 1;" 2>/dev/null || echo "N/A")
+
+if [[ "$bytes_recv" == "0" ]]; then
+    ok "fs table: push_bytes_recv=0 after push completion"
+else
+    bad "fs table: push_bytes_recv=$bytes_recv (expected 0 after completion)"
+fi
+
+# Check fs table: push_resume_token should be empty after completion
+resume_token=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT push_resume_token FROM fs WHERE cluster='test' AND push_status='pushed' LIMIT 1;" 2>/dev/null || echo "N/A")
+
+if [[ -z "$resume_token" ]]; then
+    ok "fs table: push_resume_token cleared after push completion"
+else
+    bad "fs table: push_resume_token not cleared (got: $resume_token)"
 fi
 
 ###############################################################################

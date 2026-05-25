@@ -784,8 +784,11 @@ static void *node_ws_thread(void *arg) {
     }
 
     /* Initial scheduler run */
-    if (strcmp(role_buf, "master") == 0 && cluster_buf[0] && mapping_buf[0])
+    int initial_scheduler_done = 0;
+    if (strcmp(role_buf, "master") == 0 && cluster_buf[0] && mapping_buf[0]) {
         scheduler_run(nw, cluster_buf, pending_snaps, pending_labels, &pending_tail);
+        initial_scheduler_done = 1;
+    }
 
     time_t last_ping = time(NULL);
     time_t last_scheduler = time(NULL);
@@ -1157,7 +1160,7 @@ static void *node_ws_thread(void *arg) {
                          cJSON_Delete(msg);
                           break;
                       }
-                     if (action && cJSON_IsString(action) &&
+                    if (action && cJSON_IsString(action) &&
                             strcmp(action->valuestring, "push") == 0) {
                             cJSON *guid_j = cJSON_GetObjectItem(msg, "guid");
                             cJSON *bg_j = cJSON_GetObjectItem(msg, "base_guid");
@@ -1188,10 +1191,13 @@ static void *node_ws_thread(void *arg) {
                                /* Create storage directory */
                                {
                                    char mcmd[2048];
-                                   int n = snprintf(mcmd, sizeof(mcmd), "mkdir -p '%s' 2>/dev/null", snap_dir);
+                                   int n = snprintf(mcmd, sizeof(mcmd), "mkdir -p '%s'", snap_dir);
                                    if (n > 0 && n < (int)sizeof(mcmd)) {
-                                       int rc = system(mcmd);
-                                       (void)rc;
+                                       FILE *mp = audit_popen(mcmd);
+                                       if (mp) {
+                                           char tmp[256]; while (fgets(tmp, sizeof(tmp), mp));
+                                           audit_popen_result(mp, NULL, 0);
+                                       }
                                    }
                                }
 
@@ -1201,7 +1207,7 @@ static void *node_ws_thread(void *arg) {
                                    uint32_t last = 0;
                                    while (1) {
                                        char test[ZEP_MAX_PATH * 2 + 256];
-                                       int n = snprintf(test, sizeof(test), "%s/%u", snap_dir, last);
+                                       int n = snprintf(test, sizeof(test), "%s/%04u.stream", snap_dir, last);
                                        if (n > 0 && n < (int)sizeof(test) && access(test, F_OK) == 0) {
                                            blob_num = (int)(last + 1);
                                            last = (uint32_t)blob_num;
@@ -1211,20 +1217,61 @@ static void *node_ws_thread(void *arg) {
                                    }
                                }
 
-                               char *blob_path = NULL;
+                               /* Get cluster name */
+                               char cluster[64] = {0};
+                               sqlite3_stmt *clst = NULL;
+                               if (sqlite3_prepare_v2(g_db,
+                                   "SELECT cluster FROM auth WHERE cn = ?1 LIMIT 1",
+                                   -1, &clst, NULL) == SQLITE_OK) {
+                                   sqlite3_bind_text(clst, 1, nw->cn, -1, SQLITE_STATIC);
+                                   if (sqlite3_step(clst) == SQLITE_ROW) {
+                                       const char *c = (const char *)sqlite3_column_text(clst, 0);
+                                       if (c && c[0]) snprintf(cluster, sizeof(cluster), "%s", c);
+                                   }
+                                   sqlite3_finalize(clst);
+                               }
+
+                               /* INSERT or REPLACE snapshot with status=pushing */
+                               if (cluster[0]) {
+                                   sqlite3_stmt *si = NULL;
+                                   if (sqlite3_prepare_v2(g_db,
+                                       "INSERT OR REPLACE INTO snapshots "
+                                       "(cluster, node, guid, base_guid, snapshot, label, cluster_fs, "
+                                       "status, blob_count, blob_size, direction, storage_base) "
+                                       "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pushing', 1, 0, 'push', "
+                                       "'file:///%s/%s/%s/')",
+                                       -1, &si, NULL) == SQLITE_OK) {
+                                       sqlite3_bind_text(si, 1, cluster, -1, SQLITE_STATIC);
+                                       sqlite3_bind_text(si, 2, nw->cn, -1, SQLITE_STATIC);
+                                       sqlite3_bind_text(si, 3, guid, -1, SQLITE_STATIC);
+                                       sqlite3_bind_text(si, 4, bg, -1, SQLITE_STATIC);
+                                       sqlite3_bind_text(si, 5, snap, -1, SQLITE_STATIC);
+                                       sqlite3_bind_text(si, 6, lbl, -1, SQLITE_STATIC);
+                                       sqlite3_bind_text(si, 7, cfs, -1, SQLITE_STATIC);
+                                       sqlite3_step(si);
+                                       sqlite3_finalize(si);
+                                   }
+                               }
+
+                               /* Open first .stream file */
+                               char stream_path[ZEP_MAX_PATH * 2 + 256];
+                               int stream_count = 0;
                                {
                                    char part[16];
-                                   snprintf(part, sizeof(part), "%04u", (uint32_t)blob_num);
-                                   int n = asprintf(&blob_path, "%s/%s", snap_dir, part); if (n < 0) blob_path = NULL;
+                                   snprintf(part, sizeof(part), "%04u.stream", (uint32_t)blob_num);
+                                   int n = snprintf(stream_path, sizeof(stream_path), "%s/%s", snap_dir, part);
+                                   if (n < 0 || n >= (int)sizeof(stream_path)) {
+                                       zep_log("ws: push OOM for stream path guid=%s\n", guid);
+                                       ws_send_frame_gtls(nw, WS_OP_EXIT, (unsigned char *)&blob_num, 1);
+                                       ws_send_frame_gtls(nw, WS_OP_EOF, NULL, 0);
+                                       cJSON_Delete(msg);
+                                       break;
+                                   }
                                }
-                               if (!blob_path) {
-                                   zep_log("ws: push OOM for guid=%s\n", guid);
-                                   ws_send_frame_gtls(nw, WS_OP_EXIT, (unsigned char *)&blob_num, 1);
-                                   ws_send_frame_gtls(nw, WS_OP_EOF, NULL, 0);
-                           } else {
-                                   FILE *fp = fopen(blob_path, is_resume ? "ab" : "wb");
-                                   if (!fp) {
-                                       zep_log("ws: push fopen failed: %s\n", blob_path);
+                               FILE *fp = fopen(stream_path, is_resume ? "ab" : "wb");
+                               if (!fp) {
+                                   zep_log("ws: push fopen failed: %s\n", stream_path);
+                                   if (cluster[0]) {
                                        sqlite3_stmt *sf = NULL;
                                        if (sqlite3_prepare_v2(g_db,
                                            "UPDATE snapshots SET status='failed' WHERE node=?1 AND guid=?2 AND status='pushing'",
@@ -1234,69 +1281,148 @@ static void *node_ws_thread(void *arg) {
                                            sqlite3_step(sf);
                                            sqlite3_finalize(sf);
                                        }
-                                       free(blob_path);
-                                       ws_send_frame_gtls(nw, WS_OP_EXIT, (unsigned char *)&blob_num, 1);
-                                       ws_send_frame_gtls(nw, WS_OP_EOF, NULL, 0);
-                                   } else {
-                                       /* Get cluster name */
-                                   char cluster[64] = {0};
-                                   sqlite3_stmt *clst = NULL;
-                                   if (sqlite3_prepare_v2(g_db,
-                                       "SELECT cluster FROM auth WHERE cn = ?1 LIMIT 1",
-                                       -1, &clst, NULL) == SQLITE_OK) {
-                                       sqlite3_bind_text(clst, 1, nw->cn, -1, SQLITE_STATIC);
-                                       if (sqlite3_step(clst) == SQLITE_ROW) {
-                                           const char *c = (const char *)sqlite3_column_text(clst, 0);
-                                           if (c && c[0]) snprintf(cluster, sizeof(cluster), "%s", c);
+                                   }
+                                   ws_send_frame_gtls(nw, WS_OP_EXIT, (unsigned char *)&blob_num, 1);
+                                   ws_send_frame_gtls(nw, WS_OP_EOF, NULL, 0);
+                                   cJSON_Delete(msg);
+                                   break;
+                               }
+
+                               /* Send resume offset response */
+                               uint64_t file_offset = 0;
+                               if (is_resume) {
+                                   fseek(fp, 0, SEEK_END);
+                                   file_offset = (uint64_t)ftell(fp);
+                                   fseek(fp, 0, SEEK_CUR);
+                               }
+                               {
+                                   char resp[128];
+                                   if (is_resume && file_offset > 0)
+                                       snprintf(resp, sizeof(resp),
+                                           "{\"resume\":true,\"offset\":%lu}",
+                                           (unsigned long)file_offset);
+                                   else
+                                       snprintf(resp, sizeof(resp), "{\"resume\":false}");
+                                   ws_send_frame_gtls(nw, WS_OP_TEXT,
+                                            (unsigned char *)resp, strlen(resp));
+                               }
+
+                               /* Read BIN frames and write to .stream files */
+                               for (;;) {
+                                   ssize_t rn = ws_recv_frame_full(nw, buf, WS_SUBCHUNK + 256, out, WS_SUBCHUNK, &buf[0]);
+                                   if (rn < 0) break;
+                                   unsigned char op = buf[0] & 0x0F;
+                                   if (op == WS_OP_CLOSE) break;
+                                   if (op == WS_OP_PING) {
+                                       ws_send_frame_gtls(nw, WS_OP_PONG, out, (size_t)rn);
+                                       continue;
+                                   }
+                                   if (op == WS_OP_PONG) continue;
+                                   if (op == WS_OP_BIN && rn > 0) {
+                                       if (fwrite(out, 1, (size_t)rn, fp) != (size_t)rn) break;
+                                       continue;
+                                   }
+                                   if (op == WS_OP_EXIT || op == WS_OP_EOF) break;
+                               }
+                               fclose(fp);
+                               stream_count = 1;
+
+                               /* If WS_OP_EXIT, get final size and check for more .stream files */
+                               uint64_t final_size = 0;
+                               {
+                                   FILE *chk = fopen(stream_path, "rb");
+                                   if (chk) { fseek(chk, 0, SEEK_END); final_size = (uint64_t)ftell(chk); fclose(chk); }
+                               }
+
+                               /* Check if there are more .stream files (from retries) */
+                               if (is_resume) {
+                                   uint32_t last = (uint32_t)blob_num;
+                                   while (1) {
+                                       char test[ZEP_MAX_PATH * 2 + 256];
+                                       int n = snprintf(test, sizeof(test), "%s/%04u.stream", snap_dir, last + 1);
+                                       if (n > 0 && n < (int)sizeof(test) && access(test, F_OK) == 0) {
+                                           last++;
+                                           stream_count++;
+                                       } else {
+                                           break;
                                        }
-                                       sqlite3_finalize(clst);
+                                   }
+                               }
+
+                               /* Save resume token if enabled and stream has data */
+                               if (g_resume && final_size > 0) {
+                                   char tok_file[ZEP_MAX_PATH * 2 + 256];
+                                   snprintf(tok_file, sizeof(tok_file), "%s/tok_%04u", snap_dir, blob_num);
+                                   char tok_cmd[4096];
+                                   snprintf(tok_cmd, sizeof(tok_cmd),
+                                       "zstream token -g -i '%s' > '%s' 2>&1", stream_path, tok_file);
+                                   FILE *tp = audit_popen(tok_cmd);
+                                   if (tp) {
+                                       char tmp[256];
+                                       while (fgets(tmp, sizeof(tmp), tp));
+                                       int tok_rc = audit_popen_result(tp, NULL, 0);
+                                       if (tok_rc == 0 || tok_rc == 2) {
+                                           err_t tok_valid = zstream_token_from_file(tok_file);
+                                           if (tok_valid == ZEP_ERR_OK) {
+                                               char tok[256] = {0};
+                                               FILE *tfp = fopen(tok_file, "r");
+                                               if (tfp) {
+                                                   size_t tn = fread(tok, 1, sizeof(tok) - 1, tfp);
+                                                   tok[tn] = '\0';
+                                                   while (tn > 0 && (tok[tn-1]=='\n'||tok[tn-1]=='\r')) tok[--tn]='\0';
+                                                   if (tok[0]) {
+                                                       db_fs_save_token(g_db, cluster, cfs, tok, (int64_t)final_size);
+                                                       zep_log("push: saved resume token for guid=%s size=%ld\n",
+                                                               guid, (long)final_size);
+                                                   }
+                                               }
+                                               if (tfp) fclose(tfp);
+                                           }
+                                       }
+                                   }
+                                   unlink(tok_file);
+                               }
+
+                               /* Validate .stream files — retry loop */
+                               int retry = 0;
+                               int max_retries = 10;
+                               int all_valid = 0;
+
+                               while (retry <= max_retries) {
+                                   int valid_count = 0;
+                                   for (int i = 0; i < stream_count; i++) {
+                                       char sfile[ZEP_MAX_PATH * 2 + 256];
+                                       snprintf(sfile, sizeof(sfile), "%s/%04u.stream", snap_dir, blob_num + i);
+                                       err_t rv = zstream_token_from_file(sfile);
+                                       if (rv == ZEP_ERR_OK) {
+                                           valid_count++;
+                                       } else {
+                                           zep_log("push: invalid chunk %d/%d for guid=%s (retry %d)\n",
+                                                   i, stream_count, guid, retry);
+                                       }
                                    }
 
-                                   /* INSERT or REPLACE snapshot with status=pushing */
-                                   if (cluster[0]) {
-                                       sqlite3_stmt *si = NULL;
-                                       if (sqlite3_prepare_v2(g_db,
-                                           "INSERT OR REPLACE INTO snapshots "
-                                           "(cluster, node, guid, base_guid, snapshot, label, cluster_fs, "
-                                           "status, blob_count, blob_size, direction, storage_base) "
-                                           "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pushing', 1, 0, 'push', "
-                                           "'file:///%s/%s/%s/')",
-                                           -1, &si, NULL) == SQLITE_OK) {
-                                           sqlite3_bind_text(si, 1, cluster, -1, SQLITE_STATIC);
-                                           sqlite3_bind_text(si, 2, nw->cn, -1, SQLITE_STATIC);
-                                           sqlite3_bind_text(si, 3, guid, -1, SQLITE_STATIC);
-                                           sqlite3_bind_text(si, 4, bg, -1, SQLITE_STATIC);
-                                           sqlite3_bind_text(si, 5, snap, -1, SQLITE_STATIC);
-                                           sqlite3_bind_text(si, 6, lbl, -1, SQLITE_STATIC);
-                                           sqlite3_bind_text(si, 7, cfs, -1, SQLITE_STATIC);
-                                           sqlite3_step(si);
-                                           sqlite3_finalize(si);
-                                       }
+                                   if (valid_count == stream_count) {
+                                       all_valid = 1;
+                                       break;
                                    }
 
-                                   /* Send resume offset response */
-                                   uint64_t file_offset = 0;
-                                   if (is_resume) {
-                                       fseek(fp, 0, SEEK_END);
-                                       file_offset = (uint64_t)ftell(fp);
-                                       fseek(fp, 0, SEEK_CUR);
-                                   }
-                                   {
-                                       char resp[128];
-                                       if (is_resume && file_offset > 0)
-                                           snprintf(resp, sizeof(resp),
-                                               "{\"resume\":true,\"offset\":%lu}",
-                                               (unsigned long)file_offset);
-                                       else
-                                           snprintf(resp, sizeof(resp), "{\"resume\":false}");
+                                   /* Need more data — send resume request */
+                                   if (retry == 0 && !is_resume) {
+                                       uint64_t resume_offset = final_size;
+                                       char req[256];
+                                       snprintf(req, sizeof(req),
+                                           "{\"action\":\"resume\",\"offset\":%lu,\"size\":%lu}",
+                                           (unsigned long)resume_offset,
+                                           (unsigned long)final_size);
                                        ws_send_frame_gtls(nw, WS_OP_TEXT,
-                                                (unsigned char *)resp, strlen(resp));
+                                           (unsigned char *)req, strlen(req));
                                    }
 
-                                   /* Read BIN frames and write to blob file */
-                                    for (;;) {
-                                        ssize_t rn = ws_recv_frame_full(nw, buf, WS_SUBCHUNK + 256, out, WS_SUBCHUNK, &buf[0]);
-                                        if (rn < 0) break;
+                                   /* Wait for more data from node */
+                                   for (;;) {
+                                       ssize_t rn = ws_recv_frame_full(nw, buf, WS_SUBCHUNK + 256, out, WS_SUBCHUNK, &buf[0]);
+                                       if (rn < 0) break;
                                        unsigned char op = buf[0] & 0x0F;
                                        if (op == WS_OP_CLOSE) break;
                                        if (op == WS_OP_PING) {
@@ -1305,167 +1431,132 @@ static void *node_ws_thread(void *arg) {
                                        }
                                        if (op == WS_OP_PONG) continue;
                                        if (op == WS_OP_BIN && rn > 0) {
-                                           if (fwrite(out, 1, (size_t)rn, fp) != (size_t)rn) break;
+                                           if (stream_count == 1) {
+                                               char part[16];
+                                               snprintf(part, sizeof(part), "%04u.stream", (uint32_t)blob_num);
+                                               int n = snprintf(stream_path, sizeof(stream_path), "%s/%s", snap_dir, part);
+                                               if (n >= 0 && n < (int)sizeof(stream_path)) {
+                                                   fp = fopen(stream_path, "wb");
+                                                   if (fp) {
+                                                       if (fwrite(out, 1, (size_t)rn, fp) != (size_t)rn) { fclose(fp); fp = NULL; }
+                                                       fclose(fp);
+                                                       stream_count = 2;
+                                                       break;
+                                                   }
+                                               }
+                                           } else {
+                                               char part[16];
+                                               snprintf(part, sizeof(part), "%04u.stream", (uint32_t)(blob_num + stream_count - 1));
+                                               int n = snprintf(stream_path, sizeof(stream_path), "%s/%s", snap_dir, part);
+                                               if (n >= 0 && n < (int)sizeof(stream_path)) {
+                                                   fp = fopen(stream_path, "ab");
+                                                   if (fp) {
+                                                       if (fwrite(out, 1, (size_t)rn, fp) != (size_t)rn) { fclose(fp); fp = NULL; }
+                                                       fclose(fp);
+                                                   }
+                                               }
+                                               break;
+                                           }
                                            continue;
                                        }
                                        if (op == WS_OP_EXIT || op == WS_OP_EOF) break;
                                    }
-                                   fclose(fp);
 
-                                   /* Get final size */
-                                   uint64_t final_size = 0;
+                                   /* Get new final size */
+                                   final_size = 0;
                                    {
-                                       FILE *chk = fopen(blob_path, "rb");
+                                       FILE *chk = fopen(stream_path, "rb");
                                        if (chk) { fseek(chk, 0, SEEK_END); final_size = (uint64_t)ftell(chk); fclose(chk); }
                                    }
 
-                                   /* Run zstream dump for verification */
-                                     char dump_cmd[8192];
-                                     if (is_resume && blob_num > 0) {
-                                         /* Reassemble all blobs before zstream dump -v */
-                                         int n = 0;
-                                         int blob_max = blob_num;
-                                         for (int b = 0; b <= blob_max; b++) {
-                                             char bf[16];
-                                             snprintf(bf, sizeof(bf), "%04u", (unsigned)b);
-                                             char fpath[ZEP_MAX_PATH * 2 + 256];
-                                             if (snprintf(fpath, sizeof(fpath), "%s/%s", snap_dir, bf) < 0) break;
-                                             n += snprintf(dump_cmd + n, sizeof(dump_cmd) - (size_t)n,
-                                                           "cat '%s' ", fpath);
-                                             if (b < blob_max) {
-                                                 n += snprintf(dump_cmd + n, sizeof(dump_cmd) - (size_t)n,
-                                                               "| ");
-                                             }
-                                         }
-                                         n += snprintf(dump_cmd + n, sizeof(dump_cmd) - (size_t)n,
-                                                       "| zstream dump -v - 2>/dev/null");
-                                     } else {
-                                         snprintf(dump_cmd, sizeof(dump_cmd),
-                                             "zstream dump -v '%s' 2>/dev/null", blob_path);
-                                     }
-                                    FILE *dp = popen(dump_cmd, "r");
-                                    int dump_ok = 0;
-                                   if (dp) {
-                                       char dline[512];
-                                       char toguid[ZEP_MAX_GUID_LEN] = {0};
-                                       char fromguid[ZEP_MAX_GUID_LEN] = {0};
-                                       while (fgets(dline, sizeof(dline), dp)) {
-                                           char *dl = dline;
-                                           while (*dl == ' ' || *dl == '\t') dl++;
-                                           if (strncmp(dl, "toguid =", 8) == 0) {
-                                               char *v = dl + 8;
-                                               while (*v == ' ') v++;
-                                               size_t len = strlen(v);
-                                               while (len > 0 && (v[len-1]=='\n'||v[len-1]=='\r')) v[--len]='\0';
-                                               if (len > 0 && len < sizeof(toguid))
-                                                   snprintf(toguid, sizeof(toguid), "%s", v);
-                                           }
-                                           if (strncmp(dl, "fromguid =", 10) == 0) {
-                                               char *v = dl + 10;
-                                               while (*v == ' ') v++;
-                                               size_t len = strlen(v);
-                                               while (len > 0 && (v[len-1]=='\n'||v[len-1]=='\r')) v[--len]='\0';
-                                               if (len > 0 && len < sizeof(fromguid))
-                                                   snprintf(fromguid, sizeof(fromguid), "%s", v);
-                                           }
+                                   /* Check for more .stream files */
+                                   uint32_t last = (uint32_t)(blob_num + stream_count - 1);
+                                   while (1) {
+                                       char test[ZEP_MAX_PATH * 2 + 256];
+                                       int n = snprintf(test, sizeof(test), "%s/%04u.stream", snap_dir, last + 1);
+                                       if (n > 0 && n < (int)sizeof(test) && access(test, F_OK) == 0) {
+                                           last++;
+                                           stream_count++;
+                                       } else {
+                                           break;
                                        }
-                                       int drc = pclose(dp);
-                                       audit_log(AUDIT_EVT_EXEC, "serve", dump_cmd, WIFEXITED(drc) ? WEXITSTATUS(drc) : -1);
-                                       if (WIFEXITED(drc) && WEXITSTATUS(drc) == 0 && toguid[0]) {
-                                           dump_ok = 1;
-                                           /* INSERT/UPDATE cluster_chain */
-                                           if (cluster[0] && toguid[0]) {
-                                               sqlite3_stmt *st2 = NULL;
-                                               if (sqlite3_prepare_v2(g_db,
-                                                    "INSERT OR REPLACE INTO cluster_chain "
-                                                    "(cluster_key, fromguid, toguid, pushed_by, snapshot) "
-                                                    "VALUES (?1, ?2, ?3, ?4, ?5)",
-                                                    -1, &st2, NULL) == SQLITE_OK) {
-                                                    sqlite3_bind_text(st2, 1, cluster, -1, SQLITE_STATIC);
-                                                    sqlite3_bind_text(st2, 2, fromguid, -1, SQLITE_STATIC);
-                                                    sqlite3_bind_text(st2, 3, toguid, -1, SQLITE_STATIC);
-                                                    sqlite3_bind_text(st2, 4, nw->cn, -1, SQLITE_STATIC);
-                                                    sqlite3_bind_text(st2, 5, snap, -1, SQLITE_STATIC);
-                                                   sqlite3_step(st2);
-                                                   sqlite3_finalize(st2);
-                                               }
-                                               /* UPDATE snapshots: verified, base_guid, blob_size, blob_count */
-                                                sqlite3_stmt *su = NULL;
-                                                if (sqlite3_prepare_v2(g_db,
-                                                    "UPDATE snapshots SET status='verified', "
-                                                    "base_guid=?, blob_size=?, "
-                                                    "blob_count=? WHERE node=? AND guid=? AND status='pushing'",
-                                                    -1, &su, NULL) == SQLITE_OK) {
-                                                    sqlite3_bind_text(su, 1, bg, -1, SQLITE_STATIC);
-                                                    sqlite3_bind_int64(su, 2, (sqlite3_int64)final_size);
-                                                    sqlite3_bind_int(su, 3, blob_num + 1);
-                                                    sqlite3_bind_text(su, 4, nw->cn, -1, SQLITE_STATIC);
-                                                    sqlite3_bind_text(su, 5, guid, -1, SQLITE_STATIC);
-                                                    sqlite3_step(su);
-                                                    sqlite3_finalize(su);
-                                               }
-                                            }
-                                        }
-                                    }
-                                    /* Clean up snapshot_upload on success */
-                                    if (dump_ok && g_resume) {
-                                        db_upload_complete(g_db, guid);
-                                    }
-                                   /* Handle failed dump */
-                                     if (!dump_ok) {
-                                        sqlite3_stmt *sf = NULL;
-                                        if (sqlite3_prepare_v2(g_db,
-                                            "UPDATE snapshots SET status='failed', "
-                                            "blob_size=?, blob_count=? "
-                                            "WHERE node=?1 AND guid=?2 AND status='pushing'",
-                                            -1, &sf, NULL) == SQLITE_OK) {
-                                            sqlite3_bind_int64(sf, 1, (sqlite3_int64)final_size);
-                                            sqlite3_bind_int(sf, 2, blob_num + 1);
-                                            sqlite3_bind_text(sf, 3, nw->cn, -1, SQLITE_STATIC);
-                                            sqlite3_bind_text(sf, 4, guid, -1, SQLITE_STATIC);
-                                            sqlite3_step(sf);
-                                            sqlite3_finalize(sf);
-                                        }
-                                    }
+                                   }
 
-                                    /* Save resume token if enabled and stream has data */
-                                    if (g_resume && final_size > 0) {
-                                        char tok_cmd[4096];
-                                        snprintf(tok_cmd, sizeof(tok_cmd),
-                                            "zstream token -g -i '%s' 2>/dev/null", blob_path);
-                                        FILE *tp = popen(tok_cmd, "r");
-                                        if (tp) {
-                                            char tok[256] = {0};
-                                            if (fgets(tok, sizeof(tok), tp)) {
-                                                size_t tn = strlen(tok);
-                                                while (tn > 0 && (tok[tn-1]=='\n'||tok[tn-1]=='\r')) tok[--tn]='\0';
-                                                if (tok[0]) {
-                                                    db_upload_save_token(g_db, guid, nw->cn, tok, (int64_t)final_size);
-                                                    zep_log("push: saved resume token for guid=%s size=%ld\n",
-                                                            guid, (long)final_size);
-                                                }
-                                            }
-                                            pclose(tp);
-                                        }
-                                    }
-
-                                   /* Send completion */
-                                   { char complete[32];
-                                     snprintf(complete, sizeof(complete),
-                                         "{\"guid\":\"%s\",\"size\":%lu}",
-                                         guid, (unsigned long)final_size);
-                                     ws_send_frame_gtls(nw, WS_OP_TEXT,
-                                         (unsigned char *)complete, strlen(complete)); }
-                                   unsigned char ex = 0;
-                                   ws_send_frame_gtls(nw, WS_OP_EXIT, &ex, 1);
-                                  free(blob_path);
-                                   }                /* closes if(!fp) else */
+                                   retry++;
+                                   if (retry > 2 && final_size == 0) break;
                                }
-                                ws_send_frame_gtls(nw, WS_OP_EOF, NULL, 0);
-                           }
-                           cJSON_Delete(msg);
-                           break;
-                       }
+
+                               /* zstream join — reassemble all .stream files */
+                               err_t join_err = ZEP_ERR_ZFS;
+                               char toguid[ZEP_MAX_GUID_LEN] = {0};
+                               if (all_valid || retry > 0) {
+                                   join_err = zstream_join(snap_dir, dir_name, blob_num, stream_count,
+                                                           toguid, sizeof(toguid));
+                               }
+
+                               /* Update snapshots and cluster_chain */
+                               if (join_err == ZEP_ERR_OK && toguid[0]) {
+                                   if (cluster[0] && toguid[0]) {
+                                       sqlite3_stmt *st2 = NULL;
+                                       if (sqlite3_prepare_v2(g_db,
+                                            "INSERT OR REPLACE INTO cluster_chain "
+                                            "(cluster_key, fromguid, toguid, pushed_by, snapshot) "
+                                            "VALUES (?1, ?2, ?3, ?4, ?5)",
+                                            -1, &st2, NULL) == SQLITE_OK) {
+                                            sqlite3_bind_text(st2, 1, cluster, -1, SQLITE_STATIC);
+                                            sqlite3_bind_text(st2, 2, bg, -1, SQLITE_STATIC);
+                                            sqlite3_bind_text(st2, 3, toguid, -1, SQLITE_STATIC);
+                                            sqlite3_bind_text(st2, 4, nw->cn, -1, SQLITE_STATIC);
+                                            sqlite3_bind_text(st2, 5, snap, -1, SQLITE_STATIC);
+                                            sqlite3_step(st2);
+                                            sqlite3_finalize(st2);
+                                        }
+
+                                       db_fs_mark_snapshot_verified(g_db, guid, (int64_t)final_size,
+                                                                    stream_count, bg);
+
+                                       int pending_id = 0;
+                                       if (db_fs_get_next_pending_id(g_db, cluster, nw->cn, &pending_id) == ZEP_ERR_OK && pending_id > 0) {
+                                           /* There are still pending snapshots — don't cascade */
+                                       } else {
+                                           db_fs_cascade_update_to_id(g_db, cluster, 0);
+                                       }
+
+                                       db_fs_mark_pushed(g_db, cluster, cfs, guid);
+                                   }
+                               } else {
+                                   sqlite3_stmt *sf = NULL;
+                                   if (sqlite3_prepare_v2(g_db,
+                                       "UPDATE snapshots SET push_status='resuming', "
+                                       "blob_size=?, blob_count=? "
+                                       "WHERE node=?1 AND guid=?2 AND status='pending' AND push_status='pending'",
+                                       -1, &sf, NULL) == SQLITE_OK) {
+                                       sqlite3_bind_int64(sf, 1, (sqlite3_int64)final_size);
+                                       sqlite3_bind_int(sf, 2, stream_count);
+                                       sqlite3_bind_text(sf, 3, nw->cn, -1, SQLITE_STATIC);
+                                       sqlite3_bind_text(sf, 4, guid, -1, SQLITE_STATIC);
+                                       sqlite3_step(sf);
+                                       sqlite3_finalize(sf);
+                                   }
+                               }
+
+                               /* Send completion */
+                               { char complete[128];
+                                 snprintf(complete, sizeof(complete),
+                                     "{\"guid\":\"%s\",\"size\":%lu,\"streams\":%d,\"result\":\"%s\"}",
+                                     guid, (unsigned long)final_size, stream_count,
+                                     join_err == ZEP_ERR_OK ? "complete" : "incomplete");
+                                 ws_send_frame_gtls(nw, WS_OP_TEXT,
+                                     (unsigned char *)complete, strlen(complete)); }
+                               zep_log("push: phase 3 complete for guid=%s size=%lu streams=%d\n",
+                                       guid, (unsigned long)final_size, stream_count);
+                               unsigned char ex = 0;
+                               ws_send_frame_gtls(nw, WS_OP_EXIT, &ex, 1);
+                               ws_send_frame_gtls(nw, WS_OP_EOF, NULL, 0);
+                            }
+                            cJSON_Delete(msg);
+                            break;
+                        }
                       /* Handle create_snap response from node */
                       if (action && cJSON_IsString(action) &&
                           strcmp(action->valuestring, "create_snap") == 0) {
@@ -1546,11 +1637,53 @@ static void *node_ws_thread(void *arg) {
                              if (pending_head < pending_tail) pending_head++;
                              zep_log("create_snap failed for node %s rc=%d\n",
                                  nw->cn, rc_j ? rc_j->valueint : -1);
-                         }
-                         cJSON_Delete(msg);
-                         continue;
-                      }
-                      cJSON_Delete(msg);
+                        }
+                          zep_log_debug("create_snap: head=%d tail=%d initial_done=%d\n",
+                              pending_head, pending_tail, initial_scheduler_done);
+                          /* After all create_snap tasks acknowledged, dispatch push (once) */
+                          if (pending_head >= pending_tail && initial_scheduler_done &&
+                              strcmp(role_buf, "master") == 0
+                              && cluster_buf[0] && mapping_buf[0]) {
+                              zep_log("scheduler: all create_snap done, dispatching push\n");
+                              initial_scheduler_done = 0;
+                              sqlite3_stmt *push_st = NULL;
+                              zep_log_debug("push query: node=%s cluster=%s\n", nw->cn, cluster_buf);
+                              int prep_rc = sqlite3_prepare_v2(g_db,
+                                  "SELECT guid, snapshot, label, cluster_fs FROM snapshots "
+                                  "WHERE node=?1 AND direction='push' AND push_status='pending' "
+                                  "ORDER BY rowid ASC LIMIT 1",
+                                  -1, &push_st, NULL);
+                              zep_log_debug("push query prepare rc=%d err=%s\n", prep_rc, sqlite3_errmsg(g_db));
+                              if (prep_rc == SQLITE_OK) {
+                                  sqlite3_bind_text(push_st, 1, nw->cn, -1, SQLITE_STATIC);
+                                  int step_rc = sqlite3_step(push_st);
+                                  zep_log_debug("push query step_rc=%d\n", step_rc);
+                                  if (step_rc == SQLITE_ROW) {
+                                      const char *pguid = (const char *)sqlite3_column_text(push_st, 0);
+                                      const char *psnap = (const char *)sqlite3_column_text(push_st, 1);
+                                      const char *plbl = (const char *)sqlite3_column_text(push_st, 2);
+                                      const char *pcfs = (const char *)sqlite3_column_text(push_st, 3);
+                                      if (pguid && pcfs) {
+                                          char push_json[4096];
+                                          int pn = snprintf(push_json, sizeof(push_json),
+                                              "{\"action\":\"push\",\"guid\":\"%s\",\"snapshot\":\"%s\","
+                                              "\"label\":\"%s\",\"cluster_fs\":\"%s\"}",
+                                              pguid, psnap ? psnap : "", plbl ? plbl : "", pcfs);
+                                          if (pn > 0 && pn < (int)sizeof(push_json)) {
+                                              zep_log("scheduler: dispatching push for guid=%s label=%s\n",
+                                                      pguid, plbl ? plbl : "");
+                                              ws_send_frame_gtls(nw, WS_OP_TEXT,
+                                                  (unsigned char *)push_json, (size_t)pn);
+                                          }
+                                      }
+                                  }
+                                  sqlite3_finalize(push_st);
+                              }
+                          }
+                          cJSON_Delete(msg);
+                          continue;
+                       }
+                       cJSON_Delete(msg);
                 }
             }
                 if (plen == 0) continue; /* empty data frame */
@@ -2602,11 +2735,12 @@ zep_log_debug("config set: key=%s body_len=%zu body=%.*s\n",
         if (g_resume && strcmp(role, "master") == 0 && cluster_name[0]) {
             sqlite3_stmt *rst = NULL;
             if (sqlite3_prepare_v2(g_db,
-                "SELECT su.guid, su.resume_token, s.cluster_fs, s.label "
-                "FROM snapshot_upload su "
-                "JOIN snapshots s ON s.guid = su.guid "
-                "WHERE su.node = ?1 AND su.complete = 0 "
-                "AND s.status = 'failed' AND s.direction = 'push' "
+                "SELECT s.guid, f.push_resume_token, f.fs, s.label "
+                "FROM fs f "
+                "JOIN snapshots s ON s.guid = f.last_pushed_guid "
+                "WHERE s.node = ?1 AND f.push_resume_token != '' "
+                "AND f.push_status != 'pushed' "
+                "AND s.direction = 'push' "
                 "LIMIT 1",
                 -1, &rst, NULL) == SQLITE_OK) {
                 sqlite3_bind_text(rst, 1, ctx->node, -1, SQLITE_STATIC);
@@ -2927,7 +3061,7 @@ zep_log_debug("config set: key=%s body_len=%zu body=%.*s\n",
                         return ret;
                     }
 
-                    if (g_resume && db_upload_has_incomplete(g_db, ctx->node)) {
+                    if (g_resume && db_fs_has_incomplete_push(g_db, ctx->node)) {
                         cJSON_AddBoolToObject(resp, "skip", 1);
                         sqlite3_finalize(st);
                         char *js = cJSON_PrintUnformatted(resp);

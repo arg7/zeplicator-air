@@ -66,6 +66,7 @@ err_t db_init_tables(sqlite3 *db) {
         "  created_at    TEXT NOT NULL DEFAULT (datetime('now'))"
         ");"
         "CREATE TABLE IF NOT EXISTS snapshots ("
+        "  id           INTEGER PRIMARY KEY AUTOINCREMENT,"
         "  cluster      TEXT NOT NULL,"
         "  node         TEXT NOT NULL,"
         "  guid         TEXT NOT NULL,"
@@ -83,14 +84,17 @@ err_t db_init_tables(sqlite3 *db) {
         "  recorded_at  TEXT NOT NULL DEFAULT (datetime('now')),"
         "  UNIQUE(node, guid)"
         ");"
-        "CREATE TABLE IF NOT EXISTS snapshot_upload ("
-         "  guid          TEXT PRIMARY KEY,"
-         "  node          TEXT NOT NULL DEFAULT '',"
-         "  bytes_received BIGINT NOT NULL DEFAULT 0,"
-         "  resume_token  TEXT NOT NULL DEFAULT '',"
-         "  complete      INTEGER NOT NULL DEFAULT 0,"
-         "  created_at    TEXT NOT NULL DEFAULT (datetime('now'))"
-         ");";
+        "CREATE TABLE IF NOT EXISTS fs ("
+        "  id              INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  cluster         TEXT NOT NULL,"
+        "  fs              TEXT NOT NULL,"
+        "  last_pushed_guid TEXT NOT NULL DEFAULT '',"
+        "  last_pulled_guid TEXT NOT NULL DEFAULT '',"
+        "  push_resume_token TEXT NOT NULL DEFAULT '',"
+        "  push_bytes_recv  BIGINT NOT NULL DEFAULT 0,"
+        "  push_status      TEXT NOT NULL DEFAULT 'pending',"
+        "  UNIQUE(cluster, fs)"
+        ");";
     char *err = NULL;
     int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
     if (rc != SQLITE_OK) {
@@ -584,59 +588,196 @@ err_t db_rotation_candidates(sqlite3 *db, const char *cluster,
     return ZEP_ERR_OK;
 }
 
-err_t db_upload_get_offset(sqlite3 *db, const char *guid,
-                            char *offset_buf, size_t len) {
-    if (!offset_buf || !len) return ZEP_ERR_NOT_FOUND;
-    offset_buf[0] = '\0';
+err_t db_fs_get(sqlite3 *db, const char *cluster, const char *fs_name,
+                char *last_pushed_guid, size_t guid_len,
+                char *last_pulled_guid, size_t pulled_len,
+                char *resume_token, size_t token_len,
+                int64_t *bytes_recv) {
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db,
-            "SELECT bytes_received FROM snapshot_upload WHERE guid = ?1 AND complete = 0",
+            "SELECT last_pushed_guid, last_pulled_guid, "
+            "       push_resume_token, push_bytes_recv "
+            "FROM fs WHERE cluster = ?1 AND fs = ?2",
             -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
-    int found = (sqlite3_step(stmt) == SQLITE_ROW);
-    if (found) {
-        int64_t bytes = sqlite3_column_int64(stmt, 0);
-        snprintf(offset_buf, len, "%ld", (long)bytes);
+    sqlite3_bind_text(stmt, 1, cluster, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, fs_name, -1, SQLITE_STATIC);
+    err_t ret = ZEP_ERR_NOT_FOUND;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (last_pushed_guid)
+            snprintf(last_pushed_guid, guid_len, "%s",
+                     sqlite3_column_text(stmt, 0));
+        if (last_pulled_guid)
+            snprintf(last_pulled_guid, pulled_len, "%s",
+                     sqlite3_column_text(stmt, 1));
+        if (resume_token)
+            snprintf(resume_token, token_len, "%s",
+                     sqlite3_column_text(stmt, 2));
+        if (bytes_recv)
+            *bytes_recv = sqlite3_column_int64(stmt, 3);
+        ret = ZEP_ERR_OK;
     }
     sqlite3_finalize(stmt);
-    return found ? ZEP_ERR_OK : ZEP_ERR_NOT_FOUND;
+    return ret;
 }
 
-err_t db_upload_save_token(sqlite3 *db, const char *guid,
-                            const char *node, const char *token, int64_t bytes) {
+err_t db_fs_save_token(sqlite3 *db, const char *cluster, const char *fs_name,
+                       const char *token, int64_t bytes) {
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db,
-            "INSERT OR REPLACE INTO snapshot_upload "
-            "(guid, node, bytes_received, resume_token, complete) "
-            "VALUES (?1, ?2, ?3, ?4, 0)",
+            "INSERT OR REPLACE INTO fs "
+            "(cluster, fs, push_resume_token, push_bytes_recv, "
+            " last_pushed_guid, last_pulled_guid, push_status) "
+            "VALUES (?1, ?2, ?3, ?4, '', '', 'pending')",
             -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, node ? node : "", -1, SQLITE_STATIC);
-    sqlite3_bind_int64(stmt, 3, bytes);
-    sqlite3_bind_text(stmt, 4, token ? token : "", -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 1, cluster, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, fs_name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, token ? token : "", -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 4, bytes);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
 }
 
-err_t db_upload_complete(sqlite3 *db, const char *guid) {
+err_t db_fs_clear_token(sqlite3 *db, const char *cluster, const char *fs_name) {
+    return db_fs_save_token(db, cluster, fs_name, "", 0);
+}
+
+err_t db_fs_mark_pushed(sqlite3 *db, const char *cluster, const char *fs_name,
+                        const char *guid) {
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db,
-            "DELETE FROM snapshot_upload WHERE guid = ?1",
+            "UPDATE fs SET last_pushed_guid = ?3, push_status = 'pushed', "
+            "  push_resume_token = '', push_bytes_recv = 0 "
+            "WHERE cluster = ?1 AND fs = ?2",
             -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 1, cluster, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, fs_name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, guid, -1, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
 }
 
-int db_upload_has_incomplete(sqlite3 *db, const char *node) {
+err_t db_fs_mark_pulled(sqlite3 *db, const char *cluster, const char *fs_name,
+                        const char *guid) {
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db,
-            "SELECT 1 FROM snapshot_upload WHERE node = ?1 AND complete = 0 LIMIT 1",
+            "UPDATE fs SET last_pulled_guid = ?3, push_status = 'pending' "
+            "WHERE cluster = ?1 AND fs = ?2",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, cluster, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, fs_name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, guid, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
+}
+
+err_t db_fs_list_push_pending(sqlite3 *db, const char *cluster,
+                              const char *node, char ***out_guids, int *count) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT guid FROM snapshots "
+            "WHERE cluster = ?1 AND node = ?2 AND direction = 'push' "
+            "  AND push_status = 'pending' AND status = 'pending' "
+            "ORDER BY rowid ASC",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, cluster, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, node, -1, SQLITE_STATIC);
+
+    int cap = 16, cnt = 0;
+    char **list = calloc((size_t)cap, sizeof(char *));
+    if (!list) { sqlite3_finalize(stmt); return ZEP_ERR_SYS; }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (cnt >= cap) {
+            cap *= 2;
+            char **nl = realloc(list, (size_t)cap * sizeof(char *));
+            if (!nl) {
+                for (int j = 0; j < cnt; j++) free(list[j]);
+                free(list); sqlite3_finalize(stmt);
+                return ZEP_ERR_SYS;
+            }
+            list = nl;
+        }
+        list[cnt++] = strdup((const char *)sqlite3_column_text(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    *out_guids = list;
+    *count = cnt;
+    return ZEP_ERR_OK;
+}
+
+err_t db_fs_get_next_pending_id(sqlite3 *db, const char *cluster,
+                                const char *node, int *out_id) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT MIN(rowid) FROM snapshots "
+            "WHERE cluster = ?1 AND node = ?2 AND direction = 'push' "
+            "  AND push_status = 'pending' AND status = 'pending'",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, cluster, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, node, -1, SQLITE_STATIC);
+    err_t ret = ZEP_ERR_NOT_FOUND;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        int val = sqlite3_column_int(stmt, 0);
+        if (val > 0) {
+            *out_id = val;
+            ret = ZEP_ERR_OK;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return ret;
+}
+
+err_t db_fs_mark_snapshot_verified(sqlite3 *db, const char *guid,
+                                   int64_t blob_size, int blob_count,
+                                   const char *base_guid) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE snapshots SET status = 'verified', blob_count = ?3, "
+            "  blob_size = ?4, base_guid = ?5 "
+            "WHERE guid = ?1",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, base_guid ? base_guid : "", -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 3, blob_count);
+    sqlite3_bind_int64(stmt, 4, blob_size);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
+}
+
+err_t db_fs_cascade_update_to_id(sqlite3 *db, const char *cluster,
+                                 int target_id) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE snapshots SET status = 'verified' "
+            "WHERE cluster = ?1 AND direction = 'push' AND rowid <= ?2 "
+            "  AND push_status = 'pending'",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return ZEP_ERR_DB;
+    sqlite3_bind_text(stmt, 1, cluster, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 2, target_id);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    (void)rc;
+    return ZEP_ERR_OK;
+}
+
+int db_fs_has_incomplete_push(sqlite3 *db, const char *node) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT 1 FROM snapshots "
+            "WHERE node = ?1 AND direction = 'push' AND push_status = 'pending' "
+            "LIMIT 1",
             -1, &stmt, NULL) != SQLITE_OK)
         return 0;
     sqlite3_bind_text(stmt, 1, node, -1, SQLITE_STATIC);

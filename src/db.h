@@ -40,11 +40,30 @@ char *db_snapshot_chain_json(sqlite3 *db, const char *cluster,
 err_t db_snapshot_latest_guid(sqlite3 *db, const char *node,
                               const char *direction,
                               char *guid, size_t len);
-err_t db_upload_get_offset(sqlite3 *db, const char *guid,
-                            char *offset_buf, size_t len);
-err_t db_upload_save_token(sqlite3 *db, const char *guid,
-                            const char *node, const char *token, int64_t bytes);
-err_t db_upload_complete(sqlite3 *db, const char *guid);
+
+/* ── fs table (Phase 3: resume push) ── */
+err_t db_fs_get(sqlite3 *db, const char *cluster, const char *fs_name,
+                char *last_pushed_guid, size_t guid_len,
+                char *last_pulled_guid, size_t pulled_len,
+                char *resume_token, size_t token_len,
+                int64_t *bytes_recv);
+err_t db_fs_save_token(sqlite3 *db, const char *cluster, const char *fs_name,
+                       const char *token, int64_t bytes);
+err_t db_fs_clear_token(sqlite3 *db, const char *cluster, const char *fs_name);
+err_t db_fs_mark_pushed(sqlite3 *db, const char *cluster, const char *fs_name,
+                        const char *guid);
+err_t db_fs_mark_pulled(sqlite3 *db, const char *cluster, const char *fs_name,
+                        const char *guid);
+err_t db_fs_list_push_pending(sqlite3 *db, const char *cluster,
+                              const char *node, char ***out_guids, int *count);
+err_t db_fs_get_next_pending_id(sqlite3 *db, const char *cluster,
+                                const char *node, int *out_id);
+err_t db_fs_mark_snapshot_verified(sqlite3 *db, const char *guid,
+                                   int64_t blob_size, int blob_count,
+                                   const char *base_guid);
+err_t db_fs_cascade_update_to_id(sqlite3 *db, const char *cluster,
+                                 int target_id);
+int   db_fs_has_incomplete_push(sqlite3 *db, const char *node);
 
 err_t db_common_ancestor(sqlite3 *db, const char *cluster,
                          char *guid, size_t len);
@@ -54,13 +73,6 @@ int   db_node_pull_count(sqlite3 *db, const char *cluster, const char *node);
 err_t db_rotation_candidates(sqlite3 *db, const char *cluster,
                               const char *node, const char *mapping,
                               cJSON *cluster_json, cJSON *out);
-
-err_t db_upload_get_offset(sqlite3 *db, const char *guid,
-                            char *offset_buf, size_t len);
-err_t db_upload_save_token(sqlite3 *db, const char *guid,
-                            const char *node, const char *token, int64_t bytes);
-err_t db_upload_complete(sqlite3 *db, const char *guid);
-int   db_upload_has_incomplete(sqlite3 *db, const char *node);
 
 err_t db_pull_state_save(sqlite3 *db, const char *key,
                          const char *guid, int blobs_done);
