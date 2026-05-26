@@ -166,29 +166,11 @@ err_t zstream_token_from_file(const char *token_file) {
         return ZEP_ERR_ZFS;
     }
 
-    char line[256];
-    int valid = 0;
-    while (fgets(line, sizeof(line), tp)) {
-        char *dl = line;
-        while (*dl == ' ' || *dl == '\t') dl++;
-        if (strstr(dl, "valid")) {
-            char *eq = strchr(dl, '=');
-            if (eq) {
-                char *v = eq + 1;
-                while (*v == ' ') v++;
-                if (*v == '1') valid = 1;
-            }
-        }
-    }
-
     int rc = audit_popen_result(tp, NULL, 0);
     audit_log(AUDIT_EVT_EXEC, "zstream", cmd, rc);
 
-    /* Exit code 0 or 2 (no DRR_END) with valid=1 = valid for split chunks.
-     * Exit code 1 without "valid" line = valid complete stream (DRR_END found). */
-    if ((rc == 0 || rc == 2) && valid)
-        return ZEP_ERR_OK;
-    if (rc == 1 && !valid)
+    /* Exit 0 = valid token, 1 = complete (DRR_END), 2 = split chunk (no DRR_END) */
+    if (rc == 0 || rc == 1 || rc == 2)
         return ZEP_ERR_OK;
     return ZEP_ERR_ZFS;
 }
