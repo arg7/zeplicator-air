@@ -158,7 +158,7 @@ err_t zstream_token_from_file(const char *token_file) {
     if (!token_file || !token_file[0]) return ZEP_ERR_SYS;
 
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "zstream token -g -i '%s'", token_file);
+    snprintf(cmd, sizeof(cmd), "zstream token -g -i '%s' > /dev/null", token_file);
 
     FILE *tp = audit_popen(cmd);
     if (!tp) {
