@@ -1548,7 +1548,8 @@ static void *node_ws_thread(void *arg) {
                                        db_fs_mark_pushed(g_db, cluster, cfs, guid);
                                    }
                                } else {
-                                   sqlite3_stmt *sf = NULL;
+                                    db_fs_clear_token(g_db, cluster, cfs);
+                                    sqlite3_stmt *sf = NULL;
                                    if (sqlite3_prepare_v2(g_db,
                                        "UPDATE snapshots SET push_status='resuming', "
                                        "blob_size=?, blob_count=? "
