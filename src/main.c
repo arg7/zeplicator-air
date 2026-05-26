@@ -1337,11 +1337,14 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                 mp = comma ? comma + 1 : colon + strlen(colon);
                             }
 
-                            if (local_snap[0]) {
+                             if (local_snap[0]) {
                                      char send_cmd[4096];
                                      int is_resume_push = (prt && prt[0]);
                                      int n = 0;
-                                     if (is_resume_push && pbg && pbg[0]) {
+                                     if (is_resume_push) {
+                                         n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
+                                             "zfs send -t '%s'", prt);
+                                     } else if (pbg && pbg[0]) {
                                          n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
                                              "zfs send -I '%s' '%s'", pbg, local_snap);
                                      } else {

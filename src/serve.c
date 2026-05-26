@@ -1596,7 +1596,7 @@ static void *node_ws_thread(void *arg) {
                                         const char *nc = (const char *)sqlite3_column_text(next_st, 3);
                                         const char *nb = (const char *)sqlite3_column_text(next_st, 4);
                                         char rtok[256] = {0};
-                                        if (nb && nb[0]) {
+                                        {
                                             sqlite3_stmt *rts = NULL;
                                             if (sqlite3_prepare_v2(g_db,
                                                 "SELECT push_resume_token FROM fs "
@@ -1753,24 +1753,24 @@ static void *node_ws_thread(void *arg) {
                                        const char *plbl = (const char *)sqlite3_column_text(push_st, 2);
                                        const char *pcfs = (const char *)sqlite3_column_text(push_st, 3);
                                        const char *pbg = (const char *)sqlite3_column_text(push_st, 4);
-                                       /* Get resume token from fs table */
-                                       char resume_token[256] = {0};
-                                       if (pbg && pbg[0]) {
-                                           sqlite3_stmt *rt_st = NULL;
-                                           if (sqlite3_prepare_v2(g_db,
-                                               "SELECT push_resume_token FROM fs "
-                                               "WHERE cluster=?1 AND fs=?2 LIMIT 1",
-                                               -1, &rt_st, NULL) == SQLITE_OK) {
-                                               sqlite3_bind_text(rt_st, 1, cluster_buf, -1, SQLITE_STATIC);
-                                               sqlite3_bind_text(rt_st, 2, pcfs, -1, SQLITE_STATIC);
-                                               if (sqlite3_step(rt_st) == SQLITE_ROW) {
-                                                   const char *rt = (const char *)sqlite3_column_text(rt_st, 0);
-                                                   if (rt && rt[0])
-                                                       snprintf(resume_token, sizeof(resume_token), "%s", rt);
-                                               }
-                                               sqlite3_finalize(rt_st);
-                                           }
-                                       }
+                                        /* Get resume token from fs table */
+                                        char resume_token[256] = {0};
+                                        {
+                                            sqlite3_stmt *rt_st = NULL;
+                                            if (sqlite3_prepare_v2(g_db,
+                                                "SELECT push_resume_token FROM fs "
+                                                "WHERE cluster=?1 AND fs=?2 LIMIT 1",
+                                                -1, &rt_st, NULL) == SQLITE_OK) {
+                                                sqlite3_bind_text(rt_st, 1, cluster_buf, -1, SQLITE_STATIC);
+                                                sqlite3_bind_text(rt_st, 2, pcfs, -1, SQLITE_STATIC);
+                                                if (sqlite3_step(rt_st) == SQLITE_ROW) {
+                                                    const char *rt = (const char *)sqlite3_column_text(rt_st, 0);
+                                                    if (rt && rt[0])
+                                                        snprintf(resume_token, sizeof(resume_token), "%s", rt);
+                                                }
+                                                sqlite3_finalize(rt_st);
+                                            }
+                                        }
                                        if (pguid && pcfs) {
                                            char push_json[4096];
                                            int pn;
