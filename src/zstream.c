@@ -184,8 +184,11 @@ err_t zstream_token_from_file(const char *token_file) {
     int rc = audit_popen_result(tp, NULL, 0);
     audit_log(AUDIT_EVT_EXEC, "zstream", cmd, rc);
 
-    /* Exit code 0 or 2 (no DRR_END) = valid for split chunks */
+    /* Exit code 0 or 2 (no DRR_END) with valid=1 = valid for split chunks.
+     * Exit code 1 without "valid" line = valid complete stream (DRR_END found). */
     if ((rc == 0 || rc == 2) && valid)
+        return ZEP_ERR_OK;
+    if (rc == 1 && !valid)
         return ZEP_ERR_OK;
     return ZEP_ERR_ZFS;
 }

@@ -124,6 +124,7 @@ FILE *audit_popen(const char *cmd) {
     g_audit_tmp[0] = '\0';
 
     char tmp_path[512];
+    snprintf(tmp_path, sizeof(tmp_path), "/tmp/zep-audit-XXXXXX");
     int tmp_fd = mkstemp(tmp_path);
     if (tmp_fd < 0) {
         return popen(cmd, "r");

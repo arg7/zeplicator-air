@@ -448,7 +448,9 @@ static void *ws_node_pipe_thread(void *arg) {
                             cJSON_AddItemToArray(snaps, sn);
                         }
                     }
-                    pclose(fp);
+                    int rc = pclose(fp);
+                    audit_log("snap_list", "zfs", cmd,
+                        WIFEXITED(rc) ? WEXITSTATUS(rc) : -128);
                 }
                 /* Move to next mapping */
                 const char *comma = strchr(colon, ',');
@@ -730,7 +732,11 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                 if (ws_node_send_frame(conn, WS_NODE_OP_TEXT,
                     (unsigned char *)push_req, strlen(push_req)) < 0) {
                     zep_log("ws-node: push_ws send failed\n");
-                    if (send_fp) pclose(send_fp);
+                    if (send_fp) {
+                        int ck = pclose(send_fp);
+                        audit_log("push_send", "zfs", _pscmd,
+                            WIFEXITED(ck) ? WEXITSTATUS(ck) : -128);
+                    }
                     char pres = 1;
                     (void)!write(g_push_ws_resp_pipe[1], &pres, 1);
                     continue;
@@ -1224,14 +1230,15 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                 }
                                 char cmd[4096];
                                 snprintf(cmd, sizeof(cmd),
-                                    "zfs snapshot -g 'guid' '%s' 2>&1",
+                                    "zfs snapshot -g 'guid' '%s'",
                                     local_snap);
                                 zep_log("create_snap: %s\n", cmd);
 
                                 /* Run snapshot command, capture stdout for guid */
-                                FILE *fp = popen(cmd, "r");
+                                FILE *fp = audit_popen(cmd);
                                 char stdout_buf[64] = {0};
                                 char real_guid[33] = {0};
+                                char errbuf[256] = {0};
                                 int exit_code = -1;
                                 if (fp) {
                                     if (fgets(stdout_buf, (int)sizeof(stdout_buf), fp)) {
@@ -1242,8 +1249,8 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                             snprintf(real_guid, sizeof(real_guid), "%s", stdout_buf);
                                         }
                                     }
-                                    int rc = pclose(fp);
-                                    exit_code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+                                    exit_code = audit_popen_result(fp, errbuf, sizeof(errbuf));
+                                    audit_log_err("create_snap", "zfs", cmd, exit_code, errbuf);
                                     zep_log("create_snap: rc=%d guid=%s\n",
                                         exit_code, real_guid);
 
@@ -1340,7 +1347,9 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                 if (chk) {
                                     char line[512];
                                     if (fgets(line, sizeof(line), chk)) snap_exists = 1;
-                                    pclose(chk);
+                                    int rc = pclose(chk);
+                                    audit_log("snap_check", "zfs", check_cmd,
+                                        WIFEXITED(rc) ? WEXITSTATUS(rc) : -128);
                                 }
 
                                 if (!snap_exists) {
@@ -1390,7 +1399,9 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                          if (ws_node_send_frame(conn, WS_NODE_OP_TEXT,
                                              (unsigned char *)push_req, (size_t)pn) < 0) {
                                              zep_log("push: send request failed\n");
-                                             pclose(send_fp);
+                                             int ck = pclose(send_fp);
+                                             audit_log("push_send", "zfs", send_cmd,
+                                                 WIFEXITED(ck) ? WEXITSTATUS(ck) : -128);
                                              char pres = 1;
                                              (void)!write(g_push_ws_resp_pipe[1], &pres, 1);
                                          } else {
@@ -1422,20 +1433,25 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                                           if (ws_node_send_frame(conn, WS_NODE_OP_BIN, pipe_buf, nr) < 0) {
                                                               pipe_err = 1; break;
                                                           }
-                                                      } else {
-                                                          pipe_eof = 1;
-                                                          pclose(send_fp);
-                                                          send_fp = NULL;
-                                                          if (resumed) {
-                                                              zep_log("push: resumed pipeline EOF, sending EXIT\n");
-                                                              unsigned char ex = 0;
-                                                              ws_node_send_frame(conn, WS_NODE_OP_EXIT, &ex, 1);
+                                                       } else {
+                                                           pipe_eof = 1;
+                                                           int ck = pclose(send_fp);
+                                                           audit_log("push_send", "zfs", send_cmd,
+                                                               WIFEXITED(ck) ? WEXITSTATUS(ck) : -128);
+                                                           send_fp = NULL;
+                                                           if (resumed) {
+                                                               unsigned char ex = (unsigned char)(WIFEXITED(ck) && WEXITSTATUS(ck) == 0 ? 0 : 1);
+                                                               zep_log("push: resumed pipeline EOF, sending EXIT rc=%d\n", (int)ex);
+                                                               ws_node_send_frame(conn, WS_NODE_OP_EXIT, &ex, 1);
                                                               resumed = 0;
                                                               pipe_eof = 0;
                                                               continue;
-                                                          } else {
-                                                              zep_log("push: pipeline EOF, waiting for resume or server close\n");
-                                                          }
+                                                           } else {
+                                                               unsigned char ex = (unsigned char)(WIFEXITED(ck) && WEXITSTATUS(ck) == 0 ? 0 : 1);
+                                                               zep_log("push: pipeline EOF complete, sending EXIT rc=%d\n", (int)ex);
+                                                               ws_node_send_frame(conn, WS_NODE_OP_EXIT, &ex, 1);
+                                                               break;
+                                                           }
                                                       }
                                                   }
                                                   if (ws_fd >= 0 && FD_ISSET(ws_fd, &rfds)) {
@@ -1456,10 +1472,15 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                                                      zep_log("push: pipeline re-opened, fd=%d\n", fileno(send_fp));
                                                                      fflush(stderr);
                                                                  }
-                                                           } else if (ws_op == WS_NODE_OP_EXIT || ws_op == WS_NODE_OP_EOF) {
-                                                               zep_log("push: received EXIT/EOF from server, stopping\n");
-                                                               if (send_fp) { pclose(send_fp); send_fp = NULL; }
-                                                               break;
+                                                            } else if (ws_op == WS_NODE_OP_EXIT || ws_op == WS_NODE_OP_EOF) {
+                                                                zep_log("push: received EXIT/EOF from server, stopping\n");
+                                                                if (send_fp) {
+                                                                    int ck = pclose(send_fp);
+                                                                    audit_log("push_send", "zfs", send_cmd,
+                                                                        WIFEXITED(ck) ? WEXITSTATUS(ck) : -128);
+                                                                    send_fp = NULL;
+                                                                }
+                                                                break;
                                                            }
                                                        } else if (rn < 0) {
                                                            break;
@@ -1470,6 +1491,8 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                              if (send_fp) {
                                                 send_rc = pclose(send_fp);
                                                 send_fp = NULL;
+                                                audit_log("push_send", "zfs", send_cmd,
+                                                    WIFEXITED(send_rc) ? WEXITSTATUS(send_rc) : -128);
                                                 zep_log("push: pipe closed rc=%d\n", send_rc);
                                                 unsigned char ex = (unsigned char)(send_rc == 0 ? 0 : 1);
                                                 ws_node_send_frame(conn, WS_NODE_OP_EXIT, &ex, 1);
@@ -1813,7 +1836,9 @@ int pipeline_push_ws(const zep_config_t *cfg, const char *fs,
                   break;
               }
           }
-          pclose(p);
+          int rc = pclose(p);
+          audit_log("snap_list", "zfs", cmd,
+              WIFEXITED(rc) ? WEXITSTATUS(rc) : -128);
       }
       if (!guid_str[0]) {
           zep_log("push_ws: no snapshot guid found for fs=%s\n", fs);
@@ -1858,7 +1883,9 @@ int pipeline_push_ws_explicit(const zep_config_t *cfg, const char *snap_name,
               size_t gl = strlen(guid);
               while (gl > 0 && (guid[gl-1]=='\n'||guid[gl-1]=='\r')) guid[--gl]='\0';
           }
-          pclose(p);
+          int rc = pclose(p);
+          audit_log("snap_guid", "zfs", cmd,
+              WIFEXITED(rc) ? WEXITSTATUS(rc) : -128);
       }
       if (!guid[0]) {
           zep_log("push_ws_explicit: no guid found for snap=%s\n", snap_name);

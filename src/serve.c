@@ -1196,7 +1196,8 @@ static void *node_ws_thread(void *arg) {
                                        FILE *mp = audit_popen(mcmd);
                                        if (mp) {
                                            char tmp[256]; while (fgets(tmp, sizeof(tmp), mp));
-                                           audit_popen_result(mp, NULL, 0);
+                                           int mk_rc = audit_popen_result(mp, NULL, 0);
+                                           audit_log(AUDIT_EVT_EXEC, "serve", mcmd, mk_rc);
                                        }
                                    }
                                }
@@ -1322,9 +1323,10 @@ static void *node_ws_thread(void *arg) {
                                             (unsigned char *)resp, strlen(resp));
                                }
 
-                               /* Read BIN frames and write to .stream files */
-                               for (;;) {
-                                   ssize_t rn = ws_recv_frame_full(nw, buf, WS_SUBCHUNK + 256, out, WS_SUBCHUNK, &buf[0]);
+                                /* Read BIN frames and write to .stream files */
+                                int node_exit_rc = -1;
+                                for (;;) {
+                                    ssize_t rn = ws_recv_frame_full(nw, buf, WS_SUBCHUNK + 256, out, WS_SUBCHUNK, &buf[0]);
                                    if (rn < 0) break;
                                    unsigned char op = buf[0] & 0x0F;
                                    if (op == WS_OP_CLOSE) break;
@@ -1333,11 +1335,12 @@ static void *node_ws_thread(void *arg) {
                                        continue;
                                    }
                                    if (op == WS_OP_PONG) continue;
-                                   if (op == WS_OP_BIN && rn > 0) {
-                                       if (fwrite(out, 1, (size_t)rn, fp) != (size_t)rn) break;
-                                       continue;
-                                   }
-                                   if (op == WS_OP_EXIT || op == WS_OP_EOF) break;
+                                    if (op == WS_OP_BIN && rn > 0) {
+                                        if (fwrite(out, 1, (size_t)rn, fp) != (size_t)rn) break;
+                                        continue;
+                                    }
+                                    if (op == WS_OP_EXIT && rn == 1) node_exit_rc = (int)out[0];
+                                    if (op == WS_OP_EXIT || op == WS_OP_EOF) break;
                                }
                                fclose(fp); fp = NULL;
                                 stream_count = 1;
@@ -1364,8 +1367,8 @@ static void *node_ws_thread(void *arg) {
                                    }
                                }
 
-                               /* Save resume token if enabled and stream has data */
-                                if (g_resume && final_size > 0) {
+                                /* Save resume token if enabled, stream has data, and node reported non-zero exit */
+                                 if (g_resume && final_size > 0 && node_exit_rc != 0) {
                                     char tok_file[ZEP_MAX_PATH * 2 + 256];
                                     snprintf(tok_file, sizeof(tok_file), "%s/tok_%04u", snap_dir, blob_num);
                                     char tok_cmd[4096];
@@ -1374,6 +1377,7 @@ static void *node_ws_thread(void *arg) {
                                     FILE *tp = audit_popen(tok_cmd);
                                     if (tp) {
                                         int tok_rc = audit_popen_result(tp, NULL, 0);
+                                        audit_log(AUDIT_EVT_EXEC, "serve", tok_cmd, tok_rc);
                                         if (tok_rc == 0 || tok_rc == 2) {
                                             char tok[256] = {0};
                                             FILE *tfp = fopen(tok_file, "r");
