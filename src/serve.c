@@ -1633,6 +1633,7 @@ static void *node_ws_thread(void *arg) {
                                                 zep_log("scheduler: dispatching push for guid=%s label=%s%s\n",
                                                         ng, nl ? nl : "",
                                                         rtok[0] ? " (resume)" : "");
+                                                zep_log("scheduler: push_cmd %s\n", pj);
                                                 ws_send_frame_gtls(nw, WS_OP_TEXT,
                                                     (unsigned char *)pj, (size_t)pn);
                                             }
@@ -1787,13 +1788,14 @@ static void *node_ws_thread(void *arg) {
                                                    pguid, psnap ? psnap : "", plbl ? plbl : "", pcfs,
                                                    pbg ? pbg : "");
                                            }
-                                           if (pn > 0 && pn < (int)sizeof(push_json)) {
-                                               zep_log("scheduler: dispatching push for guid=%s label=%s%s\n",
-                                                       pguid, plbl ? plbl : "",
-                                                       resume_token[0] ? " (resume)" : "");
-                                               ws_send_frame_gtls(nw, WS_OP_TEXT,
-                                                   (unsigned char *)push_json, (size_t)pn);
-                                           }
+                                            if (pn > 0 && pn < (int)sizeof(push_json)) {
+                                                zep_log("scheduler: dispatching push for guid=%s label=%s%s\n",
+                                                        pguid, plbl ? plbl : "",
+                                                        resume_token[0] ? " (resume)" : "");
+                                                zep_log("scheduler: push_cmd %s\n", push_json);
+                                                ws_send_frame_gtls(nw, WS_OP_TEXT,
+                                                    (unsigned char *)push_json, (size_t)pn);
+                                            }
                                        }
                                   }
                                   sqlite3_finalize(push_st);
