@@ -28,7 +28,7 @@ err_t zfs_send_open(const char *fs, const char *from_snap, const char *to_snap,
     if (resume_token && resume_token[0]) {
         (void)to_snap;
         snprintf(cmd, sizeof(cmd),
-            "zfs send %s -t '%s' 2>/dev/null%s%s%s%s%s%s",
+            "zfs send %s -t '%s'%s%s%s%s%s%s",
             extra_opts ? extra_opts : "",
             resume_token,
             buf_cmd && buf_cmd[0] ? " | " : "",
@@ -39,7 +39,7 @@ err_t zfs_send_open(const char *fs, const char *from_snap, const char *to_snap,
             debug_inject_cmd && debug_inject_cmd[0] ? debug_inject_cmd : "");
     } else if (from_snap && from_snap[0]) {
         snprintf(cmd, sizeof(cmd),
-            "zfs send %s %s '%s' '%s' 2>/dev/null%s%s%s%s%s%s",
+            "zfs send %s %s '%s' '%s'%s%s%s%s%s%s",
             extra_opts ? extra_opts : "",
             send_all ? "-I" : "-i",
             from_snap, to_snap,
@@ -51,7 +51,7 @@ err_t zfs_send_open(const char *fs, const char *from_snap, const char *to_snap,
             debug_inject_cmd && debug_inject_cmd[0] ? debug_inject_cmd : "");
     } else {
         snprintf(cmd, sizeof(cmd),
-            "zfs send %s '%s' 2>/dev/null%s%s%s%s%s%s",
+            "zfs send %s '%s'%s%s%s%s%s%s",
             extra_opts ? extra_opts : "", to_snap,
             buf_cmd && buf_cmd[0] ? " | " : "",
             buf_cmd && buf_cmd[0] ? buf_cmd : "",
@@ -95,7 +95,7 @@ err_t zfs_get_latest_guid(const char *fs, char *guid, size_t len) {
     if (!guid || !len || !fs) return ZEP_ERR_SYS;
     guid[0] = '\0';
     char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "zfs list -H -o name,guid -s creation -t snap '%s' 2>/dev/null | tail -1", fs);
+    snprintf(cmd, sizeof(cmd), "zfs list -H -o name,guid -s creation -t snap '%s' | tail -1", fs);
     FILE *p = popen(cmd, "r");
     if (!p) return ZEP_ERR_SYS;
     char line[1024];

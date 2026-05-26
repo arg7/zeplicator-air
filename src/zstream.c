@@ -30,7 +30,7 @@ err_t zstream_parse(const void *data, size_t len,
     close(fd);
 
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "zstream dump -v '%s' 2>/dev/null", tmpl);
+    snprintf(cmd, sizeof(cmd), "zstream dump -v '%s'", tmpl);
     FILE *zp = popen(cmd, "r");
     if (!zp) { unlink(tmpl); audit_log(AUDIT_EVT_EXEC, "zstream", cmd, -127); return ZEP_ERR_ZFS; }
 
@@ -82,7 +82,7 @@ err_t zstream_token_parse_offset(const char *token,
     *offset_out = 0;
 
     char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "zstream token '%s' 2>/dev/null", token);
+    snprintf(cmd, sizeof(cmd), "zstream token '%s'", token);
     FILE *p = popen(cmd, "r");
     if (!p) { audit_log(AUDIT_EVT_EXEC, "zstream", cmd, -127); return ZEP_ERR_ZFS; }
 
@@ -109,66 +109,46 @@ err_t zstream_token_parse_offset(const char *token,
     return ZEP_ERR_NOT_FOUND;
 }
 
-/* Build a cat pipeline for all .stream files, pipe to zstream dump -v.
- * Returns ZEP_ERR_OK if toguid extracted successfully. */
+/* Reassemble all .stream files using zstream join.
+ * Returns ZEP_ERR_OK if join succeeded. */
 err_t zstream_join(const char *dir_path, const char *base_name,
                    int start_blob, int blob_count,
                    char *toguid_out, size_t toguid_len) {
-    if (!dir_path || !base_name) return ZEP_ERR_SYS;
+    (void)base_name;
+    (void)toguid_out;
+    (void)toguid_len;
+    if (!dir_path) return ZEP_ERR_SYS;
     if (toguid_out) { toguid_out[0] = '\0'; }
 
-    /* Build command: cat dir/base_NNNN.stream dir/base_NNNN+1.stream ... | zstream dump -v - */
+    char joined_path[ZEP_MAX_PATH * 2 + 256];
+    snprintf(joined_path, sizeof(joined_path), "%s/joined.zfs", dir_path);
+    unlink(joined_path);
+
     char cmd[8192] = {0};
-    int n = 0;
+    int n = snprintf(cmd, sizeof(cmd), "zstream join");
 
     for (int i = 0; i < blob_count; i++) {
-        char bf[16];
-        snprintf(bf, sizeof(bf), "%04u", (unsigned)(start_blob + i));
         char fpath[ZEP_MAX_PATH * 2 + 256];
-        int fn = snprintf(fpath, sizeof(fpath), "%s/%s/%s",
-                          dir_path, base_name, bf);
+        int fn = snprintf(fpath, sizeof(fpath), "%s/%04u.stream",
+                          dir_path, (unsigned)(start_blob + i));
         if (fn < 0 || fn >= (int)sizeof(fpath)) return ZEP_ERR_SYS;
 
-        n += snprintf(cmd + n, sizeof(cmd) - (size_t)n, "cat '%s' ", fpath);
-        if (n < 0 || n >= (int)(sizeof(cmd) - 20)) return ZEP_ERR_SYS;
-
-        if (i < blob_count - 1) {
-            n += snprintf(cmd + n, sizeof(cmd) - (size_t)n, "| ");
-        }
+        n += snprintf(cmd + n, sizeof(cmd) - (size_t)n, " -i '%s'", fpath);
+        if (n < 0 || n >= (int)(sizeof(cmd) - 30)) return ZEP_ERR_SYS;
     }
-    n += snprintf(cmd + n, sizeof(cmd) - (size_t)n, "| zstream dump -v -");
+    n += snprintf(cmd + n, sizeof(cmd) - (size_t)n, " > '%s'", joined_path);
 
-    FILE *dp = audit_popen(cmd);
-    if (!dp) {
+    FILE *cp = audit_popen(cmd);
+    if (!cp) {
         audit_log(AUDIT_EVT_EXEC, "zstream", cmd, -127);
         return ZEP_ERR_ZFS;
     }
+    int join_rc = audit_popen_result(cp, NULL, 0);
+    audit_log(AUDIT_EVT_EXEC, "zstream", cmd, join_rc);
 
-    char line[512];
-    char tguid[ZEP_MAX_GUID_LEN] = {0};
-    while (fgets(line, sizeof(line), dp)) {
-        char *dl = line;
-        while (*dl == ' ' || *dl == '\t') dl++;
-        if (strncmp(dl, "toguid =", 8) == 0) {
-            char *v = dl + 8;
-            while (*v == ' ') v++;
-            size_t len = strlen(v);
-            while (len > 0 && (v[len-1]=='\n'||v[len-1]=='\r')) v[--len] = '\0';
-            if (len > 0 && len < sizeof(tguid))
-                snprintf(tguid, sizeof(tguid), "%s", v);
-        }
-    }
+    if (join_rc != 0) return ZEP_ERR_ZFS;
 
-    int rc = audit_popen_result(dp, NULL, 0);
-    audit_log(AUDIT_EVT_EXEC, "zstream", cmd, rc);
-
-    /* Exit code 0 = valid, 2 = no DRR_END (truncated split — still valid for join) */
-    if ((rc == 0 || rc == 2) && tguid[0]) {
-        if (toguid_out && toguid_len > 0)
-            snprintf(toguid_out, toguid_len, "%s", tguid);
-        return ZEP_ERR_OK;
-    }
-    return ZEP_ERR_ZFS;
+    return ZEP_ERR_OK;
 }
 
 /* Validate a zstream token file (output of zstream token -g -i <file>).
@@ -178,7 +158,7 @@ err_t zstream_token_from_file(const char *token_file) {
     if (!token_file || !token_file[0]) return ZEP_ERR_SYS;
 
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "zstream token -g -i '%s' 2>/dev/null", token_file);
+    snprintf(cmd, sizeof(cmd), "zstream token -g -i '%s'", token_file);
 
     FILE *tp = audit_popen(cmd);
     if (!tp) {

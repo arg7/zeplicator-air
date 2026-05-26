@@ -98,7 +98,7 @@ int main(int argc, char *argv[]) {
             if (is_zstd && has_skip && skipped < skip) {
                 char lcmd[8192];
                 snprintf(lcmd, sizeof(lcmd),
-                         "zstd -l -v '%s' 2>/dev/null | grep 'Decompressed Size:'", path);
+                         "zstd -l -v '%s' | grep 'Decompressed Size:'", path);
                 FILE *lp = popen(lcmd, "r");
                 if (lp) {
                     char line[256];
@@ -121,7 +121,7 @@ int main(int argc, char *argv[]) {
             }
 
             char cmd[8192];
-            snprintf(cmd, sizeof(cmd), "%s < '%s' 2>/dev/null",
+            snprintf(cmd, sizeof(cmd), "%s < '%s'",
                      unzip_cmd, path);
             FILE *fp = popen(cmd, "r");
             if (!fp) {

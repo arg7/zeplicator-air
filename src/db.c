@@ -740,16 +740,16 @@ err_t db_fs_mark_snapshot_verified(sqlite3 *db, const char *guid,
                                    int64_t blob_size, int blob_count,
                                    const char *base_guid) {
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db,
-            "UPDATE snapshots SET status = 'verified', blob_count = ?3, "
-            "  blob_size = ?4, base_guid = ?5 "
-            "WHERE guid = ?1",
-            -1, &stmt, NULL) != SQLITE_OK)
-        return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, base_guid ? base_guid : "", -1, SQLITE_STATIC);
-    sqlite3_bind_int(stmt, 3, blob_count);
-    sqlite3_bind_int64(stmt, 4, blob_size);
+ if (sqlite3_prepare_v2(db,
+             "UPDATE snapshots SET status = 'verified', push_status = 'verified', "
+             "  blob_count = ?2, blob_size = ?3, base_guid = ?4 "
+             "WHERE guid = ?1",
+             -1, &stmt, NULL) != SQLITE_OK)
+         return ZEP_ERR_DB;
+     sqlite3_bind_text(stmt, 1, guid, -1, SQLITE_STATIC);
+     sqlite3_bind_int(stmt, 2, blob_count);
+     sqlite3_bind_int64(stmt, 3, blob_size);
+     sqlite3_bind_text(stmt, 4, base_guid ? base_guid : "", -1, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
