@@ -24,4 +24,20 @@ err_t zstream_join(const char *dir_path, const char *base_name,
  * ZEP_ERR_ZFS if truncated. */
 err_t zstream_token_from_file(const char *token_file);
 
+/* Extract a zstream resume token from a file.
+ * Runs `zstream token -g -i <filepath>`, writes null-terminated token
+ * to *token_out (up to token_len bytes). Returns ZEP_ERR_OK on success,
+ * ZEP_ERR_ZFS if the command fails or produces no token. */
+err_t zstream_token_extract(const char *filepath, char *token_out, size_t token_len);
+
+/* Accumulative zstream join for resume push.
+ * If assembled_in is non-empty: joins assembled_in + new_chunk → assembled_out.
+ * If assembled_in is empty: sanitizes new_chunk (strips incomplete tail) → assembled_out.
+ * On success sets *complete to 1 if DRR_END found (join exit 0), 0 otherwise.
+ * Returns ZEP_ERR_OK on success, ZEP_ERR_ZFS on failure. */
+err_t zstream_join_accumulative(const char *assembled_in,
+                                const char *new_chunk,
+                                const char *assembled_out,
+                                int *complete);
+
 #endif

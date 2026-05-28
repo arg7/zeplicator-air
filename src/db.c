@@ -81,6 +81,8 @@ err_t db_init_tables(sqlite3 *db) {
         "  storage_base TEXT NOT NULL,"
         "  push_status  TEXT NOT NULL DEFAULT 'pending',"
         "  push_err     TEXT NOT NULL DEFAULT '',"
+        "  push_started_at   TEXT NOT NULL DEFAULT '',"
+        "  push_completed_at TEXT NOT NULL DEFAULT '',"
         "  recorded_at  TEXT NOT NULL DEFAULT (datetime('now')),"
         "  UNIQUE(node, guid)"
         ");"
@@ -122,6 +124,18 @@ err_t db_init_tables(sqlite3 *db) {
         if (merr) sqlite3_free(merr);
         sqlite3_exec(db,
                      "ALTER TABLE snapshots ADD COLUMN push_err TEXT NOT NULL DEFAULT ''",
+                     NULL, NULL, &merr);
+        if (merr) sqlite3_free(merr);
+    }
+    /* One-shot migration: add push_started_at, push_completed_at */
+    {
+        char *merr = NULL;
+        sqlite3_exec(db,
+                     "ALTER TABLE snapshots ADD COLUMN push_started_at TEXT NOT NULL DEFAULT ''",
+                     NULL, NULL, &merr);
+        if (merr) sqlite3_free(merr);
+        sqlite3_exec(db,
+                     "ALTER TABLE snapshots ADD COLUMN push_completed_at TEXT NOT NULL DEFAULT ''",
                      NULL, NULL, &merr);
         if (merr) sqlite3_free(merr);
     }
@@ -742,7 +756,8 @@ err_t db_fs_mark_snapshot_verified(sqlite3 *db, const char *guid,
     sqlite3_stmt *stmt = NULL;
  if (sqlite3_prepare_v2(db,
              "UPDATE snapshots SET status = 'verified', push_status = 'verified', "
-             "  blob_count = ?2, blob_size = ?3, base_guid = ?4 "
+             "  blob_count = ?2, blob_size = ?3, base_guid = ?4, "
+             "  push_completed_at = datetime('now') "
              "WHERE guid = ?1",
              -1, &stmt, NULL) != SQLITE_OK)
          return ZEP_ERR_DB;

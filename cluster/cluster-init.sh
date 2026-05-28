@@ -473,8 +473,8 @@ for entry in ${NODES:-}; do
     # Resume-on test config (only on master node)
     if [[ "$RESUME_TEST" -eq 1 && "$role" == "master" ]]; then
         "$ZEP" --db "$node_db" config set resume 1 >/dev/null
-        "$ZEP" --db "$node_db" config set debug_inject_zfs_pipeline_cmd "head -c 200K" >/dev/null
-        say "  Master node ${cn}: resume=1, debug_inject_zfs_pipeline_cmd='head -c 200K'"
+        "$ZEP" --db "$node_db" config set debug_inject_zfs_pipeline_cmd "head -c 1M" >/dev/null
+        say "  Master node ${cn}: resume=1, debug_inject_zfs_pipeline_cmd='head -c 1M'"
     fi
     id "$cn" &>/dev/null && chown -R "${cn}:${cn}" "$(dirname "$node_db")" 2>/dev/null || true
 done

@@ -169,8 +169,94 @@ err_t zstream_token_from_file(const char *token_file) {
     int rc = audit_popen_result(tp, NULL, 0);
     audit_log(AUDIT_EVT_EXEC, "zstream", cmd, rc);
 
-    /* Exit 0 = valid token, 1 = complete (DRR_END), 2 = split chunk (no DRR_END) */
-    if (rc == 0 || rc == 1 || rc == 2)
+    /* Exit 0 = valid stream data, exit 1 = garbage (no DRR_BEGIN), exit 2 = complete (DRR_END) */
+    if (rc == 0 || rc == 2)
         return ZEP_ERR_OK;
+    return ZEP_ERR_ZFS;
+}
+
+/* Extract a zstream resume token from a file.
+ * Runs `zstream token -g -i <filepath>`, captures stdout as token string. */
+err_t zstream_token_extract(const char *filepath, char *token_out, size_t token_len) {
+    if (!filepath || !token_out || token_len == 0) return ZEP_ERR_SYS;
+    token_out[0] = '\0';
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "zstream token -g -i '%s'", filepath);
+
+    char tmp[] = "/tmp/zep-token-XXXXXX";
+    int fd = mkstemp(tmp);
+    if (fd < 0) { perror("mkstemp"); return ZEP_ERR_SYS; }
+    close(fd);
+
+    char cmdfile[1024];
+    snprintf(cmdfile, sizeof(cmdfile), "%s > '%s'", cmd, tmp);
+
+    FILE *tp = audit_popen(cmdfile);
+    if (!tp) {
+        audit_log(AUDIT_EVT_EXEC, "zstream", cmdfile, -127);
+        unlink(tmp);
+        return ZEP_ERR_ZFS;
+    }
+    int rc = audit_popen_result(tp, NULL, 0);
+    audit_log(AUDIT_EVT_EXEC, "zstream", cmdfile, rc);
+
+    if (rc != 0) {
+        unlink(tmp);
+        return ZEP_ERR_ZFS;
+    }
+
+    FILE *tfp = fopen(tmp, "r");
+    if (tfp) {
+        size_t tn = fread(token_out, 1, token_len - 1, tfp);
+        token_out[tn] = '\0';
+        while (tn > 0 && (token_out[tn-1]=='\n' || token_out[tn-1]=='\r'))
+            token_out[--tn] = '\0';
+        fclose(tfp);
+    }
+
+    unlink(tmp);
+
+    if (!token_out[0]) return ZEP_ERR_ZFS;
+    return ZEP_ERR_OK;
+}
+
+/* Accumulative zstream join for resume push.
+ * If assembled_in is non-empty: joins assembled_in + new_chunk -> assembled_out (zstream join head chunk).
+ * If assembled_in is empty: sanitizes new_chunk (strips incomplete tail) -> assembled_out (zstream join "" chunk).
+ * On success sets *complete to 1 if DRR_END found (join exit 0), 0 otherwise (exit 2).
+ * Returns ZEP_ERR_OK on success, ZEP_ERR_ZFS on failure. */
+err_t zstream_join_accumulative(const char *assembled_in,
+                                const char *new_chunk,
+                                const char *assembled_out,
+                                int *complete) {
+    if (!new_chunk || !assembled_out || !complete) return ZEP_ERR_SYS;
+    *complete = 0;
+
+    unlink(assembled_out);
+
+    char cmd[8192] = {0};
+    if (assembled_in && assembled_in[0]) {
+        snprintf(cmd, sizeof(cmd), "zstream join '%s' '%s' > '%s'",
+            assembled_in, new_chunk, assembled_out);
+    } else {
+        snprintf(cmd, sizeof(cmd), "zstream join '%s' > '%s'",
+            new_chunk, assembled_out);
+    }
+
+    FILE *cp = audit_popen(cmd);
+    if (!cp) {
+        audit_log(AUDIT_EVT_EXEC, "zstream", cmd, -127);
+        return ZEP_ERR_ZFS;
+    }
+    int join_rc = audit_popen_result(cp, NULL, 0);
+    audit_log(AUDIT_EVT_EXEC, "zstream", cmd, join_rc);
+
+    /* join exit 0 = DRR_END present (complete), 2 = no DRR_END (incomplete) */
+    if (join_rc == 0) {
+        *complete = 1;
+        return ZEP_ERR_OK;
+    }
+    if (join_rc == 2) return ZEP_ERR_OK;
     return ZEP_ERR_ZFS;
 }

@@ -412,7 +412,7 @@ echo -e "${CYAN}=== Step 8: Test push pull (phase 3) ===${NC}"
 PULL_TIMEOUT=120
 elapsed=0
 while [[ $elapsed -lt $PULL_TIMEOUT ]]; do
-    if grep -q "push: phase 3 complete" /tmp/zep-server.log 2>/dev/null; then
+    if grep -q "push: db state: 0 push pending" /tmp/zep-server.log 2>/dev/null; then
         echo "  Phase 3 complete after ${elapsed}s"
         break
     fi
@@ -475,16 +475,24 @@ else
     bad "DB: $failed_count master snapshots in failed state"
 fi
 
-# Check storage: .stream files should exist in store/za-master/
+# Check storage: assembled.zfs should exist in store/za-master/
 store_dir="/var/lib/zep-air/store/za-master"
-stream_files=$($SUDO find "$store_dir" -name "*.stream" 2>/dev/null | wc -l)
+assembled_files=$($SUDO find "$store_dir" -name "assembled.zfs" 2>/dev/null | wc -l)
 
-if [[ "$stream_files" -ge 1 ]]; then
-    stream_path=$($SUDO find "$store_dir" -name "*.stream" 2>/dev/null | head -1)
-    stream_size=$($SUDO stat -c%s "$stream_path" 2>/dev/null || echo 0)
-    ok "storage: .stream file found at $stream_path (size=$stream_size)"
+if [[ "$assembled_files" -ge 1 ]]; then
+    assembled_path=$($SUDO find "$store_dir" -name "assembled.zfs" 2>/dev/null | head -1)
+    assembled_size=$($SUDO stat -c%s "$assembled_path" 2>/dev/null || echo 0)
+    ok "storage: assembled.zfs found at $assembled_path (size=$assembled_size)"
 else
-    bad "storage: no .stream files found in $store_dir"
+    bad "storage: no assembled.zfs found in $store_dir"
+fi
+
+# Check: no leftover .zfs chunk files
+zfs_chunks=$($SUDO find "$store_dir" -name "*.zfs" ! -name "assembled.zfs" 2>/dev/null | wc -l)
+if [[ "$zfs_chunks" -eq 0 ]]; then
+    ok "storage: no leftover .zfs chunk files"
+else
+    bad "storage: $zfs_chunks leftover .zfs chunk files found"
 fi
 
 # Check fs table: should have entries for the cluster/fs

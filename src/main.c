@@ -686,18 +686,23 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                 char _pscmd[8192];
                 {
                     char scmd[8192];
-                 if (prt[0]) {
-                          snprintf(scmd, sizeof(scmd),
-                              "set -o pipefail; exec zfs send %s -t '%s'%s%s%s%s%s%s",
-                              cfg->send_options[0] ? cfg->send_options : "",
-                              prt,
-                              cfg->push_buf_cmd[0] ? " | " : "",
-                              cfg->push_buf_cmd[0] ? cfg->push_buf_cmd : "",
-                              cfg->push_zip_cmd[0] ? " | " : "",
-                              cfg->push_zip_cmd[0] ? cfg->push_zip_cmd : "",
-                              cfg->debug_inject_zfs_pipeline_cmd[0] ? " | " : "",
-                              cfg->debug_inject_zfs_pipeline_cmd[0] ? cfg->debug_inject_zfs_pipeline_cmd : "");
-                      } else {
+                if (prt[0]) {
+                            int sc_n = snprintf(scmd, sizeof(scmd),
+                                "set -o pipefail; exec zfs send -t '%s'",
+                                prt);
+                            if (sc_n > 0 && sc_n < (int)sizeof(scmd) && cfg->push_buf_cmd[0]) {
+                                sc_n += snprintf(scmd + sc_n, sizeof(scmd) - (size_t)sc_n,
+                                    " | %s", cfg->push_buf_cmd);
+                            }
+                            if (sc_n > 0 && sc_n < (int)sizeof(scmd) && cfg->push_zip_cmd[0]) {
+                                sc_n += snprintf(scmd + sc_n, sizeof(scmd) - (size_t)sc_n,
+                                    " | %s", cfg->push_zip_cmd);
+                            }
+                            if (sc_n > 0 && sc_n < (int)sizeof(scmd) && cfg->debug_inject_zfs_pipeline_cmd[0]) {
+                                sc_n += snprintf(scmd + sc_n, sizeof(scmd) - (size_t)sc_n,
+                                    " | %s", cfg->debug_inject_zfs_pipeline_cmd);
+                            }
+                        } else {
                           snprintf(scmd, sizeof(scmd),
                               "set -o pipefail; exec zfs send %s '%s'%s%s%s%s%s%s",
                               cfg->send_options[0] ? cfg->send_options : "",
@@ -825,6 +830,11 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                     int send_rc = pclose(send_fp);
                     audit_log("push_send", "zfs", _pscmd, WIFEXITED(send_rc) ? WEXITSTATUS(send_rc) : -128);
                     zep_log_debug("ws-node: push_ws send pipe closed rc=%d\n", send_rc);
+                    if (!server_done) {
+                        unsigned char ex = (unsigned char)(WIFEXITED(send_rc) && WEXITSTATUS(send_rc) == 0 ? 0 : 1);
+                        ws_node_send_frame(conn, WS_NODE_OP_EXIT, &ex, 1);
+                        ws_node_send_frame(conn, WS_NODE_OP_EOF, NULL, 0);
+                    }
                 }
 
                 /* server_done was set by the main loop above */
@@ -1338,44 +1348,53 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                             }
 
                              if (local_snap[0]) {
-                                     char send_cmd[4096];
-                                     int is_resume_push = (prt && prt[0]);
-                                     int n = 0;
-                                     if (is_resume_push) {
-                                         n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
-                                             "zfs send -t '%s'", prt);
-                                     } else if (pbg && pbg[0]) {
-                                         n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
-                                             "zfs send -I '%s' '%s'", pbg, local_snap);
-                                     } else {
-                                         n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
-                                             "zfs send '%s'", local_snap);
-                                     }
-                                     if (cfg->send_options[0] && !is_resume_push) {
-                                         n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
-                                             " %s", cfg->send_options);
-                                     }
-                                     if (cfg->push_buf_cmd[0]) {
-                                         n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
-                                             " | %s", cfg->push_buf_cmd);
-                                     }
-                                     if (cfg->push_zip_cmd[0]) {
-                                         n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
-                                             " | %s", cfg->push_zip_cmd);
-                                     }
-                                     if (cfg->debug_inject_zfs_pipeline_cmd[0]) {
-                                         n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
-                                             " | %s", cfg->debug_inject_zfs_pipeline_cmd);
-                                     }
+                                      char send_cmd[4096];
+                                       int is_resume_push = (prt && prt[0]);
+                                       int n = 0;
+                                       if (is_resume_push) {
+                                            n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
+                                                "zfs send -t '%s'", prt);
+                                       } else if (pbg && pbg[0]) {
+                                           n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
+                                               "zfs send -I '%s' '%s'", pbg, local_snap);
+                                       } else {
+                                           n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
+                                               "zfs send '%s'", local_snap);
+                                       }
+                                       if (cfg->send_options[0] && !is_resume_push) {
+                                           n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
+                                               " %s", cfg->send_options);
+                                       }
+                                       if (cfg->push_buf_cmd[0]) {
+                                           n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
+                                               " | %s", cfg->push_buf_cmd);
+                                       }
+                                       if (cfg->push_zip_cmd[0]) {
+                                           n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
+                                               " | %s", cfg->push_zip_cmd);
+                                       }
+                                       if (cfg->debug_inject_zfs_pipeline_cmd[0]) {
+                                           n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
+                                               " | %s", cfg->debug_inject_zfs_pipeline_cmd);
+                                       }
                                      zep_log("push: %s (resume=%d)\n", send_cmd, is_resume_push);
 
                                      FILE *send_fp = popen(send_cmd, "r");
                                      if (send_fp) {
-                                         char push_req[4096];
-                                         int pn = snprintf(push_req, sizeof(push_req),
-                                             "{\"action\":\"push\",\"guid\":\"%s\",\"base_guid\":\"%s\","
-                                             "\"snapshot\":\"%s\",\"label\":\"%s\",\"cluster_fs\":\"%s\"}",
-                                             pguid, pbg ? pbg : "", local_snap, plbl, pcfs);
+                                          char push_req[4096];
+                                          int pn;
+                                          if (is_resume_push) {
+                                              pn = snprintf(push_req, sizeof(push_req),
+                                                  "{\"action\":\"push\",\"guid\":\"%s\",\"base_guid\":\"%s\","
+                                                  "\"snapshot\":\"%s\",\"label\":\"%s\",\"cluster_fs\":\"%s\","
+                                                  "\"resume_token\":\"%s\"}",
+                                                  pguid, pbg ? pbg : "", local_snap, plbl, pcfs, prt);
+                                          } else {
+                                              pn = snprintf(push_req, sizeof(push_req),
+                                                  "{\"action\":\"push\",\"guid\":\"%s\",\"base_guid\":\"%s\","
+                                                  "\"snapshot\":\"%s\",\"label\":\"%s\",\"cluster_fs\":\"%s\"}",
+                                                  pguid, pbg ? pbg : "", local_snap, plbl, pcfs);
+                                          }
                                          if (ws_node_send_frame(conn, WS_NODE_OP_TEXT,
                                              (unsigned char *)push_req, (size_t)pn) < 0) {
                                              zep_log("push: send request failed\n");
@@ -1427,8 +1446,11 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                                               pipe_eof = 0;
                                                               continue;
                                                            } else {
-                                                               zep_log("push: pipeline EOF, waiting for resume or server close\n");
-                                                           }
+                                                                unsigned char ex = (unsigned char)(WIFEXITED(ck) && WEXITSTATUS(ck) == 0 ? 0 : 1);
+                                                                zep_log("push: pipeline EOF, sending EXIT rc=%d\n", (int)ex);
+                                                                ws_node_send_frame(conn, WS_NODE_OP_EXIT, &ex, 1);
+                                                                ws_node_send_frame(conn, WS_NODE_OP_EOF, NULL, 0);
+                                                            }
                                                       }
                                                   }
                                                   if (ws_fd >= 0 && FD_ISSET(ws_fd, &rfds)) {
