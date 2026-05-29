@@ -398,6 +398,7 @@ static void *ws_node_pipe_thread(void *arg) {
                 FILE *fp = popen(cmd, "r");
                 if (fp) {
                     char line[ZEP_MAX_SNAPSHOT_NAME];
+                    char prev_guid[ZEP_MAX_GUID_LEN] = {0};
                     while (fgets(line, sizeof(line), fp)) {
                         size_t sl = strlen(line);
                         while (sl > 0 && (line[sl-1] == '\n' || line[sl-1] == '\r'))
@@ -445,7 +446,9 @@ static void *ws_node_pipe_thread(void *arg) {
                             cJSON_AddStringToObject(sn, "guid", guid);
                             cJSON_AddStringToObject(sn, "snapshot", line);
                             cJSON_AddStringToObject(sn, "label", label);
+                            cJSON_AddStringToObject(sn, "base_guid", prev_guid);
                             cJSON_AddItemToArray(snaps, sn);
+                            snprintf(prev_guid, sizeof(prev_guid), "%s", guid);
                         }
                     }
                     int rc = pclose(fp);
@@ -1299,6 +1302,7 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                         cJSON *cfs_j = cJSON_GetObjectItem(task, "cluster_fs");
                         cJSON *bg_j = cJSON_GetObjectItem(task, "base_guid");
                         cJSON *rt_j = cJSON_GetObjectItem(task, "resume_token");
+                        cJSON *bs_j = cJSON_GetObjectItem(task, "base_snap");
                         if (guid_j && cJSON_IsString(guid_j) &&
                             snap_j && cJSON_IsString(snap_j) &&
                             cfs_j && cJSON_IsString(cfs_j)) {
@@ -1308,6 +1312,7 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                             const char *pcfs = cfs_j->valuestring;
                             const char *pbg = (bg_j && cJSON_IsString(bg_j)) ? bg_j->valuestring : "";
                             const char *prt = (rt_j && cJSON_IsString(rt_j)) ? rt_j->valuestring : "";
+                            const char *pbs = (bs_j && cJSON_IsString(bs_j)) ? bs_j->valuestring : "";
 
                             /* Resolve local snapshot name from mapping */
                             const char *mp = cfg->mapping;
@@ -1354,9 +1359,9 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                        if (is_resume_push) {
                                             n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
                                                 "zfs send -t '%s'", prt);
-                                       } else if (pbg && pbg[0]) {
+                                       } else if (pbs && pbs[0]) {
                                            n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
-                                               "zfs send -I '%s' '%s'", pbg, local_snap);
+                                               "zfs send -i '%s' '%s'", pbs, local_snap);
                                        } else {
                                            n += snprintf(send_cmd + n, sizeof(send_cmd) - (size_t)n,
                                                "zfs send '%s'", local_snap);

@@ -774,9 +774,9 @@ err_t db_fs_cascade_update_to_id(sqlite3 *db, const char *cluster,
                                  int target_id) {
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db,
-            "UPDATE snapshots SET status = 'verified' "
+            "UPDATE snapshots SET status = 'verified', push_status = 'verified' "
             "WHERE cluster = ?1 AND direction = 'push' AND rowid <= ?2 "
-            "  AND push_status = 'pending'",
+            "  AND (push_status = 'pending' OR push_status = 'archived')",
             -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;
     sqlite3_bind_text(stmt, 1, cluster, -1, SQLITE_STATIC);
