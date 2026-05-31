@@ -1184,11 +1184,276 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                 ws_node_send_frame(conn, WS_NODE_OP_EXIT, &                                exit_byte, 1);
                             }
                             continue;
-                        }
-                    }
-                    /* Handle create_snap: create ZFS snapshot, report GUID back */
-                    if (action && cJSON_IsString(action) &&
-                        strcmp(action->valuestring, "create_snap") == 0) {
+                         }
+                     }
+                     /* Handle pull: server sends assembled.zfs, client receives via zfs recv */
+                     if (action && cJSON_IsString(action) &&
+                         strcmp(action->valuestring, "pull") == 0) {
+                         cJSON *guid_j = cJSON_GetObjectItem(task, "guid");
+                         cJSON *snap_j = cJSON_GetObjectItem(task, "snapshot");
+                         cJSON *cfs_j = cJSON_GetObjectItem(task, "cluster_fs");
+                         if (guid_j && cJSON_IsString(guid_j) && snap_j && cJSON_IsString(snap_j)) {
+                             zep_log("ws-node: RX pull guid=%s snap=%s\n",
+                                     guid_j->valuestring, snap_j->valuestring);
+
+                             /* Resolve cluster_fs -> local_fs from mapping */
+                             const char *cfs = cfs_j && cJSON_IsString(cfs_j) ? cfs_j->valuestring : "";
+                             char local_fs[ZEP_MAX_SNAPSHOT_NAME] = {0};
+
+                             if (cfs[0]) {
+                                 const char *mp2 = cfg->mapping;
+                                 while (mp2 && *mp2) {
+                                     while (*mp2==' '||*mp2=='\t') mp2++;
+                                     if (!*mp2) break;
+                                     const char *colon = strchr(mp2, ':');
+                                     if (!colon) break;
+                                     size_t cflen = (size_t)(colon - mp2);
+                                     char cfs_buf[512];
+                                     if (cflen >= sizeof(cfs_buf)) cflen = sizeof(cfs_buf) - 1;
+                                     memcpy(cfs_buf, mp2, cflen);
+                                     cfs_buf[cflen] = '\0';
+                                     if (strcmp(cfs_buf, cfs) == 0) {
+                                         const char *start = colon + 1;
+                                         while (*start==' ') start++;
+                                         const char *end = strchr(start, ',');
+                                         if (!end) end = start + strlen(start);
+                                         const char *paren = strchr(start, '(');
+                                         size_t n = paren ? (size_t)(paren - start) : (size_t)(end - start);
+                                         if (n >= sizeof(local_fs)) n = sizeof(local_fs) - 1;
+                                         memcpy(local_fs, start, n);
+                                         local_fs[n] = '\0';
+                                         break;
+                                     }
+                                     const char *comma = strchr(colon, ',');
+                                     mp2 = comma ? comma + 1 : colon + strlen(colon);
+                                 }
+                             }
+
+                             if (!local_fs[0]) {
+                                 zep_log("ws-node: pull: mapping lookup failed for cfs=%s\n", cfs);
+                                 cJSON_Delete(task);
+                                 continue;
+                             }
+
+                               char recv_cmd[2048];
+                              snprintf(recv_cmd, sizeof(recv_cmd),
+                                  "zfs recv -F -s '%s' 2>/tmp/zep-recv-err.log", local_fs);
+
+                              FILE *recv_fp = popen(recv_cmd, "w");
+                              zep_log("ws-node: pull recv_cmd=%s fp=%p\n", recv_cmd, (void*)recv_fp);
+
+                              int pull_exit_code = -1;
+
+                              /* Receive BIN frames from server */
+                              for (;;) {
+                                  ssize_t rn = ws_node_recv_frame(conn, out,
+                                      WS_NODE_FRAME_MAX, &buf[0]);
+                                  if (rn < 0) break;
+                                  unsigned char op = buf[0] & 0x0F;
+                                  if (op == WS_NODE_OP_CLOSE) break;
+                                  if (op == WS_NODE_OP_PING) {
+                                      ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)rn);
+                                      continue;
+                                  }
+                                  if (op == WS_NODE_OP_PONG) continue;
+                                  if (op == WS_NODE_OP_BIN && rn > 0 && recv_fp) {
+                                      if (fwrite(out, 1, (size_t)rn, recv_fp) != (size_t)rn) {
+                                          zep_log("ws-node: pull recv fwrite failed\n");
+                                          break;
+                                      }
+                                      continue;
+                                  }
+                                  if (op == WS_NODE_OP_EXIT && rn == 1) {
+                                      pull_exit_code = (int)out[0];
+                                  }
+                                  if (op == WS_NODE_OP_EOF) break;
+                              }
+
+                              int recv_rc = 0;
+                              if (recv_fp) {
+                                  recv_rc = pclose(recv_fp);
+                                  pull_exit_code = WIFEXITED(recv_rc) ? WEXITSTATUS(recv_rc) : 1;
+                                  zep_log("ws-node: pull recv pipe closed rc=%d\n", recv_rc);
+                              }
+
+                              if (pull_exit_code != 0) {
+                                  FILE *ef = fopen("/tmp/zep-recv-err.log", "r");
+                                  if (ef) {
+                                      char ebuf[1024] = {0};
+                                      size_t nr = fread(ebuf, 1, sizeof(ebuf) - 1, ef);
+                                      fclose(ef);
+                                      if (nr > 0) {
+                                          while (nr > 0 && (ebuf[nr-1]=='\n'||ebuf[nr-1]=='\r'))
+                                              ebuf[--nr] = '\0';
+                                          zep_log("ws-node: pull recv stderr: %s\n", ebuf);
+                                      }
+                                  }
+                              }
+
+                              /* Send ACK back to server */
+                              char ack_json[4096] = {0};
+                              int ack_n = 0;
+                              char resume_token_buf[512] = {0};
+                              char stderr_buf[512] = {0};
+                              if (pull_exit_code != 0 && local_fs[0]) {
+                                  /* Try to get resume token */
+                                  char tok_cmd[2048];
+                                  snprintf(tok_cmd, sizeof(tok_cmd),
+                                      "zfs get -Hp -o value receive_resume_token '%s' 2>/dev/null",
+                                      local_fs);
+                                  FILE *tp = popen(tok_cmd, "r");
+                                  if (tp) {
+                                      if (fgets(resume_token_buf, sizeof(resume_token_buf), tp)) {
+                                          size_t tl = strlen(resume_token_buf);
+                                          while (tl > 0 && (resume_token_buf[tl-1]=='\n'||resume_token_buf[tl-1]=='\r'))
+                                              resume_token_buf[--tl] = '\0';
+                                          if (resume_token_buf[0]) {
+                                              zep_log("ws-node: pull got resume_token=%.40s...\n", resume_token_buf);
+                                          }
+                                      }
+                                      pclose(tp);
+                                  }
+                                  /* Read stderr from zfs recv */
+                                  FILE *ef = fopen("/tmp/zep-recv-err.log", "r");
+                                  if (ef) {
+                                      (void)!fread(stderr_buf, 1, sizeof(stderr_buf) - 1, ef);
+                                      fclose(ef);
+                                      size_t sl = strlen(stderr_buf);
+                                      while (sl > 0 && (stderr_buf[sl-1]=='\n'||stderr_buf[sl-1]=='\r'))
+                                          stderr_buf[--sl] = '\0';
+                                  }
+                              }
+
+                              if (resume_token_buf[0]) {
+                                  ack_n = snprintf(ack_json, sizeof(ack_json),
+                                      "{\"action\":\"pull_ack\",\"guid\":\"%s\",\"exit_code\":%d,\"resume_token\":\"%s\"}",
+                                      guid_j->valuestring, pull_exit_code, resume_token_buf);
+                              } else if (stderr_buf[0]) {
+                                  ack_n = snprintf(ack_json, sizeof(ack_json),
+                                      "{\"action\":\"pull_ack\",\"guid\":\"%s\",\"exit_code\":%d,\"stderr\":\"%s\"}",
+                                      guid_j->valuestring, pull_exit_code, stderr_buf);
+                              } else {
+                                  ack_n = snprintf(ack_json, sizeof(ack_json),
+                                      "{\"action\":\"pull_ack\",\"guid\":\"%s\",\"exit_code\":%d}",
+                                      guid_j->valuestring, pull_exit_code);
+                              }
+                             if (ack_n > 0) {
+                                 ws_node_send_frame(conn, WS_NODE_OP_TEXT,
+                                     (unsigned char *)ack_json, (size_t)ack_n);
+                                 zep_log("ws-node: pull ack sent: %s\n", ack_json);
+                             }
+                         }
+                         cJSON_Delete(task);
+                         continue;
+                     }
+                     /* Handle pull_resume: server sends resumed data */
+                     if (action && cJSON_IsString(action) &&
+                         strcmp(action->valuestring, "pull_resume") == 0) {
+                         cJSON *guid_j = cJSON_GetObjectItem(task, "guid");
+                         if (guid_j && cJSON_IsString(guid_j)) {
+                             zep_log("ws-node: RX pull_resume guid=%s\n", guid_j->valuestring);
+
+                             /* Resolve local_fs from mapping */
+                              char local_fs[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                             char resolved_fs[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                             const char *mp2 = cfg->mapping;
+                             while (mp2 && *mp2) {
+                                 while (*mp2==' '||*mp2=='\t') mp2++;
+                                 if (!*mp2) break;
+                                 const char *colon = strchr(mp2, ':');
+                                 if (!colon) break;
+                                 size_t cflen = (size_t)(colon - mp2);
+                                 char cfs_buf[512];
+                                 if (cflen >= sizeof(cfs_buf)) cflen = sizeof(cfs_buf) - 1;
+                                 memcpy(cfs_buf, mp2, cflen);
+                                 cfs_buf[cflen] = '\0';
+                                 const char *start = colon + 1;
+                                 while (*start==' ') start++;
+                                 const char *end = strchr(start, ',');
+                                 if (!end) end = start + strlen(start);
+                                 const char *paren = strchr(start, '(');
+                                 size_t n = paren ? (size_t)(paren - start) : (size_t)(end - start);
+                                 if (n >= sizeof(resolved_fs)) n = sizeof(resolved_fs) - 1;
+                                 memcpy(resolved_fs, start, n);
+                                 resolved_fs[n] = '\0';
+                                 if (cfs_buf[0]) {
+                                     snprintf(local_fs, sizeof(local_fs), "%s", resolved_fs);
+                                     break;
+                                 }
+                                 const char *comma = strchr(colon, ',');
+                                 mp2 = comma ? comma + 1 : colon + strlen(colon);
+                             }
+
+                             char recv_cmd[2048];
+                              snprintf(recv_cmd, sizeof(recv_cmd),
+                                  "zfs recv -F -s '%s' 2>/tmp/zep-recv-err.log", local_fs);
+
+                             FILE *recv_fp = popen(recv_cmd, "w");
+                               zep_log("ws-node: pull_resume recv_cmd=%s fp=%p\n", recv_cmd, (void*)recv_fp);
+
+                               int pull_exit_code = -1;
+
+                               for (;;) {
+                                   ssize_t rn = ws_node_recv_frame(conn, out,
+                                       WS_NODE_FRAME_MAX, &buf[0]);
+                                   if (rn < 0) break;
+                                   unsigned char op = buf[0] & 0x0F;
+                                   if (op == WS_NODE_OP_CLOSE) break;
+                                  if (op == WS_NODE_OP_PING) {
+                                      ws_node_send_frame(conn, WS_NODE_OP_PONG, out, (size_t)rn);
+                                      continue;
+                                  }
+                                  if (op == WS_NODE_OP_PONG) continue;
+                                  if (op == WS_NODE_OP_BIN && rn > 0 && recv_fp) {
+                                       if (fwrite(out, 1, (size_t)rn, recv_fp) != (size_t)rn) {
+                                           zep_log("ws-node: pull_resume recv fwrite failed\n");
+                                           break;
+                                       }
+                                      continue;
+                                  }
+                                  if (op == WS_NODE_OP_EXIT && rn == 1) {
+                                      pull_exit_code = (int)out[0];
+                                  }
+                                  if (op == WS_NODE_OP_EOF) break;
+                              }
+
+                              int recv_rc = 0;
+                              if (recv_fp) {
+                                  recv_rc = pclose(recv_fp);
+                                  pull_exit_code = WIFEXITED(recv_rc) ? WEXITSTATUS(recv_rc) : 1;
+                                  zep_log("ws-node: pull_resume recv pipe closed rc=%d\n", recv_rc);
+                              }
+
+                              if (pull_exit_code != 0) {
+                                  FILE *ef = fopen("/tmp/zep-recv-err.log", "r");
+                                  if (ef) {
+                                      char ebuf[1024] = {0};
+                                      size_t nr = fread(ebuf, 1, sizeof(ebuf) - 1, ef);
+                                      fclose(ef);
+                                      if (nr > 0) {
+                                          while (nr > 0 && (ebuf[nr-1]=='\n'||ebuf[nr-1]=='\r'))
+                                              ebuf[--nr] = '\0';
+                                          zep_log("ws-node: pull_resume recv stderr: %s\n", ebuf);
+                                      }
+                                  }
+                              }
+
+                             char ack_json[4096];
+                             int ack_n = snprintf(ack_json, sizeof(ack_json),
+                                 "{\"action\":\"pull_ack\",\"guid\":\"%s\",\"exit_code\":%d}",
+                                 guid_j->valuestring, pull_exit_code);
+                             if (ack_n > 0) {
+                                 ws_node_send_frame(conn, WS_NODE_OP_TEXT,
+                                     (unsigned char *)ack_json, (size_t)ack_n);
+                                 zep_log("ws-node: pull_resume ack sent\n");
+                             }
+                         }
+                         cJSON_Delete(task);
+                         continue;
+                     }
+                     /* Handle create_snap: create ZFS snapshot, report GUID back */
+                     if (action && cJSON_IsString(action) &&
+                         strcmp(action->valuestring, "create_snap") == 0) {
                         zep_log("ws-node: RX create_snap from server\n");
                         cJSON *cfs_j = cJSON_GetObjectItem(task, "cluster_fs");
                         cJSON *snap_j = cJSON_GetObjectItem(task, "snapshot");

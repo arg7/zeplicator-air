@@ -42,8 +42,9 @@ static char g_admin_cert_path[ZEP_MAX_PATH] = "";
 static char g_key_password[128] = "";
 static int  g_setup_mode = 0;
 static int  g_no_tls = 0;
-static int  g_resume = 0;
-static struct MHD_Daemon *g_daemon = NULL;
+  static int  g_resume = 0;
+    static char g_debug_inject_pull_cmd[128] = "";
+    static struct MHD_Daemon *g_daemon = NULL;
 static sqlite3 *g_db = NULL;
 
 
@@ -742,6 +743,197 @@ scheduler_run(struct node_ws *nw, const char *cluster_buf,
     cJSON_Delete(cj);
 }
 
+/* ── Pull trigger: find next snapshot to send to client ── */
+static void node_ws_pull_trigger(struct node_ws *nw, const char *cluster_buf,
+                                  const char *role_buf) {
+    if (strcmp(role_buf, "client") != 0) return;
+    if (!nw->cn[0] || !cluster_buf[0]) return;
+
+    /* Find the master node for this cluster */
+    char master_cn[64] = {0};
+    {
+        sqlite3_stmt *ms = NULL;
+        if (sqlite3_prepare_v2(g_db,
+            "SELECT cn FROM auth WHERE cluster = ?1 AND role = 'master' LIMIT 1",
+            -1, &ms, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(ms, 1, cluster_buf, -1, SQLITE_STATIC);
+            if (sqlite3_step(ms) == SQLITE_ROW) {
+                const char *m = (const char *)sqlite3_column_text(ms, 0);
+                if (m) snprintf(master_cn, sizeof(master_cn), "%s", m);
+            }
+            sqlite3_finalize(ms);
+        }
+    }
+    if (!master_cn[0]) {
+        zep_log_debug("pull_trigger: no master for cluster %s\n", cluster_buf);
+        return;
+    }
+
+    /* Find common GUID between master and client (only fully-pulled client records count) */
+    sqlite3_stmt *common_st = NULL;
+    if (sqlite3_prepare_v2(g_db,
+        "SELECT s1.guid, s1.base_guid, s1.snapshot, s1.storage_base "
+        "FROM snapshots s1 "
+        "INNER JOIN snapshots s2 ON s1.guid = s2.guid "
+        "WHERE s1.node = ?1 AND s2.node = ?2 "
+        "  AND s1.direction = 'push' AND s2.direction = 'pull' "
+        "  AND s2.pull_status = 'pulled' "
+        "ORDER BY s1.id DESC LIMIT 1",
+        -1, &common_st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(common_st, 1, master_cn, -1, SQLITE_STATIC);
+        sqlite3_bind_text(common_st, 2, nw->cn, -1, SQLITE_STATIC);
+    }
+
+    char common_guid[ZEP_MAX_GUID_LEN] = {0};
+    char common_base[ZEP_MAX_GUID_LEN] = {0};
+    char common_snap[ZEP_MAX_SNAPSHOT_NAME] = {0};
+    char common_storage[ZEP_MAX_PATH * 2 + 256] = {0};
+
+    if (common_st) {
+        if (sqlite3_step(common_st) == SQLITE_ROW) {
+            const char *g = (const char *)sqlite3_column_text(common_st, 0);
+            const char *b = (const char *)sqlite3_column_text(common_st, 1);
+            const char *s = (const char *)sqlite3_column_text(common_st, 2);
+            const char *sb = (const char *)sqlite3_column_text(common_st, 3);
+            if (g) snprintf(common_guid, sizeof(common_guid), "%s", g);
+            if (b) snprintf(common_base, sizeof(common_base), "%s", b);
+            if (s) snprintf(common_snap, sizeof(common_snap), "%s", s);
+            if (sb) snprintf(common_storage, sizeof(common_storage), "%s", sb);
+        }
+        sqlite3_finalize(common_st);
+    }
+
+    /* Determine what to send: find latest verified master snap not yet pulled by client */
+    char target_guid[ZEP_MAX_GUID_LEN] = {0};
+    char target_base[ZEP_MAX_GUID_LEN] = {0};
+    char target_snap[ZEP_MAX_SNAPSHOT_NAME] = {0};
+    char target_storage[ZEP_MAX_PATH * 2 + 256] = {0};
+    char target_cfs[512] = {0};
+
+    /* Find any verified master snap with storage_base, not yet pulled by this client, excluding common GUID */
+    sqlite3_stmt *next_st = NULL;
+    if (sqlite3_prepare_v2(g_db,
+        "SELECT guid, base_guid, snapshot, storage_base, cluster_fs "
+        "FROM snapshots "
+        "WHERE node = ?1 AND cluster = ?2 AND push_status = 'verified' AND direction = 'push' "
+        "  AND storage_base IS NOT NULL AND storage_base != '' "
+        "  AND guid NOT IN (SELECT guid FROM snapshots WHERE node=?3 AND direction='pull' AND pull_status='pulled') "
+        "  AND (?4 = '' OR guid != ?4)"
+        "ORDER BY id ASC LIMIT 1",
+        -1, &next_st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(next_st, 1, master_cn, -1, SQLITE_STATIC);
+        sqlite3_bind_text(next_st, 2, cluster_buf, -1, SQLITE_STATIC);
+        sqlite3_bind_text(next_st, 3, nw->cn, -1, SQLITE_STATIC);
+        sqlite3_bind_text(next_st, 4, common_guid, -1, SQLITE_STATIC);
+        if (sqlite3_step(next_st) == SQLITE_ROW) {
+            const char *g = (const char *)sqlite3_column_text(next_st, 0);
+            const char *b = (const char *)sqlite3_column_text(next_st, 1);
+            const char *s = (const char *)sqlite3_column_text(next_st, 2);
+            const char *sb = (const char *)sqlite3_column_text(next_st, 3);
+            const char *cf = (const char *)sqlite3_column_text(next_st, 4);
+            if (g) snprintf(target_guid, sizeof(target_guid), "%s", g);
+            if (b) snprintf(target_base, sizeof(target_base), "%s", b);
+            if (s) snprintf(target_snap, sizeof(target_snap), "%s", s);
+            if (sb) snprintf(target_storage, sizeof(target_storage), "%s", sb);
+            if (cf) snprintf(target_cfs, sizeof(target_cfs), "%s", cf);
+        }
+        sqlite3_finalize(next_st);
+    }
+
+    if (!target_guid[0]) {
+        zep_log_debug("pull_trigger: no pending pull for client %s\n", nw->cn);
+        return;
+    }
+
+    /* Check if target already pulled for this client */
+    sqlite3_stmt *chk_st = NULL;
+    if (sqlite3_prepare_v2(g_db,
+        "SELECT pull_status FROM snapshots "
+        "WHERE guid = ?1 AND node = ?2 AND direction = 'pull' LIMIT 1",
+        -1, &chk_st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(chk_st, 1, target_guid, -1, SQLITE_STATIC);
+        sqlite3_bind_text(chk_st, 2, nw->cn, -1, SQLITE_STATIC);
+        if (sqlite3_step(chk_st) == SQLITE_ROW) {
+            const char *ps = (const char *)sqlite3_column_text(chk_st, 0);
+            if (ps && (strcmp(ps, "pulled") == 0 || strcmp(ps, "pulling") == 0)) {
+                zep_log_debug("pull_trigger: guid=%s already %s for %s, skipping\n",
+                              target_guid, ps, nw->cn);
+                sqlite3_finalize(chk_st);
+                return;
+            }
+        }
+        sqlite3_finalize(chk_st);
+    }
+
+   /* Send pull command and stream assembled.zfs */
+    char pull_json[4096];
+    int n = snprintf(pull_json, sizeof(pull_json),
+        "{\"action\":\"pull\",\"guid\":\"%s\",\"base_guid\":\"%s\","
+        "\"snapshot\":\"%s\",\"cluster_fs\":\"%s\"}",
+        target_guid, target_base, target_snap, target_cfs);
+    if (n > 0 && n < (int)sizeof(pull_json)) {
+        zep_log("pull_trigger: sending pull for guid=%s snap=%s to client %s\n",
+                target_guid, target_snap, nw->cn);
+        ws_send_frame_gtls(nw, WS_OP_TEXT, (unsigned char *)pull_json, (size_t)n);
+
+        /* Look up assembled.zfs and stream it */
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(g_db,
+            "SELECT storage_base FROM snapshots WHERE guid=?1 AND direction='push' LIMIT 1",
+            -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, target_guid, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                const char *storage_base = (const char *)sqlite3_column_text(st, 0);
+                if (!storage_base || !storage_base[0]) {
+                    zep_log_debug("pull_trigger: no storage_base for guid=%s, skipping stream\n", target_guid);
+                } else {
+                    char assembled_path[ZEP_MAX_PATH * 2 + 256];
+                    const char *prefix = "file://";
+                    const char *base_path = storage_base;
+                    if (strncmp(base_path, prefix, strlen(prefix)) == 0)
+                        base_path += strlen(prefix);
+                    snprintf(assembled_path, sizeof(assembled_path),
+                             "%sassembled.zfs", base_path);
+
+                    if (access(assembled_path, F_OK) == 0) {
+                        char pull_cmd[4096];
+                        int cn = snprintf(pull_cmd, sizeof(pull_cmd),
+                            "cat '%s'", assembled_path);
+                        if (g_debug_inject_pull_cmd[0]) {
+                            cn += snprintf(pull_cmd + cn, sizeof(pull_cmd) - (size_t)cn,
+                                " | %s", g_debug_inject_pull_cmd);
+                        }
+                        FILE *fp = popen(pull_cmd, "r");
+                        if (fp) {
+                            unsigned char rbuf[65536];
+                            size_t nr;
+                            while ((nr = fread(rbuf, 1, sizeof(rbuf), fp)) > 0) {
+                                ws_send_frame_gtls(nw, WS_OP_BIN, rbuf, nr);
+                            }
+                            int rc = pclose(fp);
+                            unsigned char ex = WIFEXITED(rc) ? (unsigned char)WEXITSTATUS(rc) : 1;
+                            ws_send_frame_gtls(nw, WS_OP_EXIT, &ex, 1);
+                        } else {
+                            zep_log("pull_trigger: popen(%s) failed\n", pull_cmd);
+                            unsigned char ex = 1;
+                            ws_send_frame_gtls(nw, WS_OP_EXIT, &ex, 1);
+                        }
+                        ws_send_frame_gtls(nw, WS_OP_EOF, NULL, 0);
+                    } else {
+                        zep_log("pull_trigger: assembled.zfs not found\n");
+                        unsigned char ex = 1;
+                        ws_send_frame_gtls(nw, WS_OP_EXIT, &ex, 1);
+                        ws_send_frame_gtls(nw, WS_OP_EOF, NULL, 0);
+                    }
+                }
+            } else {
+                zep_log_debug("pull_trigger: no storage_base row for guid=%s\n", target_guid);
+            }
+            sqlite3_finalize(st);
+        }
+    }
+}
+
 static void *node_ws_thread(void *arg) {
     struct node_ws_thread_ctx *ctx = (struct node_ws_thread_ctx *)arg;
     struct node_ws *nw = ctx->nw;
@@ -836,6 +1028,14 @@ static void *node_ws_thread(void *arg) {
         if (strcmp(role_buf, "master") == 0 && cluster_buf[0] && mapping_buf[0]) {
             if (now - last_scheduler >= 30) {
                 scheduler_run(nw, cluster_buf, pending_snaps, pending_labels, &pending_tail);
+                last_scheduler = now;
+            }
+        }
+
+        /* Periodic pull check for clients */
+        if (strcmp(role_buf, "client") == 0 && cluster_buf[0] && nw->cn[0]) {
+            if (now - last_scheduler >= 30) {
+                node_ws_pull_trigger(nw, cluster_buf, role_buf);
                 last_scheduler = now;
             }
         }
@@ -1034,9 +1234,9 @@ static void *node_ws_thread(void *arg) {
                                            sqlite3_bind_text(ck, 2, g->valuestring, -1, SQLITE_STATIC);
                                            if (sqlite3_step(ck) != SQLITE_ROW) {
                                                 db_snapshot_insert(g_db, cluster_buf, nw->cn,
-                                                    g->valuestring, base_guid, snapname->valuestring,
-                                                    lbl->valuestring, cluster_fs, 0, 0,
-                                                    "push", "", "pending", "discovered");
+                                                     g->valuestring, base_guid, snapname->valuestring,
+                                                     lbl->valuestring, cluster_fs, 0, 0,
+                                                     "push", "", "pending", "discovered", "");
                                                {
                                                    sqlite3_stmt *pa = NULL;
                                                    if (sqlite3_prepare_v2(g_db,
@@ -1161,9 +1361,9 @@ static void *node_ws_thread(void *arg) {
                                             sqlite3_bind_text(ck, 2, g->valuestring, -1, SQLITE_STATIC);
                                             if (sqlite3_step(ck) != SQLITE_ROW) {
                                                 db_snapshot_insert(g_db, cluster_buf, nw->cn,
-                                                    g->valuestring, base_guid, snapname->valuestring,
-                                                    lbl->valuestring, cluster_fs, 0, 0,
-                                                    "pull", "", "pending", "discovered");
+                                                     g->valuestring, base_guid, snapname->valuestring,
+                                                     lbl->valuestring, cluster_fs, 0, 0,
+                                                     "pull", "", "pending", "discovered", "");
                                                 {
                                                     sqlite3_stmt *pa = NULL;
                                                     if (sqlite3_prepare_v2(g_db,
@@ -1220,120 +1420,191 @@ static void *node_ws_thread(void *arg) {
                                     zep_log("discovery: node=%s role=%s — skipping\n",
                                         nw->cn, role_buf[0] ? role_buf : "(none)");
                                 }
-                               discovery_done = 1;
+                              discovery_done = 1;
                                zep_log("discovery: phase 1 complete\n");
+                               /* After discovery, check for pending pulls for client nodes */
+                               if (strcmp(role_buf, "client") == 0) {
+                                   node_ws_pull_trigger(nw, cluster_buf, role_buf);
+                               }
                            }
-                          cJSON_Delete(msg);
-                          continue;
+                           cJSON_Delete(msg);
+                           continue;
                       }
                       if (action && cJSON_IsString(action) &&
-                          strcmp(action->valuestring, "pull") == 0) {
-                         cJSON *guid_j = cJSON_GetObjectItem(msg, "guid");
-                         cJSON *lguid_j = cJSON_GetObjectItem(msg, "local_guid");
-                         if (guid_j && cJSON_IsString(guid_j)) {
-                             sqlite3_stmt *st = NULL;
-                             sqlite3_prepare_v2(g_db,
-                                 "SELECT guid, base_guid, snapshot FROM snapshots "
-                                 "WHERE guid = ?1 AND direction = 'push' LIMIT 1",
-                                 -1, &st, NULL);
-                             if (st) {
-                                 sqlite3_bind_text(st, 1, guid_j->valuestring,
-                                                   -1, SQLITE_STATIC);
-                             if (sqlite3_step(st) == SQLITE_ROW) {
-                                      const char *remote_base =
-                                          (const char *)sqlite3_column_text(st, 1);
-                                      const char *snap =
-                                         (const char *)sqlite3_column_text(st, 2);
-                                     if (snap && snap[0]) {
-                                         const char *local_guid =
-                                             lguid_j && cJSON_IsString(lguid_j)
-                                             ? lguid_j->valuestring : "";
-                                         char pipe_cmd[4096];
-                                         /* If remote_base is empty/zero, full send.
-                                          * Else if local_guid matches remote_base,
-                                          * incremental. */
-                                         int is_full = (!remote_base[0] ||
-                                             strcmp(remote_base, "0") == 0);
-                                         int is_inc = !is_full && local_guid[0] &&
-                                             strcmp(local_guid, remote_base) == 0;
-                                         if (is_full) {
-                                             snprintf(pipe_cmd, sizeof(pipe_cmd),
-                                                 "zfs send '%s'", snap);
-                                         } else if (is_inc) {
-                                             /* Need to resolve from_snap from its guid.
-                                              * Query the snapshots table for the base guid. */
-                                             sqlite3_stmt *bst = NULL;
-                                             sqlite3_prepare_v2(g_db,
-                                                 "SELECT snapshot FROM snapshots "
-                                                 "WHERE guid = ?1 AND direction = 'push' LIMIT 1",
-                                                 -1, &bst, NULL);
-                                             if (bst) {
-                                                 sqlite3_bind_text(bst, 1, remote_base, -1, SQLITE_STATIC);
-                                                 if (sqlite3_step(bst) == SQLITE_ROW) {
-                                                     const char *from_snap =
-                                                         (const char *)sqlite3_column_text(bst, 0);
-                                                     if (from_snap && from_snap[0]) {
-                                                         snprintf(pipe_cmd, sizeof(pipe_cmd),
-                                                             "zfs send -i '%s' '%s'",
-                                                             from_snap, snap);
-                                                     } else {
-                                                         snprintf(pipe_cmd, sizeof(pipe_cmd),
-                                                             "echo 'base snap not found' >&2; exit 1");
-                                                     }
-                                                 } else {
-                                                     snprintf(pipe_cmd, sizeof(pipe_cmd),
-                                                         "echo 'base snap not found' >&2; exit 1");
-                                                 }
-                                                 sqlite3_finalize(bst);
-                                             } else {
-                                                 snprintf(pipe_cmd, sizeof(pipe_cmd),
-                                                     "echo 'base snap not found' >&2; exit 1");
-                                             }
-                                         } else {
-                                              /* Client guid doesn't match any base in chain
-                                               * (old pulls, different clients). Fall back
-                                               * to full send. */
-                                              zep_log_debug("ws: pull snap=%s base_mismatch full_send\n", snap);
-                                              snprintf(pipe_cmd, sizeof(pipe_cmd),
-                                                  "zfs send '%s'", snap);
+                           strcmp(action->valuestring, "pull") == 0) {
+                          cJSON *guid_j = cJSON_GetObjectItem(msg, "guid");
+                          if (guid_j && cJSON_IsString(guid_j)) {
+                              sqlite3_stmt *st = NULL;
+                              sqlite3_prepare_v2(g_db,
+                                  "SELECT guid, base_guid, snapshot, storage_base, push_status "
+                                  "FROM snapshots "
+                                  "WHERE guid = ?1 AND direction = 'push' LIMIT 1",
+                                  -1, &st, NULL);
+                          if (st) {
+                                   sqlite3_bind_text(st, 1, guid_j->valuestring,
+                                                     -1, SQLITE_STATIC);
+                               if (sqlite3_step(st) == SQLITE_ROW) {
+                                        const char *snap =
+                                           (const char *)sqlite3_column_text(st, 1);
+                                       const char *storage_base =
+                                           (const char *)sqlite3_column_text(st, 2);
+                                       const char *push_status =
+                                           (const char *)sqlite3_column_text(st, 3);
+                                       if (snap && snap[0] && storage_base && storage_base[0]) {
+                                          /* Build assembled.zfs path from storage_base "file://<path>/". */
+                                          char assembled_path[ZEP_MAX_PATH * 2 + 256];
+                                          const char *prefix = "file://";
+                                          const char *base_path = storage_base;
+                                          if (strncmp(base_path, prefix, strlen(prefix)) == 0)
+                                              base_path += strlen(prefix);
+                                          snprintf(assembled_path, sizeof(assembled_path),
+                                                   "%sassembled.zfs", base_path);
+
+                                          if (access(assembled_path, F_OK) != 0) {
+                                               zep_log("pull: assembled.zfs not found for guid=%s path=%s\n",
+                                                       guid_j->valuestring, assembled_path);
+                                               unsigned char ex = 1;
+                                               ws_send_frame_gtls(nw, WS_OP_EXIT, &ex, 1);
+                                               ws_send_frame_gtls(nw, WS_OP_EOF, NULL, 0);
+                                           } else {
+                                               zep_log("pull: streaming assembled.zfs for guid=%s status=%s\n",
+                                                       guid_j->valuestring, push_status ? push_status : "(none)");
+
+                                               /* Build command: cat assembled.zfs | inject_cmd (optional) */
+                                               char pull_cmd[4096];
+                                               int n = snprintf(pull_cmd, sizeof(pull_cmd),
+                                                   "cat '%s'", assembled_path);
+                                               if (g_debug_inject_pull_cmd[0]) {
+                                                   n += snprintf(pull_cmd + n, sizeof(pull_cmd) - (size_t)n,
+                                                       " | %s", g_debug_inject_pull_cmd);
+                                               }
+                                               zep_log("pull: cmd=%s\n", pull_cmd);
+
+                                               FILE *fp = popen(pull_cmd, "r");
+                                               if (fp) {
+                                                   unsigned char rbuf[65536];
+                                                   size_t nr;
+                                                   while ((nr = fread(rbuf, 1, sizeof(rbuf), fp)) > 0) {
+                                                       ws_send_frame_gtls(nw, WS_OP_BIN, rbuf, nr);
+                                                   }
+                                                   int rc = pclose(fp);
+                                                   unsigned char ex = WIFEXITED(rc) ? (unsigned char)WEXITSTATUS(rc) : 1;
+                                                   zep_log("pull: stream done rc=%d\n", ex);
+                                                   ws_send_frame_gtls(nw, WS_OP_EXIT, &ex, 1);
+                                               } else {
+                                                   zep_log("pull: popen(%s) failed: %s\n",
+                                                           pull_cmd, strerror(errno));
+                                                   unsigned char ex = 1;
+                                                   ws_send_frame_gtls(nw, WS_OP_EXIT, &ex, 1);
+                                               }
+                                              ws_send_frame_gtls(nw, WS_OP_EOF, NULL, 0);
                                           }
-                                         zep_log_debug("ws: pull snap=%s full=%d inc=%d\n",
-                                             snap, is_full, is_inc);
-                                         FILE *pp = popen(pipe_cmd, "r");
-                                          zep_log_debug("ws: popen pipe_cmd=%s pp=%p\n", pipe_cmd, (void*)pp);
-                                          audit_log(AUDIT_EVT_EXEC, "serve", pipe_cmd, pp ? -128 : -127);
-                                          if (pp) {
-                                              unsigned char rbuf[65536];
-                                              for (;;) {
-                                                  size_t nr = fread(rbuf, 1,
-                                                      sizeof(rbuf), pp);
-                                                  zep_log_debug("ws: fread nr=%zu\n", nr);
-                                                  if (nr == 0) break;
-                                                  ws_send_frame_gtls(nw,
-                                                     WS_OP_BIN, rbuf, nr);
-                                             }
-                                             int rc = pclose(pp);
-                                             audit_log(AUDIT_EVT_EXEC, "serve", pipe_cmd, WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
-                                             unsigned char ex = rc ? 1 : 0;
-                                             ws_send_frame_gtls(nw,
-                                                 WS_OP_EXIT, &ex, 1);
-                                         } else {
-                                             unsigned char ex = 1;
-                                             ws_send_frame_gtls(nw,
-                                                 WS_OP_EXIT, &ex, 1);
-                                         }
-                                         ws_send_frame_gtls(nw,
-                                             WS_OP_EOF, NULL, 0);
-                                     }
-                                 }
-                                 sqlite3_finalize(st);
+                                      }
+                                  }
+                                  sqlite3_finalize(st);
                              }
                          }
-                         cJSON_Delete(msg);
-                          break;
-                      }
-                     if (action && cJSON_IsString(action) &&
-                              strcmp(action->valuestring, "push") == 0) {
+                          cJSON_Delete(msg);
+                           break;
+                       }
+                      /* Pull ACK handler: client reports zfs recv result */
+                      if (action && cJSON_IsString(action) &&
+                           strcmp(action->valuestring, "pull_ack") == 0) {
+                          cJSON *guid_j = cJSON_GetObjectItem(msg, "guid");
+                          cJSON *ec_j = cJSON_GetObjectItem(msg, "exit_code");
+                          cJSON *rt_j = cJSON_GetObjectItem(msg, "resume_token");
+                          if (guid_j && cJSON_IsString(guid_j)) {
+                              int exit_code = ec_j && cJSON_IsNumber(ec_j) ? (int)ec_j->valueint : -1;
+                              const char *rt = rt_j && cJSON_IsString(rt_j) ? rt_j->valuestring : "";
+                              if (exit_code == 0) {
+                                  zep_log("pull_ack: guid=%s success for client %s\n",
+                                          guid_j->valuestring, nw->cn);
+                                  /* Register a pulled record for the client (direction='pull' with master GUID) */
+                                  db_snapshot_insert(g_db, cluster_buf, nw->cn,
+                                      guid_j->valuestring, "", "", "", "", 0, 0,
+                                      "pull", "", "pending", "pulled", "");
+                              } else if (rt && rt[0]) {
+                                  zep_log("pull_ack: guid=%s interrupted, resume_token=%s\n",
+                                          guid_j->valuestring, rt);
+                                  /* Register pull record with resume token */
+                                  db_snapshot_insert(g_db, cluster_buf, nw->cn,
+                                      guid_j->valuestring, "", "", "", "", 0, 0,
+                                      "pull", "", "pending", "resuming", rt);
+                              } else {
+                                  zep_log("pull_ack: guid=%s failed exit_code=%d\n",
+                                          guid_j->valuestring, exit_code);
+                              }
+                          }
+                          cJSON_Delete(msg);
+                           break;
+                       }
+                      /* Pull resume handler: server streams resumed data */
+                      if (action && cJSON_IsString(action) &&
+                           strcmp(action->valuestring, "pull_resume") == 0) {
+                          cJSON *guid_j = cJSON_GetObjectItem(msg, "guid");
+                          cJSON *token_j = cJSON_GetObjectItem(msg, "token");
+                          if (guid_j && cJSON_IsString(guid_j) &&
+                              token_j && cJSON_IsString(token_j)) {
+                              zep_log("pull_resume: guid=%s token=%.30s...\n",
+                                      guid_j->valuestring, token_j->valuestring);
+                              /* Look up the snapshot to get assembly path */
+                              sqlite3_stmt *st = NULL;
+                              sqlite3_prepare_v2(g_db,
+                                  "SELECT storage_base FROM snapshots "
+                                  "WHERE guid = ?1 AND direction = 'push' LIMIT 1",
+                                  -1, &st, NULL);
+                              if (st) {
+                                  sqlite3_bind_text(st, 1, guid_j->valuestring, -1, SQLITE_STATIC);
+                                  if (sqlite3_step(st) == SQLITE_ROW) {
+                                      const char *storage_base =
+                                          (const char *)sqlite3_column_text(st, 0);
+                                      if (storage_base && storage_base[0]) {
+                                          char assembled_path[ZEP_MAX_PATH * 2 + 256];
+                                          const char *prefix = "file://";
+                                          const char *base_path = storage_base;
+                                          if (strncmp(base_path, prefix, strlen(prefix)) == 0)
+                                              base_path += strlen(prefix);
+                                          snprintf(assembled_path, sizeof(assembled_path),
+                                                   "%sassembled.zfs", base_path);
+
+                                          if (access(assembled_path, F_OK) == 0) {
+                                              /* Run zstream resume to reconstruct stream */
+                                              char resume_cmd[4096];
+                                              snprintf(resume_cmd, sizeof(resume_cmd),
+                                                  "zstream resume -t '%s' -i '%s'",
+                                                  token_j->valuestring, assembled_path);
+                                              FILE *fp = popen(resume_cmd, "r");
+                                              if (fp) {
+                                                  unsigned char rbuf[65536];
+                                                  size_t nr;
+                                                  while ((nr = fread(rbuf, 1, sizeof(rbuf), fp)) > 0) {
+                                                      ws_send_frame_gtls(nw, WS_OP_BIN, rbuf, nr);
+                                                  }
+                                                  pclose(fp);
+                                                  unsigned char ex = 0;
+                                                  ws_send_frame_gtls(nw, WS_OP_EXIT, &ex, 1);
+                                              } else {
+                                                  zep_log("pull_resume: popen(%s) failed\n", resume_cmd);
+                                                  unsigned char ex = 1;
+                                                  ws_send_frame_gtls(nw, WS_OP_EXIT, &ex, 1);
+                                              }
+                                              ws_send_frame_gtls(nw, WS_OP_EOF, NULL, 0);
+                                          } else {
+                                              zep_log("pull_resume: assembled.zfs not found\n");
+                                              unsigned char ex = 1;
+                                              ws_send_frame_gtls(nw, WS_OP_EXIT, &ex, 1);
+                                              ws_send_frame_gtls(nw, WS_OP_EOF, NULL, 0);
+                                          }
+                                      }
+                                  }
+                                  sqlite3_finalize(st);
+                              }
+                          }
+                          cJSON_Delete(msg);
+                           break;
+                       }
+                      if (action && cJSON_IsString(action) &&
+                               strcmp(action->valuestring, "push") == 0) {
                              cJSON *guid_j = cJSON_GetObjectItem(msg, "guid");
                              cJSON *bg_j = cJSON_GetObjectItem(msg, "base_guid");
                              cJSON *snap_j = cJSON_GetObjectItem(msg, "snapshot");
@@ -2016,8 +2287,8 @@ static void *node_ws_thread(void *arg) {
                                       strftime(now_str, sizeof(now_str), "%Y-%m-%dT%H:%M:%SZ", &tm);
                                   }
                                    db_snapshot_insert(g_db, cluster_buf, nw->cn,
-                                       guid, "", local_snap, label, cluster_fs, 0, 0,
-                                       "push", "", "pending", "discovered");
+                                        guid, "", local_snap, label, cluster_fs, 0, 0,
+                                        "push", "", "pending", "discovered", "");
                                   {
                                       sqlite3_stmt *pa = NULL;
                                       if (sqlite3_prepare_v2(g_db,
@@ -3424,9 +3695,9 @@ zep_log_debug("config set: key=%s body_len=%zu body=%.*s\n",
                     }
                     sqlite3_finalize(cs);
                 }
-              db_snapshot_insert(g_db, cl_buf[0] ? cl_buf : "",
-                     ctx->node, guid->valuestring, "", "",
-                     "", "", 0, 0, "pull", "", "pending", "discovered");
+             db_snapshot_insert(g_db, cl_buf[0] ? cl_buf : "",
+                      ctx->node, guid->valuestring, "", "",
+                      "", "", 0, 0, "pull", "", "pending", "discovered", "");
             }
             cJSON *lbl = cJSON_GetObjectItem(json, "label");
             cJSON *cfs = cJSON_GetObjectItem(json, "cluster_fs");
@@ -3761,7 +4032,7 @@ zep_log_debug("config set: key=%s body_len=%zu body=%.*s\n",
                         snap->valuestring, lbl->valuestring,
                         cfs->valuestring, 0, 0,
                         strcmp(role_buf, "master") == 0 ? "push" : "pull",
-                        "", "pending", "discovered");
+                        "", "pending", "discovered", "");
 
 
                     if (!has_common) {
@@ -3830,7 +4101,7 @@ zep_log_debug("config set: key=%s body_len=%zu body=%.*s\n",
                             }
                             db_snapshot_insert(g_db, cl_buf, ctx->node,
                                 "", "", "", "", cfs->valuestring,
-                                0, 0, "pull", "", "pending", "discovered");
+                                0, 0, "pull", "", "pending", "discovered", "");
                         } else {
                             zep_log( "inventory: %s has no snaps for %s, "
                                    "no initial — waiting for master "
@@ -4194,6 +4465,11 @@ case 'v': g_logging = LOG_LEVEL_ALL; break;  /* -v for backwards compat: show al
         char buf[32];
         if (db_config_get(g_db, "resume", buf, sizeof(buf)) == ZEP_ERR_OK)
             g_resume = atoi(buf);
+    }
+    {
+        char buf[512];
+        if (db_config_get(g_db, "debug_inject_pull_cmd", buf, sizeof(buf)) == ZEP_ERR_OK)
+            snprintf(g_debug_inject_pull_cmd, sizeof(g_debug_inject_pull_cmd), "%s", buf);
     }
 
     if (!g_no_tls && g_ca_path[0]) {

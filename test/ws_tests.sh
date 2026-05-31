@@ -622,6 +622,58 @@ fi
 echo "  Client snapshots in DB:"
 $SUDO sqlite3 "$SERVER_DB" "SELECT snapshot, label, guid, cluster_fs, direction, pull_status, push_status FROM snapshots WHERE node='za-client-1' ORDER BY recorded_at;" 2>/dev/null || true
 
+###############################################################################
+# 8c. Phase 5: Client pull from server (pull assembled.zfs via WS)
+###############################################################################
+echo -e "${CYAN}=== Step 8c: Phase 5 — Client pull ===${NC}"
+
+# Destroy client dataset so pull recv can create it from scratch as za-client-1
+echo "  Destroying client dataset for clean pull target..."
+$SUDO zfs unmount za-client-1-pool/slave 2>/dev/null || true
+$SUDO zfs destroy -r za-client-1-pool/slave 2>/dev/null || true
+
+# Restart client cron daemon (Phase 4 killed it)
+nohup sudo -u za-client-1 sh -c "\"$ZEP\" --logging DEBUG,INFO,WARN,ERROR,AUDIT --db \"$CLIENT1_DB\" cron --daemon --interval 5 2> /tmp/zep-za-client-1.log" </dev/null >/dev/null 2>&1 &
+CLIENT_PID=$!
+disown $CLIENT_PID 2>/dev/null || true
+echo "  Client cron daemon started for pull (PID $CLIENT_PID)"
+
+# Wait for pull ACK with success (exit_code=0)
+PHASE5_TIMEOUT=60
+elapsed=0
+while [[ $elapsed -lt $PHASE5_TIMEOUT ]]; do
+    if grep -q "pull_ack: guid=.*success" /tmp/zep-server.log 2>/dev/null; then
+        echo "  Pull success after ${elapsed}s"
+        break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+
+if [[ $elapsed -ge $PHASE5_TIMEOUT ]]; then
+    bad "phase 5 pull success NOT received within ${PHASE5_TIMEOUT}s"
+else
+    ok "phase 5 pull ACK received with success"
+fi
+
+# Assert: pull_status='pulled' in DB
+pulled_count=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT COUNT(*) FROM snapshots WHERE node='za-client-1' AND direction='pull' AND pull_status='pulled';" 2>/dev/null || echo 0)
+
+if [[ "$pulled_count" -ge 1 ]]; then
+    ok "DB: $pulled_count client snap(s) pull_status='pulled'"
+else
+    bad "DB: expected >= 1 pulled, got $pulled_count"
+fi
+
+# Assert: client has the pulled snapshot locally
+client_snaps=$($SUDO zfs list -t snapshot -H -o name za-client-1-pool/slave 2>/dev/null)
+if [[ -n "$client_snaps" ]]; then
+    ok "client has pulled snapshot(s): $(echo "$client_snaps" | head -1)"
+else
+    bad "client does NOT have pulled snapshot"
+fi
+
 # Clean up client crond
 kill $CLIENT_PID 2>/dev/null || true
 pkill -f "za-client-1.*cron" 2>/dev/null || true

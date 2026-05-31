@@ -126,6 +126,14 @@ err_t db_init_tables(sqlite3 *db) {
                      NULL, NULL, &merr);
         if (merr) sqlite3_free(merr);
     }
+    /* One-shot migration: add pull_resume_token for pull resume */
+    {
+        char *merr = NULL;
+        sqlite3_exec(db,
+                     "ALTER TABLE snapshots ADD COLUMN pull_resume_token TEXT NOT NULL DEFAULT ''",
+                     NULL, NULL, &merr);
+        if (merr) sqlite3_free(merr);
+    }
     return ZEP_ERR_OK;
 }
 
@@ -176,6 +184,7 @@ err_t db_config_load(sqlite3 *db, zep_config_t *cfg) {
     db_config_get(db, "push_buf_cmd", cfg->push_buf_cmd, sizeof(cfg->push_buf_cmd));
     db_config_get(db, "pull_buf_cmd", cfg->pull_buf_cmd, sizeof(cfg->pull_buf_cmd));
     db_config_get(db, "debug_inject_zfs_pipeline_cmd", cfg->debug_inject_zfs_pipeline_cmd, sizeof(cfg->debug_inject_zfs_pipeline_cmd));
+    db_config_get(db, "debug_inject_pull_cmd", cfg->debug_inject_pull_cmd, sizeof(cfg->debug_inject_pull_cmd));
     db_config_get(db, "pipe_allow", cfg->pipe_allow, sizeof(cfg->pipe_allow));
 
     if (!cfg->pipe_allow[0]) snprintf(cfg->pipe_allow, sizeof(cfg->pipe_allow), "zfs");
@@ -321,12 +330,12 @@ err_t db_snapshot_insert(sqlite3 *db, const char *cluster, const char *node,
                          const char *cluster_fs, int blob_count,
                          size_t blob_size, const char *direction,
                          const char *storage_base, const char *status,
-                         const char *pull_status) {
+                         const char *pull_status, const char *pull_resume_token) {
     const char *sql =
-        "INSERT OR IGNORE INTO snapshots "
+        "INSERT OR REPLACE INTO snapshots "
         "(cluster, node, guid, base_guid, snapshot, label, cluster_fs, "
-        " status, blob_count, blob_size, direction, storage_base, pull_status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        " status, blob_count, blob_size, direction, storage_base, pull_status, pull_resume_token) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;
@@ -343,6 +352,7 @@ err_t db_snapshot_insert(sqlite3 *db, const char *cluster, const char *node,
     sqlite3_bind_text(stmt, 11, direction, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 12, storage_base, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 13, pull_status ? pull_status : "discovered", -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 14, pull_resume_token ? pull_resume_token : "", -1, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
