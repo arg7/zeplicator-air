@@ -30,6 +30,7 @@ SERV_LOG="/tmp/zep-server-discovery.log"
 NODE_CNF_DIR="/tmp/zep-discovery-cnf"
 
 MASTER_DB="/var/lib/zep-air/home/za-master/za-master.db"
+CLIENT1_DB="/var/lib/zep-air/home/za-client-1/za-client-1.db"
 SERVER_DB="/var/lib/zep-air/server.db"
 PKI="/var/lib/zep-air/pki"
 
@@ -544,6 +545,86 @@ if [[ -z "$resume_token" ]]; then
 else
     bad "fs table: push_resume_token not cleared (got: $resume_token)"
 fi
+
+###############################################################################
+# 8b. Phase 4: Client node discovery (register as direction='pull')
+###############################################################################
+echo -e "${CYAN}=== Step 8b: Phase 4 — Client discovery ===${NC}"
+
+# Create snapshots on client node (za-client-1)
+$SUDO zfs snapshot za-client-1-pool/slave@test-hour-${NOW}
+echo "Created: za-client-1-pool/slave@test-hour-${NOW}"
+$SUDO zfs snapshot za-client-1-pool/slave@test-min-${NOW}
+echo "Created: za-client-1-pool/slave@test-min-${NOW}"
+
+# Start client cron daemon (triggers WS connect + discovery)
+nohup sudo -u za-client-1 sh -c "\"$ZEP\" --logging DEBUG,INFO,WARN,ERROR,AUDIT --db \"$CLIENT1_DB\" cron --daemon --interval 5 2> /tmp/zep-za-client-1.log" </dev/null >/dev/null 2>&1 &
+CLIENT_PID=$!
+disown $CLIENT_PID 2>/dev/null || true
+echo "  Client cron daemon started (PID $CLIENT_PID)"
+
+# Wait for phase 4 discovery
+PHASE4_TIMEOUT=20
+elapsed=0
+while [[ $elapsed -lt $PHASE4_TIMEOUT ]]; do
+    if grep -q "discovery: phase 4 completed" /tmp/zep-server.log 2>/dev/null; then
+        echo "  Phase 4 complete after ${elapsed}s"
+        break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+
+if [[ $elapsed -ge $PHASE4_TIMEOUT ]]; then
+    bad "phase 4 NOT completed within ${PHASE4_TIMEOUT}s"
+else
+    ok "phase 4 completed detected"
+fi
+
+# Assert: phase 4 log message
+if grep -q "discovery: phase 4 completed" /tmp/zep-server.log; then
+    ok "discovery: phase 4 completed logged"
+else
+    bad "discovery: phase 4 completed NOT logged"
+fi
+
+# Assert: client snapshots registered with direction='pull'
+client_snap_count=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT COUNT(*) FROM snapshots WHERE node='za-client-1' AND direction='pull';" 2>/dev/null || echo 0)
+
+if [[ "$client_snap_count" -ge 2 ]]; then
+    ok "DB: $client_snap_count client snapshots registered with direction='pull'"
+else
+    bad "DB: expected >= 2 client snaps, got $client_snap_count"
+fi
+
+# Assert: pull_status='discovered'
+discovered_count=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT COUNT(*) FROM snapshots WHERE node='za-client-1' AND pull_status='discovered';" 2>/dev/null || echo 0)
+
+if [[ "$discovered_count" -ge 2 ]]; then
+    ok "DB: $discovered_count client snaps have pull_status='discovered'"
+else
+    bad "DB: expected >= 2 with pull_status='discovered', got $discovered_count"
+fi
+
+# Assert: at least 1 client snapshot promoted to pending (latest per fs)
+pending_client=$($SUDO sqlite3 "$SERVER_DB" \
+    "SELECT COUNT(*) FROM snapshots WHERE node='za-client-1' AND push_status='pending';" 2>/dev/null || echo 0)
+
+if [[ "$pending_client" -ge 1 ]]; then
+    ok "DB: $pending_client client snapshot(s) promoted to pending (latest per fs)"
+else
+    bad "DB: expected >= 1 pending client snap, got $pending_client"
+fi
+
+# Dump client snapshots for debugging
+echo "  Client snapshots in DB:"
+$SUDO sqlite3 "$SERVER_DB" "SELECT snapshot, label, guid, cluster_fs, direction, pull_status, push_status FROM snapshots WHERE node='za-client-1' ORDER BY recorded_at;" 2>/dev/null || true
+
+# Clean up client crond
+kill $CLIENT_PID 2>/dev/null || true
+pkill -f "za-client-1.*cron" 2>/dev/null || true
 
 ###############################################################################
 # 9. Dump full server log for debugging

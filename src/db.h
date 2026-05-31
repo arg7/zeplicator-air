@@ -33,7 +33,8 @@ err_t db_snapshot_insert(sqlite3 *db, const char *cluster, const char *node,
                          const char *snapshot, const char *label,
                          const char *cluster_fs, int blob_count,
                          size_t blob_size, const char *direction,
-                         const char *storage_base, const char *status);
+                         const char *storage_base, const char *status,
+                         const char *pull_status);
 char *db_snapshot_chain_json(sqlite3 *db, const char *cluster,
                              const char *master_cn,
                              const char *client_guid);
@@ -51,8 +52,6 @@ err_t db_fs_save_token(sqlite3 *db, const char *cluster, const char *fs_name,
                        const char *token, int64_t bytes);
 err_t db_fs_clear_token(sqlite3 *db, const char *cluster, const char *fs_name);
 err_t db_fs_mark_pushed(sqlite3 *db, const char *cluster, const char *fs_name,
-                        const char *guid);
-err_t db_fs_mark_pulled(sqlite3 *db, const char *cluster, const char *fs_name,
                         const char *guid);
 err_t db_fs_list_push_pending(sqlite3 *db, const char *cluster,
                               const char *node, char ***out_guids, int *count);

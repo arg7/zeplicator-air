@@ -52,7 +52,7 @@ sudo cluster/cluster-ctl.sh start
 | `src/serve.c` | 3297 | MHD server, all REST handlers, admin API, cron sync, zstream verify, WS node/pipe endpoints |
 | `src/main.c` | 1542 | CLI dispatcher, push/pull/snap/cron commands, WS node client with custom frame protocol |
 | `src/admin.c` | 1155 | libcurl client for remote admin — cluster, join, suspend, config |
-| `src/db.c` | 664 | SQLite: config KV, auth (certs+roles), cluster_chain, push/pull tracking |
+| `src/db.c` | 664 | SQLite: config KV, auth (certs+roles), snapshots, fs tracking |
 | `src/stream-ff.c` | 242 | Stream forwarder for pipe/WS bridging |
 | `src/audit.c` | 171 | Audit logging (stderr-based) |
 | `src/http.c` | 166 | libcurl HTTP client with mTLS, PUT/GET blobs+meta |
@@ -70,7 +70,7 @@ sudo cluster/cluster-ctl.sh start
 ```
 zfs snapshot → zfs send → [buf_cmd |] [zip_cmd] → chunk → SHA256 → HTTPS PUT blob → PUT meta.json
 ```
-Server verifies: reassembles blobs → `zstd -d` → `zstream dump -v` → extracts toguid/fromguid → stores in `cluster_chain`.
+Server verifies: reassembles blobs → `zstd -d` → `zstream dump -v` → extracts toguid/fromguid → stores in `snapshots`.
 
 ### Pull (server → zep-air)
 ```
@@ -91,8 +91,8 @@ The server DB (`zep-air.db`) is authoritative. Tables:
 |-------|---------|
 | `config` | Key-value store (cluster definitions, cron timestamps) |
 | `auth` | Certificates, roles (`server|admin|master|client`), cluster membership, suspended flag, last ack |
-| `cluster_chain` | Canonical GUID chain per cluster (`UNIQUE(cluster_key, toguid)`) |
-| `pushed`/`pulled` | Legacy local tracking (deprecated — server is source of truth) |
+| `snapshots` | Authoritative snapshot registry (GUID, base_guid, status, storage) |
+| `fs` | Per-filesystem push/pull tracking (last_pushed_guid, resume tokens) |
 
 ### Key config keys (server-side)
 | Key | Example |

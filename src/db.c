@@ -31,27 +31,6 @@ err_t db_init_tables(sqlite3 *db) {
         "  key   TEXT PRIMARY KEY,"
         "  value TEXT NOT NULL"
         ");"
-        "CREATE TABLE IF NOT EXISTS pushed ("
-        "  guid        TEXT PRIMARY KEY,"
-        "  snapshot    TEXT NOT NULL,"
-        "  base_guid   TEXT,"
-        "  label       TEXT NOT NULL,"
-        "  created     TEXT NOT NULL,"
-        "  pushed_at   TEXT NOT NULL DEFAULT (datetime('now')),"
-        "  blob_count  INTEGER NOT NULL,"
-        "  stream_size INTEGER NOT NULL"
-        ");"
-        "CREATE TABLE IF NOT EXISTS pulled ("
-        "  guid        TEXT PRIMARY KEY,"
-        "  snapshot    TEXT NOT NULL,"
-        "  base_guid   TEXT,"
-        "  label       TEXT NOT NULL,"
-        "  created     TEXT NOT NULL,"
-        "  pulled_at   TEXT NOT NULL DEFAULT (datetime('now')),"
-        "  donor_node  TEXT NOT NULL,"
-        "  blob_count  INTEGER NOT NULL,"
-        "  stream_size INTEGER NOT NULL"
-        ");"
         "CREATE TABLE IF NOT EXISTS auth ("
         "  cn          TEXT PRIMARY KEY,"
         "  fingerprint TEXT NOT NULL UNIQUE,"
@@ -136,6 +115,14 @@ err_t db_init_tables(sqlite3 *db) {
         if (merr) sqlite3_free(merr);
         sqlite3_exec(db,
                      "ALTER TABLE snapshots ADD COLUMN push_completed_at TEXT NOT NULL DEFAULT ''",
+                     NULL, NULL, &merr);
+        if (merr) sqlite3_free(merr);
+    }
+    /* One-shot migration: add pull_status for client discovery */
+    {
+        char *merr = NULL;
+        sqlite3_exec(db,
+                     "ALTER TABLE snapshots ADD COLUMN pull_status TEXT NOT NULL DEFAULT 'discovered'",
                      NULL, NULL, &merr);
         if (merr) sqlite3_free(merr);
     }
@@ -333,12 +320,13 @@ err_t db_snapshot_insert(sqlite3 *db, const char *cluster, const char *node,
                          const char *snapshot, const char *label,
                          const char *cluster_fs, int blob_count,
                          size_t blob_size, const char *direction,
-                         const char *storage_base, const char *status) {
+                         const char *storage_base, const char *status,
+                         const char *pull_status) {
     const char *sql =
         "INSERT OR IGNORE INTO snapshots "
         "(cluster, node, guid, base_guid, snapshot, label, cluster_fs, "
-        " status, blob_count, blob_size, direction, storage_base) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        " status, blob_count, blob_size, direction, storage_base, pull_status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;
@@ -354,6 +342,7 @@ err_t db_snapshot_insert(sqlite3 *db, const char *cluster, const char *node,
     sqlite3_bind_int64(stmt, 10, (sqlite3_int64)blob_size);
     sqlite3_bind_text(stmt, 11, direction, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 12, storage_base, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 13, pull_status ? pull_status : "discovered", -1, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
@@ -664,22 +653,6 @@ err_t db_fs_mark_pushed(sqlite3 *db, const char *cluster, const char *fs_name,
     if (sqlite3_prepare_v2(db,
             "UPDATE fs SET last_pushed_guid = ?3, push_status = 'pushed', "
             "  push_resume_token = '', push_bytes_recv = 0 "
-            "WHERE cluster = ?1 AND fs = ?2",
-            -1, &stmt, NULL) != SQLITE_OK)
-        return ZEP_ERR_DB;
-    sqlite3_bind_text(stmt, 1, cluster, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, fs_name, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, guid, -1, SQLITE_STATIC);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE ? ZEP_ERR_OK : ZEP_ERR_DB;
-}
-
-err_t db_fs_mark_pulled(sqlite3 *db, const char *cluster, const char *fs_name,
-                        const char *guid) {
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db,
-            "UPDATE fs SET last_pulled_guid = ?3, push_status = 'pending' "
             "WHERE cluster = ?1 AND fs = ?2",
             -1, &stmt, NULL) != SQLITE_OK)
         return ZEP_ERR_DB;

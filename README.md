@@ -552,9 +552,6 @@ zep-air-serve (single binary, single process)
 ├── SQLite DB (WAL mode)
 │   ├── config        key-value store
 │   ├── auth           certs + roles + cluster membership
-│   ├── pushed         local push journal (per node)
-│   ├── pulled         local pull journal (per node)
-│   └── cluster_chain  authoritative GUID chain
 ├── blob storage       filesystem tree
 │   └── <root>/<node>/<inverted_ts>-<guid>/meta.json + 0000..NNNN
 ├── zstream verify     decompress + zstream dump -v → extract GUIDs
