@@ -33,11 +33,18 @@
 static char g_db_path[ZEP_MAX_PATH] = "zep-air.db";
 static pthread_t g_ws_tid;
 static volatile int g_daemon_running = 1;
+static volatile sig_atomic_t g_ws_shutdown = 0;
+static volatile sig_atomic_t g_ws_exited = 0;
 
 static void daemon_signal_handler(int sig) {
     (void)sig;
     g_daemon_running = 0;
-    pthread_cancel(g_ws_tid);
+    g_ws_shutdown = 1;
+}
+
+static void ws_sigterm_handler(int sig) {
+    (void)sig;
+    g_ws_shutdown = 1;
 }
 
 /* === WebSocket Pipe Client (node side) === */
@@ -107,9 +114,9 @@ static void ws_node_disconnect(struct ws_node_conn *c) {
     if (c->ssl) {
         SSL_shutdown(c->ssl);
         SSL_free(c->ssl);
+        c->ssl = NULL;
     }
-    if (c->sock >= 0) close(c->sock);
-    free(c);
+    if (c->sock >= 0) { close(c->sock); c->sock = -1; }
 }
 
 static size_t ws_node_build_frame(unsigned char *buf, size_t buf_size,
@@ -211,9 +218,12 @@ static int ws_node_send_frame(struct ws_node_conn *c, unsigned char opcode,
     return 0;
 }
 
-static struct ws_node_conn *ws_node_connect(const char *server_url, const char *cert_path,
+static int ws_node_connect(struct ws_node_conn *c, const char *server_url, const char *cert_path,
                               const char *key_path, const char *ca_path,
                               const char *key_password, const char *path) {
+    if (!c) return -1;
+    memset(c, 0, sizeof(*c));
+    c->sock = -1;
     int use_tls = 0;
     char host[512] = {0};
     int port = 80;
@@ -243,30 +253,28 @@ static struct ws_node_conn *ws_node_connect(const char *server_url, const char *
     hints.ai_socktype = SOCK_STREAM;
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);
-    if (getaddrinfo(host, port_str, &hints, &res) != 0) return NULL;
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) return -1;
 
     int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock < 0) { freeaddrinfo(res); return NULL; }
+    if (sock < 0) { freeaddrinfo(res); return -1; }
     if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-        close(sock); freeaddrinfo(res); return NULL;
+        close(sock); freeaddrinfo(res); return -1;
     }
     freeaddrinfo(res);
     { struct timeval tv = { .tv_sec = 90, .tv_usec = 0 }; setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
 
-    struct ws_node_conn *c = calloc(1, sizeof(*c));
-    if (!c) { close(sock); return NULL; }
     c->sock = sock;
 
     SSL_CTX *ssl_ctx = NULL;
     if (use_tls) {
         ssl_ctx = SSL_CTX_new(TLS_client_method());
-        if (!ssl_ctx) { ws_node_disconnect(c); return NULL; }
+        if (!ssl_ctx) { ws_node_disconnect(c); return -1; }
         SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
         if (SSL_CTX_use_certificate_file(ssl_ctx, cert_path, SSL_FILETYPE_PEM) != 1) {
-            SSL_CTX_free(ssl_ctx); ws_node_disconnect(c); return NULL;
+            SSL_CTX_free(ssl_ctx); ws_node_disconnect(c); return -1;
         }
         if (SSL_CTX_use_PrivateKey_file(ssl_ctx, key_path, SSL_FILETYPE_PEM) != 1) {
-            SSL_CTX_free(ssl_ctx); ws_node_disconnect(c); return NULL;
+            SSL_CTX_free(ssl_ctx); ws_node_disconnect(c); return -1;
         }
         if (ca_path && ca_path[0]) SSL_CTX_load_verify_locations(ssl_ctx, ca_path, NULL);
         if (key_password && key_password[0])
@@ -275,8 +283,10 @@ static struct ws_node_conn *ws_node_connect(const char *server_url, const char *
         c->ssl = SSL_new(ssl_ctx);
         SSL_set_fd(c->ssl, sock);
         if (SSL_connect(c->ssl) <= 0) {
-            SSL_CTX_free(ssl_ctx); ws_node_disconnect(c); return NULL;
+            SSL_CTX_free(ssl_ctx); ws_node_disconnect(c); return -1;
         }
+        SSL_CTX_free(ssl_ctx);
+        ssl_ctx = NULL;
     }
 
     /* WS handshake */
@@ -306,14 +316,14 @@ static struct ws_node_conn *ws_node_connect(const char *server_url, const char *
 
     if (ws_node_write(c, req, (int)strlen(req)) <= 0) {
         if (ssl_ctx) SSL_CTX_free(ssl_ctx);
-        ws_node_disconnect(c); return NULL;
+        ws_node_disconnect(c); return -1;
     }
 
     char resp_buf[1024];
     int resp_len = 0;
     for (;;) {
         int n = ws_node_read(c, resp_buf + resp_len, (int)(sizeof(resp_buf) - resp_len - 1));
-        if (n <= 0) { if (ssl_ctx) SSL_CTX_free(ssl_ctx); ws_node_disconnect(c); return NULL; }
+        if (n <= 0) { if (ssl_ctx) SSL_CTX_free(ssl_ctx); ws_node_disconnect(c); return -1; }
         resp_len += n;
         resp_buf[resp_len] = '\0';
         if (strstr(resp_buf, "\r\n\r\n")) break;
@@ -322,11 +332,11 @@ static struct ws_node_conn *ws_node_connect(const char *server_url, const char *
 
     if (strstr(resp_buf, "101") == NULL) {
         if (ssl_ctx) SSL_CTX_free(ssl_ctx);
-        ws_node_disconnect(c); return NULL;
+        ws_node_disconnect(c); return -1;
     }
 
     if (ssl_ctx) SSL_CTX_free(ssl_ctx);
-    return c;
+    return 0;
 }
 
 static void *ws_node_pipe_thread(void *arg);
@@ -347,24 +357,31 @@ static void *ws_node_pipe_thread(void *arg) {
 
     prctl(PR_SET_PDEATHSIG, SIGTERM);
 
+    struct sigaction sa = {0};
+    sa.sa_handler = ws_sigterm_handler;
+    sa.sa_flags = 0;
+    sigaction(SIGTERM, &sa, NULL);
+
+    unsigned char out_buf[WS_NODE_FRAME_MAX];
+    unsigned char buf_buf[1];
+    unsigned char *out = out_buf;
+    unsigned char *buf = buf_buf;
+
     for (;;) {
+        if (g_ws_shutdown) break;
         char ws_path[256];
         snprintf(ws_path, sizeof(ws_path), "/v1/ws/node?cn=%s", cfg->node_name);
 
         zep_log_debug( "ws-node: connecting to %s%s\n", cfg->server_url, ws_path);
 
-        struct ws_node_conn *conn = ws_node_connect(cfg->server_url, cfg->cert_path, cfg->key_path,
-                                    cfg->ca_path, cfg->key_password, ws_path);
-        if (!conn) {
+        struct ws_node_conn conn_data;
+        struct ws_node_conn *conn = &conn_data;
+        if (ws_node_connect(conn, cfg->server_url, cfg->cert_path, cfg->key_path,
+                            cfg->ca_path, cfg->key_password, ws_path) != 0) {
             zep_log_debug( "ws-node: connect failed, retrying in 5s\n");
             sleep(5);
             continue;
         }
-
-        unsigned char *buf = malloc(WS_NODE_FRAME_MAX);
-        unsigned char *out = malloc(WS_NODE_FRAME_MAX);
-        if (!buf || !out) { free(buf); free(out); ws_node_disconnect(conn); sleep(5); continue; }
-
         /* Send snapshot discovery to server */
         if (cfg->node_name[0] && cfg->cluster[0] && cfg->mapping[0]) {
             /* Collect snapshots for each mapped filesystem */
@@ -1797,10 +1814,10 @@ zep_log_debug("ws-node: recv fwrite failed\n");
             continue;
         }
 
-        free(buf); free(out);
         ws_node_disconnect(conn);
     }
     free(cfg);
+    g_ws_exited = 1;
     return NULL;
 }
 
@@ -1893,6 +1910,9 @@ static int cmd_cron(int argc, char *argv[]) {
 
     if (daemon_mode) {
         while (g_daemon_running) sleep(1);
+        /* Wait for WS thread to exit cleanly */
+        g_ws_shutdown = 1;
+        for (int i = 0; i < 15 && !g_ws_exited; i++) sleep(1);
     }
     return 0;
 }
