@@ -534,7 +534,7 @@ static void
 scheduler_run(struct node_ws *nw, const char *cluster_buf,
     char pending_snaps[][ZEP_MAX_SNAPSHOT_NAME],
     char pending_labels[][64],
-    int *pending_tail)
+    int *pending_tail, const char *mapping_buf)
 {
     char cluster_def[4096] = {0};
     char ckey[128];
@@ -568,6 +568,38 @@ scheduler_run(struct node_ws *nw, const char *cluster_buf,
 
                 char cluster_fs[512];
                 snprintf(cluster_fs, sizeof(cluster_fs), "%s/%s", pool_name, ds_name);
+                /* Resolve cluster_fs to normalized name via mapping */
+                if (mapping_buf[0]) {
+                    const char *mp = mapping_buf;
+                    const char *raw_fs = cluster_fs;
+                    while (mp && *mp) {
+                        while (*mp==' '||*mp=='\t') mp++;
+                        if (!*mp) break;
+                        const char *colon = strchr(mp, ':');
+                        if (!colon) break;
+                        size_t cflen = (size_t)(colon - mp);
+                        char cfs_buf[512];
+                        if (cflen >= sizeof(cfs_buf)) cflen = sizeof(cfs_buf) - 1;
+                        memcpy(cfs_buf, mp, cflen);
+                        cfs_buf[cflen] = '\0';
+                        const char *start = colon + 1;
+                        while (*start==' ') start++;
+                        const char *end = strchr(start, ',');
+                        if (!end) end = start + strlen(start);
+                        const char *paren = strchr(start, '(');
+                        size_t n = paren ? (size_t)(paren - start) : (size_t)(end - start);
+                        char resolved[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                        if (n >= sizeof(resolved)) n = sizeof(resolved) - 1;
+                        memcpy(resolved, start, n);
+                        resolved[n] = '\0';
+                        if (strcmp(raw_fs, resolved) == 0) {
+                            snprintf(cluster_fs, sizeof(cluster_fs), "%s", cfs_buf);
+                            break;
+                        }
+                        const char *comma = strchr(colon, ',');
+                        mp = comma ? comma + 1 : colon + strlen(colon);
+                    }
+                }
 
                 cJSON *lbl_item;
                 cJSON_ArrayForEach(lbl_item, lbls) {
@@ -872,8 +904,8 @@ static void node_ws_pull_trigger(struct node_ws *nw, const char *cluster_buf,
         "\"snapshot\":\"%s\",\"cluster_fs\":\"%s\"}",
         target_guid, target_base, target_snap, target_cfs);
     if (n > 0 && n < (int)sizeof(pull_json)) {
-        zep_log("pull_trigger: sending pull for guid=%s snap=%s to client %s\n",
-                target_guid, target_snap, nw->cn);
+        zep_log("pull_trigger: sending pull for guid=%s snap=%s cfs=%s to client %s\n",
+                 target_guid, target_snap, target_cfs, nw->cn);
         ws_send_frame_gtls(nw, WS_OP_TEXT, (unsigned char *)pull_json, (size_t)n);
 
         /* Look up assembled.zfs and stream it */
@@ -978,7 +1010,7 @@ static void *node_ws_thread(void *arg) {
     /* Initial scheduler run */
     int initial_scheduler_done = 0;
     if (strcmp(role_buf, "master") == 0 && cluster_buf[0] && mapping_buf[0]) {
-        scheduler_run(nw, cluster_buf, pending_snaps, pending_labels, &pending_tail);
+        scheduler_run(nw, cluster_buf, pending_snaps, pending_labels, &pending_tail, mapping_buf);
         initial_scheduler_done = 1;
     }
 
@@ -1027,7 +1059,7 @@ static void *node_ws_thread(void *arg) {
         /* Periodic scheduler: check if any labels are due */
         if (strcmp(role_buf, "master") == 0 && cluster_buf[0] && mapping_buf[0]) {
             if (now - last_scheduler >= 30) {
-                scheduler_run(nw, cluster_buf, pending_snaps, pending_labels, &pending_tail);
+       scheduler_run(nw, cluster_buf, pending_snaps, pending_labels, &pending_tail, mapping_buf);
                 last_scheduler = now;
             }
         }
@@ -1509,36 +1541,40 @@ static void *node_ws_thread(void *arg) {
                         }
 
                        /* Pull ACK handler: client reports zfs recv result */
-                      if (action && cJSON_IsString(action) &&
-                           strcmp(action->valuestring, "pull_ack") == 0) {
-                          cJSON *guid_j = cJSON_GetObjectItem(msg, "guid");
-                          cJSON *ec_j = cJSON_GetObjectItem(msg, "exit_code");
-                          cJSON *rt_j = cJSON_GetObjectItem(msg, "resume_token");
-                          if (guid_j && cJSON_IsString(guid_j)) {
-                              int exit_code = ec_j && cJSON_IsNumber(ec_j) ? (int)ec_j->valueint : -1;
-                              const char *rt = rt_j && cJSON_IsString(rt_j) ? rt_j->valuestring : "";
-                              if (exit_code == 0) {
-                                  zep_log("pull_ack: guid=%s success for client %s\n",
-                                          guid_j->valuestring, nw->cn);
-                                  /* Register a pulled record for the client (direction='pull' with master GUID) */
-                                  db_snapshot_insert(g_db, cluster_buf, nw->cn,
-                                      guid_j->valuestring, "", "", "", "", 0, 0,
-                                      "pull", "", "pending", "pulled", "");
-                              } else if (rt && rt[0]) {
-                                  zep_log("pull_ack: guid=%s interrupted, resume_token=%s\n",
-                                          guid_j->valuestring, rt);
-                                  /* Register pull record with resume token */
-                                  db_snapshot_insert(g_db, cluster_buf, nw->cn,
-                                      guid_j->valuestring, "", "", "", "", 0, 0,
-                                      "pull", "", "pending", "resuming", rt);
-                              } else {
-                                  zep_log("pull_ack: guid=%s failed exit_code=%d\n",
-                                          guid_j->valuestring, exit_code);
-                              }
-                          }
-                         cJSON_Delete(msg);
-                           continue;
-                        }
+                       if (action && cJSON_IsString(action) &&
+                            strcmp(action->valuestring, "pull_ack") == 0) {
+                           cJSON *guid_j = cJSON_GetObjectItem(msg, "guid");
+                           cJSON *ec_j = cJSON_GetObjectItem(msg, "exit_code");
+                           cJSON *rt_j = cJSON_GetObjectItem(msg, "resume_token");
+                           cJSON *err_j = cJSON_GetObjectItem(msg, "stderr");
+                           if (guid_j && cJSON_IsString(guid_j)) {
+                               int exit_code = ec_j && cJSON_IsNumber(ec_j) ? (int)ec_j->valueint : -1;
+                               const char *rt = rt_j && cJSON_IsString(rt_j) ? rt_j->valuestring : "";
+                               const char *err = err_j && cJSON_IsString(err_j) ? err_j->valuestring : "";
+                               if (exit_code == 0) {
+                                   zep_log("pull_ack: guid=%s success for client %s\n",
+                                           guid_j->valuestring, nw->cn);
+                                   /* Register a pulled record for the client (direction='pull' with master GUID) */
+                                   db_snapshot_insert(g_db, cluster_buf, nw->cn,
+                                       guid_j->valuestring, "", "", "", "", 0, 0,
+                                       "pull", "", "pending", "pulled", "");
+                               } else if (rt[0] && strcmp(rt, "-") != 0) {
+                                   zep_log("pull_ack: guid=%s interrupted, resume_token=%s\n",
+                                           guid_j->valuestring, rt);
+                                   /* Register pull record with valid resume token */
+                                   db_snapshot_insert(g_db, cluster_buf, nw->cn,
+                                       guid_j->valuestring, "", "", "", "", 0, 0,
+                                       "pull", "", "pending", "resuming", rt);
+                               } else {
+                                   zep_log("pull_ack: guid=%s failed exit_code=%d",
+                                           guid_j->valuestring, exit_code);
+                                   if (err[0]) zep_log(" stderr=%s", err);
+                                   zep_log("\n");
+                               }
+                           }
+                          cJSON_Delete(msg);
+                            continue;
+                         }
 
                        /* Pull resume handler: server streams resumed data */
                       if (action && cJSON_IsString(action) &&

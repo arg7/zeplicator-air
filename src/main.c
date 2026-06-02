@@ -1324,9 +1324,11 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                           size_t tl = strlen(resume_token_buf);
                                           while (tl > 0 && (resume_token_buf[tl-1]=='\n'||resume_token_buf[tl-1]=='\r'))
                                               resume_token_buf[--tl] = '\0';
-                                          if (resume_token_buf[0]) {
-                                              zep_log("ws-node: pull got resume_token=%.40s...\n", resume_token_buf);
-                                          }
+                                       if (resume_token_buf[0] && strcmp(resume_token_buf, "-") != 0) {
+                                            zep_log("ws-node: pull got resume_token=%.40s...\n", resume_token_buf);
+                                        } else {
+                                            resume_token_buf[0] = '\0';
+                                        }
                                       }
                                       pclose(tp);
                                   }
