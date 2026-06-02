@@ -1154,9 +1154,9 @@ static void *node_ws_thread(void *arg) {
                                 sqlite3_finalize(st);
                             }
                         }
-                      cJSON_Delete(msg);
-                          break;
-                      }
+                          cJSON_Delete(msg);
+                           continue;
+                        }
                        /* Node-initiated snapshot discovery */
                        if (!discovery_done && action && cJSON_IsString(action) &&
                            strcmp(action->valuestring, "discovery") == 0) {
@@ -1505,9 +1505,10 @@ static void *node_ws_thread(void *arg) {
                              }
                          }
                           cJSON_Delete(msg);
-                           break;
-                       }
-                      /* Pull ACK handler: client reports zfs recv result */
+                           continue;
+                        }
+
+                       /* Pull ACK handler: client reports zfs recv result */
                       if (action && cJSON_IsString(action) &&
                            strcmp(action->valuestring, "pull_ack") == 0) {
                           cJSON *guid_j = cJSON_GetObjectItem(msg, "guid");
@@ -1535,10 +1536,11 @@ static void *node_ws_thread(void *arg) {
                                           guid_j->valuestring, exit_code);
                               }
                           }
-                          cJSON_Delete(msg);
-                           break;
-                       }
-                      /* Pull resume handler: server streams resumed data */
+                         cJSON_Delete(msg);
+                           continue;
+                        }
+
+                       /* Pull resume handler: server streams resumed data */
                       if (action && cJSON_IsString(action) &&
                            strcmp(action->valuestring, "pull_resume") == 0) {
                           cJSON *guid_j = cJSON_GetObjectItem(msg, "guid");
