@@ -2354,7 +2354,7 @@ static void *node_ws_thread(void *arg) {
                           zep_log_debug("create_snap: head=%d tail=%d initial_done=%d\n",
                               pending_head, pending_tail, initial_scheduler_done);
                            /* After all create_snap tasks acknowledged, promote latest per fs to pending, then dispatch push */
-                           if (pending_head >= pending_tail && initial_scheduler_done &&
+                           if (pending_head >= pending_tail &&
                                strcmp(role_buf, "master") == 0
                                && cluster_buf[0] && mapping_buf[0]) {
                                {
