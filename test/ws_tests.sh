@@ -687,6 +687,52 @@ grep -iE "discovery|create_snap|scheduler|pull|push:" /tmp/zep-server.log 2>/dev
 done
 
 ###############################################################################
+# 10. Phase 6 — Snapshot rotation via WebSocket
+###############################################################################
+echo -e "${CYAN}=== Step 10: Phase 6 — Snapshot rotation ===${NC}"
+
+# Lower min retention to 1 to trigger rotation during test
+$SUDO sqlite3 "$SERVER_DB" \
+    "SELECT value FROM config WHERE key = 'cluster_test';" 2>/dev/null > /tmp/cfg_tmp.json
+python3 -c "
+import json
+with open('/tmp/cfg_tmp.json') as f:
+    d = json.load(f)
+for pool in d['pools'].values():
+    for fs in pool.values():
+        if 'labels' in fs and 'min' in fs['labels']:
+            fs['labels']['min'] = 1
+with open('/tmp/cfg_new.json', 'w') as f:
+    json.dump(d, f, separators=(',', ':'))
+"
+$SUDO sqlite3 "$SERVER_DB" "UPDATE config SET value = readfile('/tmp/cfg_new.json') WHERE key = 'cluster_test';"
+rm -f /tmp/cfg_tmp.json /tmp/cfg_new.json
+echo "  Retention lowered: min → 1"
+
+# Wait for rotation dispatch + rotate-ack
+PHASE6_TIMEOUT=90
+while (( PHASE6_TIMEOUT > 0 )); do
+    if grep -q "phase 6 complete" /tmp/zep-server.log 2>/dev/null; then
+        break
+    fi
+    sleep 2
+    PHASE6_TIMEOUT=$((PHASE6_TIMEOUT - 2))
+done
+if grep -q "phase 6 complete" /tmp/zep-server.log 2>/dev/null; then
+    ok "phase 6 rotation complete (rotate-ack processed)"
+else
+    bad "phase 6 NOT completed: no 'phase 6 complete' in log within 90s"
+fi
+
+# Assert: rotate-ack processed at least once
+ack_count=$(grep -c "rotate-ack: processed from" /tmp/zep-server.log 2>/dev/null || echo 0)
+if [[ "$ack_count" -ge 1 ]]; then
+    ok "rotate-ack processed $ack_count time(s)"
+else
+    bad "rotate-ack NEVER processed (rotation did not fire)"
+fi
+
+###############################################################################
 # Cleanup
 ###############################################################################
 echo -e "${CYAN}=== Cleanup ===${NC}"

@@ -1761,6 +1761,7 @@ static void *node_ws_thread(void *arg) {
                                 }
                             }
                             zep_log("rotate-ack: processed from %s\n", nw->cn);
+                            zep_log("phase 6 complete\n");
                             cJSON_Delete(msg);
                             continue;
                         }
