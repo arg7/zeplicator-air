@@ -481,7 +481,8 @@ int db_node_pull_count(sqlite3 *db, const char *cluster, const char *node) {
 
 err_t db_rotation_candidates(sqlite3 *db, const char *cluster,
                               const char *node, const char *mapping,
-                              cJSON *cluster_json, cJSON *out) {
+                              cJSON *cluster_json, cJSON *out,
+                              const char *direction) {
     if (!cluster_json) return ZEP_ERR_OK;
 
     cJSON *pools = cJSON_GetObjectItem(cluster_json, "pools");
@@ -549,12 +550,14 @@ err_t db_rotation_candidates(sqlite3 *db, const char *cluster,
                         "SELECT guid, snapshot FROM snapshots "
                         "WHERE node = ?1 AND cluster_fs = ?2 "
                         "  AND label = ?3 AND cluster = ?4 "
+                        "  AND direction = ?5 "
                         "ORDER BY rowid ASC",
                         -1, &st, NULL) == SQLITE_OK) {
                     sqlite3_bind_text(st, 1, node, -1, SQLITE_STATIC);
                     sqlite3_bind_text(st, 2, cluster_fs, -1, SQLITE_STATIC);
                     sqlite3_bind_text(st, 3, label, -1, SQLITE_STATIC);
                     sqlite3_bind_text(st, 4, cluster, -1, SQLITE_STATIC);
+                    sqlite3_bind_text(st, 5, direction, -1, SQLITE_STATIC);
 
                     struct row_s {
                         char guid[ZEP_MAX_GUID_LEN];

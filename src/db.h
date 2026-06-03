@@ -71,7 +71,8 @@ err_t db_snapshot_delete_node_guid(sqlite3 *db, const char *node,
 int   db_node_pull_count(sqlite3 *db, const char *cluster, const char *node);
 err_t db_rotation_candidates(sqlite3 *db, const char *cluster,
                               const char *node, const char *mapping,
-                              cJSON *cluster_json, cJSON *out);
+                              cJSON *cluster_json, cJSON *out,
+                              const char *direction);
 
 err_t db_pull_state_save(sqlite3 *db, const char *key,
                          const char *guid, int blobs_done);

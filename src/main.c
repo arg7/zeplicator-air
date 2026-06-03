@@ -1579,6 +1579,80 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                             }
                         }
                     }
+                    /* Handle rotation: destroy excess ZFS snapshots */
+                    if (action && cJSON_IsString(action) &&
+                        strcmp(action->valuestring, "rotation") == 0) {
+                        zep_log("ws-node: RX rotation from server\n");
+                        cJSON *rotate = cJSON_GetObjectItem(task, "rotate");
+                        cJSON *deleted = cJSON_CreateArray();
+                        if (rotate && cJSON_IsArray(rotate)) {
+                            cJSON *item;
+                            cJSON_ArrayForEach(item, rotate) {
+                                cJSON *g = cJSON_GetObjectItem(item, "guid");
+                                cJSON *sn = cJSON_GetObjectItem(item, "snapshot");
+                                cJSON *cf = cJSON_GetObjectItem(item, "cluster_fs");
+                                if (!g || !sn || !cf) continue;
+
+                                const char *at_sign = strchr(sn->valuestring, '@');
+                                const char *at_name = at_sign ? at_sign : "";
+
+                                const char *mp = cfg->mapping;
+                                char local_fs[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                                while (mp && *mp) {
+                                    while (*mp==' '||*mp=='\t') mp++;
+                                    if (!*mp) break;
+                                    const char *colon = strchr(mp, ':');
+                                    if (!colon) break;
+                                    size_t cflen = (size_t)(colon - mp);
+                                    char cfs_buf[512] = {0};
+                                    if (cflen >= sizeof(cfs_buf)) cflen = sizeof(cfs_buf) - 1;
+                                    memcpy(cfs_buf, mp, cflen);
+                                    const char *start = colon + 1;
+                                    while (*start==' ') start++;
+                                    const char *end = strchr(start, ',');
+                                    if (!end) end = start + strlen(start);
+                                    const char *paren = strchr(start, '(');
+                                    size_t n = paren ? (size_t)(paren - start) : (size_t)(end - start);
+                                    char resolved[ZEP_MAX_SNAPSHOT_NAME] = {0};
+                                    if (n >= sizeof(resolved)) n = sizeof(resolved) - 1;
+                                    memcpy(resolved, start, n);
+                                    resolved[n] = '\0';
+                                    if (strcmp(cfs_buf, cf->valuestring) == 0) {
+                                        snprintf(local_fs, sizeof(local_fs), "%s", resolved);
+                                        break;
+                                    }
+                                    const char *comma = strchr(colon, ',');
+                                    mp = comma ? comma + 1 : colon + strlen(colon);
+                                }
+
+                                if (local_fs[0] && at_name[0]) {
+                                    char dcmd[ZEP_MAX_SNAPSHOT_NAME * 2 + 64];
+                                    snprintf(dcmd, sizeof(dcmd),
+                                        "zfs destroy '%s%s'",
+                                        local_fs, at_name);
+                                    zep_log("rotation: %s\n", dcmd);
+                                    int rc = system(dcmd);
+                                    if (rc == 0)
+                                        zep_log("rotation: destroyed %s\n",
+                                            sn->valuestring);
+                                    else
+                                        zep_log("rotation: destroy rc=%d for %s\n",
+                                            rc, sn->valuestring);
+                                    cJSON_AddItemToArray(deleted,
+                                        cJSON_CreateString(g->valuestring));
+                                }
+                            }
+                        }
+                        cJSON *ack_obj = cJSON_CreateObject();
+                        cJSON_AddStringToObject(ack_obj, "action", "rotate-ack");
+                        cJSON_AddItemToObject(ack_obj, "deleted", deleted);
+                        cJSON_AddItemToObject(ack_obj, "remaining", cJSON_CreateArray());
+                        char *ack_js = cJSON_PrintUnformatted(ack_obj);
+                        cJSON_Delete(ack_obj);
+                        ws_node_send_frame(conn, WS_NODE_OP_TEXT,
+                            (unsigned char *)ack_js, strlen(ack_js));
+                        free(ack_js);
+                    }
                     /* Handle push: stream zfs send to server */
                     if (action && cJSON_IsString(action) &&
                         strcmp(action->valuestring, "push") == 0) {
