@@ -355,6 +355,9 @@ static void *ws_node_pipe_thread(void *arg) {
     zep_config_t *cfg = (zep_config_t *)arg;
     if (!cfg) return NULL;
 
+    char stderr_log[512];
+    snprintf(stderr_log, sizeof(stderr_log), "/var/lib/zep-air/home/%s/zep-recv-err.log", cfg->node_name);
+
     prctl(PR_SET_PDEATHSIG, SIGTERM);
 
     struct sigaction sa = {0};
@@ -1254,7 +1257,7 @@ zep_log_debug("ws-node: recv fwrite failed\n");
 
                                char recv_cmd[2048];
                               snprintf(recv_cmd, sizeof(recv_cmd),
-                                 "zfs recv -F -s -u '%s' 2>/tmp/zep-recv-err.log", local_fs);
+                                 "zfs recv -F -s -u '%s' 2>%s", local_fs, stderr_log);
 
                                FILE *recv_fp = popen(recv_cmd, "w");
                                zep_log("ws-node: pull recv_cmd=%s fp=%p\n", recv_cmd, (void*)recv_fp);
@@ -1294,16 +1297,16 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                               }
 
                               if (pull_exit_code != 0) {
-                                  FILE *ef = fopen("/tmp/zep-recv-err.log", "r");
-                                  if (ef) {
-                                      char ebuf[1024] = {0};
-                                      size_t nr = fread(ebuf, 1, sizeof(ebuf) - 1, ef);
-                                      fclose(ef);
-                                      if (nr > 0) {
-                                          while (nr > 0 && (ebuf[nr-1]=='\n'||ebuf[nr-1]=='\r'))
-                                              ebuf[--nr] = '\0';
-                                          zep_log("ws-node: pull recv stderr: %s\n", ebuf);
-                                      }
+                                   FILE *ef = fopen(stderr_log, "r");
+                                   if (ef) {
+                                       char ebuf[1024] = {0};
+                                       size_t nr = fread(ebuf, 1, sizeof(ebuf) - 1, ef);
+                                       fclose(ef);
+                                       if (nr > 0) {
+                                           while (nr > 0 && (ebuf[nr-1]=='\n'||ebuf[nr-1]=='\r'))
+                                               ebuf[--nr] = '\0';
+                                           zep_log("ws-node: pull recv stderr: %s\n", ebuf);
+                                       }
                                   }
                               }
 
@@ -1333,7 +1336,7 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                       pclose(tp);
                                   }
                                   /* Read stderr from zfs recv */
-                                  FILE *ef = fopen("/tmp/zep-recv-err.log", "r");
+                                   FILE *ef = fopen(stderr_log, "r");
                                   if (ef) {
                                       (void)!fread(stderr_buf, 1, sizeof(stderr_buf) - 1, ef);
                                       fclose(ef);
@@ -1405,9 +1408,9 @@ zep_log_debug("ws-node: recv fwrite failed\n");
 
                              char recv_cmd[2048];
                               snprintf(recv_cmd, sizeof(recv_cmd),
-                                  "zfs recv -F -s -u '%s' 2>/tmp/zep-recv-err.log", local_fs);
+                                 "zfs recv -F -s -u '%s' 2>%s", local_fs, stderr_log);
 
-                              FILE *recv_fp = popen(recv_cmd, "w");
+                               FILE *recv_fp = popen(recv_cmd, "w");
                                 zep_log("ws-node: pull_resume recv_cmd=%s fp=%p\n", recv_cmd, (void*)recv_fp);
 
                                int pull_exit_code = -1;
@@ -1443,15 +1446,15 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                   zep_log("ws-node: pull_resume recv pipe closed rc=%d\n", recv_rc);
                               }
 
-                              if (pull_exit_code != 0) {
-                                  FILE *ef = fopen("/tmp/zep-recv-err.log", "r");
-                                  if (ef) {
-                                      char ebuf[1024] = {0};
-                                      size_t nr = fread(ebuf, 1, sizeof(ebuf) - 1, ef);
-                                      fclose(ef);
-                                      if (nr > 0) {
-                                          while (nr > 0 && (ebuf[nr-1]=='\n'||ebuf[nr-1]=='\r'))
-                                              ebuf[--nr] = '\0';
+                             if (pull_exit_code != 0) {
+                                   FILE *ef = fopen(stderr_log, "r");
+                                   if (ef) {
+                                       char ebuf[1024] = {0};
+                                       size_t nr = fread(ebuf, 1, sizeof(ebuf) - 1, ef);
+                                       fclose(ef);
+                                       if (nr > 0) {
+                                           while (nr > 0 && (ebuf[nr-1]=='\n'||ebuf[nr-1]=='\r'))
+                                               ebuf[--nr] = '\0';
                                           zep_log("ws-node: pull_resume recv stderr: %s\n", ebuf);
                                       }
                                   }
