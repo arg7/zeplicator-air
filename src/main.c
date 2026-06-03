@@ -640,7 +640,7 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                 char _prcmd[2048] = {0};
                 if (pfs[0]) {
                     char rcmd2[2048];
-                    snprintf(rcmd2, sizeof(rcmd2), "zfs recv -F -u '%s'", pfs);
+                    snprintf(rcmd2, sizeof(rcmd2), "zfs recv -F -s -u '%s'", pfs);
                     snprintf(_prcmd, sizeof(_prcmd), "%s", rcmd2);
                     recv_fp = popen(rcmd2, "w");
                     zep_log_debug("ws-node: pull_ws opened recv pipe fs=%s\n", pfs);
@@ -1254,10 +1254,10 @@ zep_log_debug("ws-node: recv fwrite failed\n");
 
                                char recv_cmd[2048];
                               snprintf(recv_cmd, sizeof(recv_cmd),
-                                  "zfs recv -F -s '%s' 2>/tmp/zep-recv-err.log", local_fs);
+                                 "zfs recv -F -s -u '%s' 2>/tmp/zep-recv-err.log", local_fs);
 
-                              FILE *recv_fp = popen(recv_cmd, "w");
-                              zep_log("ws-node: pull recv_cmd=%s fp=%p\n", recv_cmd, (void*)recv_fp);
+                               FILE *recv_fp = popen(recv_cmd, "w");
+                               zep_log("ws-node: pull recv_cmd=%s fp=%p\n", recv_cmd, (void*)recv_fp);
 
                               int pull_exit_code = -1;
 
@@ -1405,10 +1405,10 @@ zep_log_debug("ws-node: recv fwrite failed\n");
 
                              char recv_cmd[2048];
                               snprintf(recv_cmd, sizeof(recv_cmd),
-                                  "zfs recv -F -s '%s' 2>/tmp/zep-recv-err.log", local_fs);
+                                  "zfs recv -F -s -u '%s' 2>/tmp/zep-recv-err.log", local_fs);
 
-                             FILE *recv_fp = popen(recv_cmd, "w");
-                               zep_log("ws-node: pull_resume recv_cmd=%s fp=%p\n", recv_cmd, (void*)recv_fp);
+                              FILE *recv_fp = popen(recv_cmd, "w");
+                                zep_log("ws-node: pull_resume recv_cmd=%s fp=%p\n", recv_cmd, (void*)recv_fp);
 
                                int pull_exit_code = -1;
 

@@ -221,12 +221,13 @@ if [[ "$DO_ZFS" -eq 1 && -n "${ZFS_POOLS:-}" ]]; then
         say "  Created dataset: $pool/$ds"
     done
 
-    # Mount datasets
+    # Mount datasets (only master needs it mounted for file writes; clients stay mountpoint=none for zfs recv)
     say "Mounting ZFS datasets ..."
     for entry in ${NODES:-}; do
         IFS=':' read -r cn role poolfs <<< "$entry"
         pool="${poolfs%%/*}"
         ds="${poolfs#*/}"
+        if [[ "$role" != "master" ]]; then continue; fi
         local_mnt="${ZEP_BASE}/mnt/${pool}/${ds}"
         zfs set mountpoint="${local_mnt}" "${pool}/${ds}" 2>/dev/null || true
         zfs mount "${pool}/${ds}" 2>/dev/null || true
