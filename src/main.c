@@ -556,11 +556,31 @@ zep_log_debug("ws-node: pull_resume guid=%s token=%.20s... fs=%s\n",
                 free(req_json);
 
              FILE *recv_fp = NULL;
-                char _rrecv_cmd[2048] = {0};
+                char _rrecv_cmd[4096] = {0};
                 if (rfs[0]) {
-                    char rcmd2[2048];
-                    snprintf(rcmd2, sizeof(rcmd2),
-                             "zfs recv -F -s -u '%s'", rfs);
+                    char rcmd2[4096];
+                    int rn = 0;
+                    if (cfg->pull_unzip_cmd[0]) {
+                        rn += snprintf(rcmd2 + rn, sizeof(rcmd2) - (size_t)rn,
+                            "%s", cfg->pull_unzip_cmd);
+                    } else if (cfg->pull_buf_cmd[0]) {
+                        rn += snprintf(rcmd2 + rn, sizeof(rcmd2) - (size_t)rn,
+                            "cat");
+                    }
+                    if (cfg->pull_buf_cmd[0]) {
+                        if (rn > 0)
+                            rn += snprintf(rcmd2 + rn, sizeof(rcmd2) - (size_t)rn, " | ");
+                        rn += snprintf(rcmd2 + rn, sizeof(rcmd2) - (size_t)rn,
+                            "%s", cfg->pull_buf_cmd);
+                    }
+                    if (rn > 0) {
+                        rn += snprintf(rcmd2 + rn, sizeof(rcmd2) - (size_t)rn, " | ");
+                    }
+                    rn += snprintf(rcmd2 + rn, sizeof(rcmd2) - (size_t)rn,
+                        "zfs recv %s%s-F -s -u '%s'",
+                        cfg->recv_options[0] ? cfg->recv_options : "",
+                        cfg->recv_options[0] ? " " : "",
+                        rfs);
                     snprintf(_rrecv_cmd, sizeof(_rrecv_cmd), "%s", rcmd2);
                     recv_fp = popen(rcmd2, "w");
 if ((g_logging & LOG_LEVEL_DEBUG) && recv_fp)
@@ -1255,9 +1275,29 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                  continue;
                              }
 
-                               char recv_cmd[2048];
-                              snprintf(recv_cmd, sizeof(recv_cmd),
-                                 "zfs recv -F -s -u '%s' 2>%s", local_fs, stderr_log);
+                                char recv_cmd[4096];
+                                int rn2 = 0;
+                                if (cfg->pull_unzip_cmd[0]) {
+                                    rn2 += snprintf(recv_cmd + rn2, sizeof(recv_cmd) - (size_t)rn2,
+                                        "%s", cfg->pull_unzip_cmd);
+                                } else if (cfg->pull_buf_cmd[0]) {
+                                    rn2 += snprintf(recv_cmd + rn2, sizeof(recv_cmd) - (size_t)rn2,
+                                        "cat");
+                                }
+                                if (cfg->pull_buf_cmd[0]) {
+                                    if (rn2 > 0)
+                                        rn2 += snprintf(recv_cmd + rn2, sizeof(recv_cmd) - (size_t)rn2, " | ");
+                                    rn2 += snprintf(recv_cmd + rn2, sizeof(recv_cmd) - (size_t)rn2,
+                                        "%s", cfg->pull_buf_cmd);
+                                }
+                                if (rn2 > 0) {
+                                    rn2 += snprintf(recv_cmd + rn2, sizeof(recv_cmd) - (size_t)rn2, " | ");
+                                }
+                                rn2 += snprintf(recv_cmd + rn2, sizeof(recv_cmd) - (size_t)rn2,
+                                    "zfs recv %s%s-F -s -u '%s' 2>%s",
+                                    cfg->recv_options[0] ? cfg->recv_options : "",
+                                    cfg->recv_options[0] ? " " : "",
+                                    local_fs, stderr_log);
 
                                FILE *recv_fp = popen(recv_cmd, "w");
                                zep_log("ws-node: pull recv_cmd=%s fp=%p\n", recv_cmd, (void*)recv_fp);
@@ -1406,9 +1446,29 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                  mp2 = comma ? comma + 1 : colon + strlen(colon);
                              }
 
-                             char recv_cmd[2048];
-                              snprintf(recv_cmd, sizeof(recv_cmd),
-                                 "zfs recv -F -s -u '%s' 2>%s", local_fs, stderr_log);
+                              char recv_cmd[4096];
+                              int rn3 = 0;
+                              if (cfg->pull_unzip_cmd[0]) {
+                                  rn3 += snprintf(recv_cmd + rn3, sizeof(recv_cmd) - (size_t)rn3,
+                                      "%s", cfg->pull_unzip_cmd);
+                              } else if (cfg->pull_buf_cmd[0]) {
+                                  rn3 += snprintf(recv_cmd + rn3, sizeof(recv_cmd) - (size_t)rn3,
+                                      "cat");
+                              }
+                              if (cfg->pull_buf_cmd[0]) {
+                                  if (rn3 > 0)
+                                      rn3 += snprintf(recv_cmd + rn3, sizeof(recv_cmd) - (size_t)rn3, " | ");
+                                  rn3 += snprintf(recv_cmd + rn3, sizeof(recv_cmd) - (size_t)rn3,
+                                      "%s", cfg->pull_buf_cmd);
+                              }
+                              if (rn3 > 0) {
+                                  rn3 += snprintf(recv_cmd + rn3, sizeof(recv_cmd) - (size_t)rn3, " | ");
+                              }
+                              rn3 += snprintf(recv_cmd + rn3, sizeof(recv_cmd) - (size_t)rn3,
+                                  "zfs recv %s%s-F -s -u '%s' 2>%s",
+                                  cfg->recv_options[0] ? cfg->recv_options : "",
+                                  cfg->recv_options[0] ? " " : "",
+                                  local_fs, stderr_log);
 
                                FILE *recv_fp = popen(recv_cmd, "w");
                                 zep_log("ws-node: pull_resume recv_cmd=%s fp=%p\n", recv_cmd, (void*)recv_fp);

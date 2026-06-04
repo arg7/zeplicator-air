@@ -129,6 +129,23 @@ else
 fi
 
 ###############################################################################
+# 3.5 Set compression/buffering config (before daemons start)
+###############################################################################
+echo -e "${CYAN}=== Step 3.5: Compression + buffering config ===${NC}"
+$SUDO $ZEP --db "$MASTER_DB" config set push_zip_cmd "zstd -c -1" || true
+$SUDO $ZEP --db "$MASTER_DB" config set push_buf_cmd "cat" || true
+# Clear stale debug inject pipeline cmd from cache
+$SUDO sqlite3 "$MASTER_DB" "DELETE FROM config WHERE key='debug_inject_zfs_pipeline_cmd';" 2>/dev/null || true
+$SUDO sqlite3 "$SERVER_DB" \
+    "INSERT OR REPLACE INTO config VALUES ('push_unzip_cmd', 'zstd -d')" 2>/dev/null || true
+$SUDO sqlite3 "$SERVER_DB" \
+    "INSERT OR REPLACE INTO config VALUES ('pull_zip_cmd', 'zstd -c -1')" 2>/dev/null || true
+$SUDO $ZEP --db "$CLIENT1_DB" config set pull_unzip_cmd "zstd -d" || true
+$SUDO $ZEP --db "$CLIENT1_DB" config set pull_buf_cmd "cat" || true
+$SUDO $ZEP --db "$CLIENT1_DB" config set recv_options "-o canmount=off" || true
+echo "  Compression/buffering config set for master, server, client"
+
+###############################################################################
 # 4. Create snapshots with proper and improper names
 ###############################################################################
 echo -e "${CYAN}=== Step 4: Create snapshots ===${NC}"
@@ -730,6 +747,35 @@ if [[ "$ack_count" -ge 1 ]]; then
     ok "rotate-ack processed $ack_count time(s)"
 else
     bad "rotate-ack NEVER processed (rotation did not fire)"
+fi
+
+###############################################################################
+# 11. Verify compression and buffering options
+###############################################################################
+echo -e "${CYAN}=== Step 11: Compression + buffering verification ===${NC}"
+
+# Verify push compression was used on master
+push_count=$(grep -c "push_send.*zstd -c -1" /tmp/zep-za-master.log 2>/dev/null || echo 0)
+if [[ "$push_count" -ge 1 ]]; then
+    ok "push_zip_cmd (zstd -c -1) used: $push_count push_send events"
+else
+    bad "push_zip_cmd never used in push_send events"
+fi
+
+# Verify pull compression was used on client
+recv_count=$(grep -c "pull recv_cmd=zstd -d" /tmp/zep-za-client-1.log 2>/dev/null || echo 0)
+if [[ "$recv_count" -ge 1 ]]; then
+    ok "pull_unzip_cmd (zstd -d) used: $recv_count pull(s)"
+else
+    bad "pull_unzip_cmd never used in pull recv"
+fi
+
+# Verify recv_options present in pull command
+recv_opt=$(grep "pull recv_cmd.*canmount=off" /tmp/zep-za-client-1.log 2>/dev/null || true)
+if [[ -n "$recv_opt" ]]; then
+    ok "recv_options (-o canmount=off) present in pull recv_cmd"
+else
+    bad "recv_options missing from pull recv_cmd"
 fi
 
 ###############################################################################

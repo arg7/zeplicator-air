@@ -44,6 +44,8 @@ static int  g_setup_mode = 0;
 static int  g_no_tls = 0;
   static int  g_resume = 0;
     static char g_debug_inject_pull_cmd[128] = "";
+    static char g_push_unzip_cmd[128] = "";
+    static char g_pull_zip_cmd[128] = "";
     static struct MHD_Daemon *g_daemon = NULL;
 static sqlite3 *g_db = NULL;
 
@@ -935,6 +937,10 @@ static void node_ws_pull_trigger(struct node_ws *nw, const char *cluster_buf,
                         char pull_cmd[4096];
                         int cn = snprintf(pull_cmd, sizeof(pull_cmd),
                             "cat '%s'", assembled_path);
+                        if (g_pull_zip_cmd[0]) {
+                            cn += snprintf(pull_cmd + cn, sizeof(pull_cmd) - (size_t)cn,
+                                " | %s", g_pull_zip_cmd);
+                        }
                         if (g_debug_inject_pull_cmd[0]) {
                             cn += snprintf(pull_cmd + cn, sizeof(pull_cmd) - (size_t)cn,
                                 " | %s", g_debug_inject_pull_cmd);
@@ -1610,14 +1616,18 @@ static void *node_ws_thread(void *arg) {
                                                zep_log("pull: streaming assembled.zfs for guid=%s status=%s\n",
                                                        guid_j->valuestring, push_status ? push_status : "(none)");
 
-                                               /* Build command: cat assembled.zfs | inject_cmd (optional) */
-                                               char pull_cmd[4096];
-                                               int n = snprintf(pull_cmd, sizeof(pull_cmd),
-                                                   "cat '%s'", assembled_path);
-                                               if (g_debug_inject_pull_cmd[0]) {
-                                                   n += snprintf(pull_cmd + n, sizeof(pull_cmd) - (size_t)n,
-                                                       " | %s", g_debug_inject_pull_cmd);
-                                               }
+                                                /* Build command: cat assembled.zfs | pull_zip_cmd | inject_cmd (optional) */
+                                                char pull_cmd[4096];
+                                                int n = snprintf(pull_cmd, sizeof(pull_cmd),
+                                                    "cat '%s'", assembled_path);
+                                                if (g_pull_zip_cmd[0]) {
+                                                    n += snprintf(pull_cmd + n, sizeof(pull_cmd) - (size_t)n,
+                                                        " | %s", g_pull_zip_cmd);
+                                                }
+                                                if (g_debug_inject_pull_cmd[0]) {
+                                                    n += snprintf(pull_cmd + n, sizeof(pull_cmd) - (size_t)n,
+                                                        " | %s", g_debug_inject_pull_cmd);
+                                                }
                                                zep_log("pull: cmd=%s\n", pull_cmd);
 
                                                FILE *fp = popen(pull_cmd, "r");
@@ -1975,11 +1985,13 @@ static void *node_ws_thread(void *arg) {
                                char assembled_path[ZEP_MAX_PATH * 2 + 256];
                                snprintf(assembled_path, sizeof(assembled_path), "%s/assembled.zfs", snap_dir);
 
-                               /* Per-chunk .zfs file path */
-                               char chunk_path[ZEP_MAX_PATH * 2 + 256];
-                               char chunk_part[16];
-                               snprintf(chunk_part, sizeof(chunk_part), "%04u.zfs", (uint32_t)chunk_num);
-                               snprintf(chunk_path, sizeof(chunk_path), "%s/%s", snap_dir, chunk_part);
+                                /* Per-chunk .zfs file path */
+                                char chunk_path[ZEP_MAX_PATH * 2 + 256];
+                                char chunk_path_raw[ZEP_MAX_PATH * 2 + 256];
+                                char chunk_part[16];
+                                snprintf(chunk_part, sizeof(chunk_part), "%04u.zfs", (uint32_t)chunk_num);
+                                snprintf(chunk_path, sizeof(chunk_path), "%s/%s", snap_dir, chunk_part);
+                                snprintf(chunk_path_raw, sizeof(chunk_path_raw), "%s/%s.raw", snap_dir, chunk_part);
 
                                 /* Clean up assembled.zfs on first push; keep for resume */
                                 if (chunk_num == 0)
@@ -1987,10 +1999,10 @@ static void *node_ws_thread(void *arg) {
 
                                zep_log("push: receiving chunk %s for guid=%s\n", chunk_part, guid);
 
-                               /* Open chunk file */
-                               FILE *fp = fopen(chunk_path, "wb");
-                               if (!fp) {
-                                   zep_log("ws: push fopen failed: %s\n", chunk_path);
+                                /* Open chunk raw file (compressed from node) */
+                                FILE *fp = fopen(chunk_path_raw, "wb");
+                                if (!fp) {
+                                    zep_log("ws: push fopen failed: %s\n", chunk_path_raw);
                                     if (cluster[0]) {
                                         sqlite3_stmt *sf = NULL;
                                         if (sqlite3_prepare_v2(g_db,
@@ -2049,6 +2061,25 @@ static void *node_ws_thread(void *arg) {
                                 }
                                 fclose(fp); fp = NULL;
 
+                                /* Decompress chunk if push_unzip_cmd is configured */
+                                if (g_push_unzip_cmd[0]) {
+                                    char dcmd[1536];
+                                    snprintf(dcmd, sizeof(dcmd),
+                                        "exec %s < '%s' > '%s' 2>/dev/null",
+                                        g_push_unzip_cmd, chunk_path_raw, chunk_path);
+                                    FILE *udp = popen(dcmd, "r");
+                                    int udr = udp ? pclose(udp) : -1;
+                                    if (udr == 0) {
+                                        unlink(chunk_path_raw);
+                                    } else {
+                                        zep_log("push: unzip failed rc=%d for chunk %s\n",
+                                                WIFEXITED(udr) ? WEXITSTATUS(udr) : -1, chunk_part);
+                                        unlink(chunk_path);
+                                    }
+                                } else {
+                                    rename(chunk_path_raw, chunk_path);
+                                }
+
                                 /* Get chunk size */
                                 uint64_t chunk_size = 0;
                                 {
@@ -2061,9 +2092,9 @@ static void *node_ws_thread(void *arg) {
                                if (validate_err != ZEP_ERR_OK) {
                                    /* Garbage — retry same chunk, don't increment counter */
                                    zep_log("push: chunk %s garbage, retrying same chunk for guid=%s\n", chunk_part, guid);
-                                   fp = fopen(chunk_path, "wb");
-                                   if (!fp) {
-                                       zep_log("ws: push fopen failed on retry: %s\n", chunk_path);
+                                    fp = fopen(chunk_path_raw, "wb");
+                                    if (!fp) {
+                                        zep_log("ws: push fopen failed on retry: %s\n", chunk_path_raw);
                                        ws_send_frame_gtls(nw, WS_OP_EXIT, (unsigned char *)&chunk_num, 1);
                                        ws_send_frame_gtls(nw, WS_OP_EOF, NULL, 0);
                                        push_dispatch = 0;
@@ -2091,7 +2122,26 @@ static void *node_ws_thread(void *arg) {
                                        }
                                        if (op == WS_OP_EXIT || op == WS_OP_EOF) break;
                                    }
-                                   fclose(fp); fp = NULL;
+                                fclose(fp); fp = NULL;
+
+                                /* Decompress chunk if push_unzip_cmd is configured */
+                                if (g_push_unzip_cmd[0]) {
+                                    char dcmd[1536];
+                                    snprintf(dcmd, sizeof(dcmd),
+                                        "exec %s < '%s' > '%s' 2>/dev/null",
+                                        g_push_unzip_cmd, chunk_path_raw, chunk_path);
+                                    FILE *udp = popen(dcmd, "r");
+                                    int udr = udp ? pclose(udp) : -1;
+                                    if (udr == 0) {
+                                        unlink(chunk_path_raw);
+                                    } else {
+                                        zep_log("push: unzip failed rc=%d for chunk %s\n",
+                                                WIFEXITED(udr) ? WEXITSTATUS(udr) : -1, chunk_part);
+                                        unlink(chunk_path);
+                                    }
+                                } else {
+                                    rename(chunk_path_raw, chunk_path);
+                                }
 
                                    validate_err = zstream_token_from_file(chunk_path);
                                    if (validate_err != ZEP_ERR_OK) {
@@ -4477,6 +4527,10 @@ case 'v': g_logging = LOG_LEVEL_ALL; break;  /* -v for backwards compat: show al
         char buf[512];
         if (db_config_get(g_db, "debug_inject_pull_cmd", buf, sizeof(buf)) == ZEP_ERR_OK)
             snprintf(g_debug_inject_pull_cmd, sizeof(g_debug_inject_pull_cmd), "%s", buf);
+        if (db_config_get(g_db, "push_unzip_cmd", buf, sizeof(buf)) == ZEP_ERR_OK)
+            snprintf(g_push_unzip_cmd, sizeof(g_push_unzip_cmd), "%s", buf);
+        if (db_config_get(g_db, "pull_zip_cmd", buf, sizeof(buf)) == ZEP_ERR_OK)
+            snprintf(g_pull_zip_cmd, sizeof(g_pull_zip_cmd), "%s", buf);
     }
 
     if (!g_no_tls && g_ca_path[0]) {
