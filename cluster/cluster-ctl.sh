@@ -239,15 +239,22 @@ do_stop() {
             stopped=$((stopped + 1))
         fi
     done
-    # Wait for them to exit
-    for i in $(seq 1 10); do
+    # Wait for them to exit with timeout verification
+    local timeout=3
+    local waited=0
+    while [[ "$waited" -lt "$timeout" ]]; do
         local alive=0
         for pid in $(cron_pids); do is_running "$pid" 2>/dev/null >/dev/null 2>&1 && alive=$((alive + 1)); done
         [[ "$alive" -eq 0 ]] >/dev/null 2>&1 && break
         sleep 1
+        waited=$((waited + 1))
     done
-    # Force kill stragglers
-    for pid in $(cron_pids); do kill -9 "$pid" 2>/dev/null || true; done
+    # If still alive after timeout, use pkill -9
+    if [[ "$waited" -ge "$timeout" ]]; then
+        echo -e "  ${YELLOW}Cron daemons did not terminate within ${timeout}s — using pkill -9${NC}"
+        pkill -9 -f "zep-air.*cron" 2>/dev/null || true
+        pkill -9 -f "zep-air-cron" 2>/dev/null || true
+    fi
     rm -f "$CRON_PIDFILE"
     echo "  ${stopped} cron daemon(s) stopped"
 
@@ -257,11 +264,19 @@ do_stop() {
     spid=$(server_pid)
     if is_running "${spid:-}" 2>/dev/null; then
         kill "$spid" 2>/dev/null || true
-        for i in $(seq 1 10); do
+        # Wait for server to exit with timeout verification
+        local timeout=3
+        local waited=0
+        while [[ "$waited" -lt "$timeout" ]]; do
             is_running "$spid" 2>/dev/null || break
             sleep 1
+            waited=$((waited + 1))
         done
-        kill -9 "$spid" 2>/dev/null || true
+        # If still alive after timeout, use pkill -9
+        if [[ "$waited" -ge "$timeout" ]]; then
+            echo -e "  ${YELLOW}Server did not terminate within ${timeout}s — using pkill -9${NC}"
+            pkill -9 -f "zep-air-serve" 2>/dev/null || true
+        fi
         echo "  Server stopped (was PID $spid)"
     else
         echo "  Server not running"
