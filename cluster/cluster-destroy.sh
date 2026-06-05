@@ -119,8 +119,8 @@ say "Removing node user accounts ..."
 for entry in ${NODES:-}; do
     IFS=':' read -r cn role poolfs <<< "$entry"
     if id "$cn" &>/dev/null 2>&1; then
-        # Kill all processes owned by the user first
-        sudo pkill -u "$cn" 2>/dev/null || true
+        # Kill all processes owned by the user first using PID-based approach
+        ps -u "$cn" -o pid= | xargs -r sudo kill -9 2>/dev/null || true
         # Wait a moment for processes to terminate
         sleep 1
         # Try to remove the user
