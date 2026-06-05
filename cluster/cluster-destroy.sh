@@ -119,7 +119,7 @@ say "Removing node user accounts ..."
 for entry in ${NODES:-}; do
     IFS=':' read -r cn role poolfs <<< "$entry"
     if id "$cn" &>/dev/null 2>&1; then
-        userdel -r "$cn" 2>/dev/null && say "  Removed user: $cn" || warn "  Could not remove user: $cn"
+        sudo userdel -r "$cn" 2>/dev/null && say "  Removed user: $cn" || warn "  Could not remove user: $cn"
     fi
 done
 
