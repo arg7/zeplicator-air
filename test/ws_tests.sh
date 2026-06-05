@@ -802,7 +802,7 @@ fi
 PIPE_ADM="--server https://master.zep.lan:$SERVER_PORT --cert $PKI/admin.crt --key $PKI/admin.key --ca $PKI/ca.crt"
 
 # Ensure pipe_allow is clean
-$ADMIN $PIPE_ADM config set pipe_allow zfs >/dev/null 2>&1
+$ADMIN $PIPE_ADM config set pipe_allow '*' >/dev/null 2>&1
 sleep 1
 
 # Test 12a: Basic single-command pipe — zfs list -t snap
