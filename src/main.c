@@ -51,6 +51,9 @@ static void ws_sigterm_handler(int sig) {
 
 #define WS_NODE_MAGIC "258EAFA5-E914-47DA-95CA-5AB5AC88212E"
 #define WS_NODE_FRAME_MAX (128 * 1024)
+
+static char g_deferred_task[WS_NODE_FRAME_MAX + 1];
+static ssize_t g_deferred_task_len = 0;
 #define WS_NODE_OP_TEXT  0x01
 #define WS_NODE_OP_BIN   0x02
 #define WS_NODE_OP_EOF   0x03
@@ -99,9 +102,14 @@ struct ws_node_conn {
 };
 
 static int ws_node_read(struct ws_node_conn *c, void *buf, int len) {
-    if (c->ssl) return SSL_read(c->ssl, buf, len);
-    return (int)recv(c->sock, buf, (size_t)len, 0);
-}
+     if (c->ssl) {
+         static int read_log = 0;
+         if (++read_log % 20 == 1)
+          zep_log_debug("ws-node: SSL_read(%d) pending=%d\n", len, SSL_pending(c->ssl));
+         return SSL_read(c->ssl, buf, len);
+     }
+     return (int)recv(c->sock, buf, (size_t)len, 0);
+ }
 
 static int ws_node_write(struct ws_node_conn *c, const void *buf, int len) {
     if (c->ssl) return SSL_write(c->ssl, buf, len);
@@ -197,9 +205,7 @@ static ssize_t ws_node_recv_frame(struct ws_node_conn *c, unsigned char *out, si
         total += n;
     }
     *opcode_out = hdr[0] & 0x0F;
-    if ((*opcode_out) == WS_NODE_OP_PING || (*opcode_out) == WS_NODE_OP_PONG) {
-        zep_log_debug( "ws-node: RX %s (%02x) %zuB\n", ws_opname(*opcode_out), *opcode_out, (size_t)payload_len);
-    }
+    zep_log_debug( "ws-node: RX %s (%02x) %zuB\n", ws_opname(*opcode_out), *opcode_out, (size_t)payload_len);
     return (ssize_t)payload_len;
 }
 
@@ -500,6 +506,9 @@ static void *ws_node_pipe_thread(void *arg) {
         /* Wait for pipe task or resume request */
 
         for (;;) {
+            ssize_t n = 0;
+            unsigned char opcode = 0;
+
             fd_set rfds;
             FD_ZERO(&rfds);
             int ws_fd = conn->sock;
@@ -515,16 +524,33 @@ static void *ws_node_pipe_thread(void *arg) {
                  if (g_push_ws_req_pipe[0] > maxfd) maxfd = g_push_ws_req_pipe[0];
              }
             int ssl_pending = (conn->ssl && SSL_pending(conn->ssl) > 0);
-            struct timeval tv = { .tv_sec = ssl_pending ? 0 : 60,
-                                  .tv_usec = 0 };
-            int sel = select(maxfd + 1, &rfds, NULL, NULL,
-                             ssl_pending ? &tv : NULL);
+             static int loop_count = 0;
+             if (++loop_count % 50 == 1)
+              zep_log_debug("ws-node: event loop #%d ssl_pending=%d ws_fd=%d\n", loop_count, ssl_pending, ws_fd);
+             struct timeval tv = { .tv_sec = ssl_pending ? 0 : 60,
+                                   .tv_usec = 0 };
+             int sel = select(maxfd + 1, &rfds, NULL, NULL,
+                              ssl_pending ? &tv : NULL);
+             if (loop_count % 50 == 0)
+              zep_log_debug("ws-node: select returned sel=%d errno=%d\n", sel, sel < 0 ? errno : 0);
             if (sel < 0) {
                 if (errno == EINTR) continue;
                 break;
             }
 
             if (sel == 0 && !ssl_pending) continue;
+
+            /* Reprocess TEXT frame captured during inner push/pull loop */
+            if (g_deferred_task_len > 0) {
+                size_t copy = (size_t)g_deferred_task_len < sizeof(g_deferred_task)-1 ?
+                    (size_t)g_deferred_task_len : sizeof(g_deferred_task)-1;
+                memcpy(out, g_deferred_task, copy);
+                out[copy] = '\0';
+                n = (ssize_t)copy;
+                opcode = WS_NODE_OP_TEXT;
+                g_deferred_task_len = 0;
+                goto process_text_frame;
+            }
 
             if (FD_ISSET(g_resume_req_pipe[0], &rfds)) {
                 char dummy;
@@ -611,6 +637,11 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                     }
                     if (op == WS_NODE_OP_EOF) break;
                     if (op == WS_NODE_OP_EXIT) break;
+                    if (op == WS_NODE_OP_TEXT && rn > 0 && (size_t)rn < sizeof(g_deferred_task)) {
+                        memcpy(g_deferred_task, out, (size_t)rn + 1);
+                        g_deferred_task_len = rn;
+                        ws_err = 1; break;
+                    }
                 }
 
                 int recv_rc = 0;
@@ -691,6 +722,11 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                     }
                     if (op == WS_NODE_OP_EOF) break;
                     if (op == WS_NODE_OP_EXIT) break;
+                    if (op == WS_NODE_OP_TEXT && rn > 0 && (size_t)rn < sizeof(g_deferred_task)) {
+                        memcpy(g_deferred_task, out, (size_t)rn + 1);
+                        g_deferred_task_len = rn;
+                        p_ws_err = 1; break;
+                    }
                 }
 
              int recv_rc = 0;
@@ -818,12 +854,12 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                 continue;
                             }
                             if (op == WS_NODE_OP_PONG) continue;
-                            if (op == WS_NODE_OP_TEXT && rn > 0 && !resume_skipped) {
+                            if (op == WS_NODE_OP_TEXT && rn > 0) {
                                 out[rn] = '\0';
                                 cJSON *resp = cJSON_Parse((char *)out);
                                 if (resp) {
                                     cJSON *res = cJSON_GetObjectItem(resp, "resume");
-                                    if (res && cJSON_IsTrue(res)) {
+                                    if (res && cJSON_IsTrue(res) && !resume_skipped) {
                                         cJSON *off = cJSON_GetObjectItem(resp, "offset");
                                         if (off && cJSON_IsNumber(off) && send_fp && !pipe_eof) {
                                             long skip = (long)off->valuedouble;
@@ -836,9 +872,17 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                             }
                                             zep_log("push_ws: resuming from offset %ld\n", skip);
                                         }
+                                        resume_skipped = 1;
+                                        cJSON_Delete(resp);
+                                        continue;
                                     }
-                                    resume_skipped = 1;
+                                    /* Not a resume — save as deferred task for outer loop */
+                                    if ((size_t)rn < sizeof(g_deferred_task)) {
+                                        memcpy(g_deferred_task, out, (size_t)rn + 1);
+                                        g_deferred_task_len = rn;
+                                    }
                                     cJSON_Delete(resp);
+                                    break;
                                 }
                                 continue;
                             }
@@ -888,8 +932,9 @@ zep_log_debug("ws-node: recv fwrite failed\n");
 
             if (!FD_ISSET(ws_fd, &rfds) && !ssl_pending) continue;
 
-            ssize_t n = ws_node_recv_frame(conn, out, WS_NODE_FRAME_MAX, &buf[0]);
-            unsigned char opcode = buf[0] & 0x0F;
+            n = ws_node_recv_frame(conn, out, WS_NODE_FRAME_MAX, &buf[0]);
+            opcode = buf[0] & 0x0F;
+zep_log_debug("ws-node: RX frame op=%02x n=%zd\n", opcode, n);
 
             if (n < 0) { zep_log_debug( "ws-node: recv error n=%zd op=%02x, reconnecting\n", n, opcode); break; }
             if (opcode == WS_NODE_OP_CLOSE) { zep_log_debug( "ws-node: close n=%zd\n", n); break; }
@@ -898,6 +943,7 @@ zep_log_debug("ws-node: recv fwrite failed\n");
             if (opcode == WS_NODE_OP_EOF) continue;
             if (opcode == WS_NODE_OP_EXIT) continue;
 
+process_text_frame:
             if ((opcode == WS_NODE_OP_TEXT || opcode == WS_NODE_OP_BIN) && n > 0) {
                 out[n] = '\0';
                 cJSON *task = cJSON_Parse((char *)out);
@@ -1323,18 +1369,23 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                       }
                                       continue;
                                   }
-                                  if (op == WS_NODE_OP_EXIT && rn == 1) {
-                                      pull_exit_code = (int)out[0];
-                                  }
-                                  if (op == WS_NODE_OP_EOF) break;
-                              }
+                                   if (op == WS_NODE_OP_EXIT && rn == 1) {
+                                       pull_exit_code = (int)out[0];
+                                   }
+                                   if (op == WS_NODE_OP_EOF) break;
+                                   if (op == WS_NODE_OP_TEXT && rn > 0 && (size_t)rn < sizeof(g_deferred_task)) {
+                                       memcpy(g_deferred_task, out, (size_t)rn + 1);
+                                       g_deferred_task_len = rn;
+                                       break;
+                                   }
+                               }
 
-                              int recv_rc = 0;
-                              if (recv_fp) {
-                                  recv_rc = pclose(recv_fp);
-                                  pull_exit_code = WIFEXITED(recv_rc) ? WEXITSTATUS(recv_rc) : 1;
-                                  zep_log("ws-node: pull recv pipe closed rc=%d\n", recv_rc);
-                              }
+                               int recv_rc = 0;
+                               if (recv_fp) {
+                                   recv_rc = pclose(recv_fp);
+                                   pull_exit_code = WIFEXITED(recv_rc) ? WEXITSTATUS(recv_rc) : 1;
+                                   zep_log("ws-node: pull recv pipe closed rc=%d\n", recv_rc);
+                               }
 
                               if (pull_exit_code != 0) {
                                    FILE *ef = fopen(stderr_log, "r");
@@ -1493,17 +1544,22 @@ zep_log_debug("ws-node: recv fwrite failed\n");
                                        }
                                       continue;
                                   }
-                                  if (op == WS_NODE_OP_EXIT && rn == 1) {
-                                      pull_exit_code = (int)out[0];
-                                  }
-                                  if (op == WS_NODE_OP_EOF) break;
-                              }
+                                   if (op == WS_NODE_OP_EXIT && rn == 1) {
+                                       pull_exit_code = (int)out[0];
+                                   }
+                                   if (op == WS_NODE_OP_EOF) break;
+                                   if (op == WS_NODE_OP_TEXT && rn > 0 && (size_t)rn < sizeof(g_deferred_task)) {
+                                       memcpy(g_deferred_task, out, (size_t)rn + 1);
+                                       g_deferred_task_len = rn;
+                                       break;
+                                   }
+                               }
 
-                              int recv_rc = 0;
-                              if (recv_fp) {
-                                  recv_rc = pclose(recv_fp);
-                                  pull_exit_code = WIFEXITED(recv_rc) ? WEXITSTATUS(recv_rc) : 1;
-                                  zep_log("ws-node: pull_resume recv pipe closed rc=%d\n", recv_rc);
+                               int recv_rc = 0;
+                               if (recv_fp) {
+                                   recv_rc = pclose(recv_fp);
+                                   pull_exit_code = WIFEXITED(recv_rc) ? WEXITSTATUS(recv_rc) : 1;
+                                   zep_log("ws-node: pull_resume recv pipe closed rc=%d\n", recv_rc);
                               }
 
                              if (pull_exit_code != 0) {
