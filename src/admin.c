@@ -858,15 +858,23 @@ static int cmd_pipe(int argc, char *argv[]) {
     time_t tick_prev = pipe_start;
     uint64_t tick_in_prev = 0, tick_out_prev = 0;
 
+    /* Non-blocking stdout to prevent deadlock when pipe is full */
+    int out_flags = fcntl(STDOUT_FILENO, F_GETFL, 0);
+    fcntl(STDOUT_FILENO, F_SETFL, out_flags | O_NONBLOCK);
+    unsigned char *out_buf = NULL;
+    size_t out_buf_len = 0;
+
     for (;;) {
-        fd_set rfds;
+        fd_set rfds, wfds;
         FD_ZERO(&rfds);
+        FD_ZERO(&wfds);
         int maxfd = -1;
         FD_SET(wc->sock, &rfds); if (wc->sock > maxfd) maxfd = wc->sock;
         if (!stdin_done) { FD_SET(STDIN_FILENO, &rfds); if (STDIN_FILENO > maxfd) maxfd = STDIN_FILENO; }
+        if (out_buf_len > 0) { FD_SET(STDOUT_FILENO, &wfds); if (STDOUT_FILENO > maxfd) maxfd = STDOUT_FILENO; }
 
         struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-        int sel = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        int sel = select(maxfd + 1, &rfds, &wfds, NULL, &tv);
         int ssl_pending = (wc->ssl && SSL_pending(wc->ssl) > 0);
 
         if (sel < 0 && errno != EINTR) break;
@@ -883,7 +891,7 @@ static int cmd_pipe(int argc, char *argv[]) {
         }
 
         if (stdin_done && !ws_done && time(NULL) - start_time > 30) {
-            zep_log_debug( "pipe: timeout waiting for remote response\n");
+            zep_log_debug( "pipe: timeout waiting for remote response (30s)\n");
             break;
         }
         if (!stdin_done) start_time = time(NULL);
@@ -907,15 +915,63 @@ static int cmd_pipe(int argc, char *argv[]) {
                 ssize_t n = ws_recv_frame(wc, out, WS_SUBCHUNK, &ws_buf[0]);
                 if (n < 0) { ws_done = 1; break; }
                 unsigned char op = ws_buf[0] & 0x0F;
-                if (op == WS_OP_CLOSE) { ws_done = 1; break; }
+                if (op == WS_OP_CLOSE) {
+                    zep_log_debug("pipe-admin: rx CLOSE, ws_done=1 buf=%zu\n", out_buf_len);
+                    ws_done = 1;
+                    break; /* Exit main loop on CLOSE */
+                }
+                if (op == WS_OP_EXIT && n == 1) {
+                    remote_exit = (int)out[0];
+                    zep_log_debug("pipe-admin: rx EXIT=%d buf=%zu\n", remote_exit, out_buf_len);
+                }
                 if (op == WS_OP_PING) {
                     ws_send_frame_ssl(wc, WS_OP_PONG, out, (size_t)n);
                     continue;
                 }
                 if (op == WS_OP_PONG) continue;
                 if (op == WS_OP_BIN) {
-                    fwrite(out, 1, (size_t)n, stdout); fflush(stdout);
-                    rcvd_stdout += (uint64_t)n;
+                    write_out: {
+                        ssize_t wn;
+                        if (out_buf_len > 0) {
+                            wn = write(STDOUT_FILENO, out_buf, out_buf_len);
+                            if (wn > 0) {
+                                memmove(out_buf, out_buf + wn, out_buf_len - (size_t)wn);
+                                out_buf_len -= (size_t)wn;
+                                if (out_buf_len == 0) { free(out_buf); out_buf = NULL; }
+                                rcvd_stdout += (uint64_t)wn;
+                                goto write_out;
+                            }
+                            if (wn <= 0 && out_buf_len > 0)
+                                zep_log_debug("pipe-admin: write block, buffer drain failed wn=%zd errno=%d buf=%zu new=%zd\n", wn, errno, out_buf_len, n);
+                            unsigned char *nb = realloc(out_buf, out_buf_len + (size_t)n);
+                            if (nb) {
+                                out_buf = nb;
+                                memcpy(out_buf + out_buf_len, out, (size_t)n);
+                                out_buf_len += (size_t)n;
+                            }
+                        } else {
+                            wn = write(STDOUT_FILENO, out, (size_t)n);
+                            if (wn > 0) {
+                                rcvd_stdout += (uint64_t)wn;
+                                if ((size_t)wn < (size_t)n) {
+                                    size_t rem = (size_t)n - (size_t)wn;
+                                    unsigned char *nb = realloc(out_buf, out_buf_len + rem);
+                                    if (nb) {
+                                        out_buf = nb;
+                                        memcpy(out_buf + out_buf_len, out + wn, rem);
+                                        out_buf_len += rem;
+                                    }
+                                }
+                            } else if (wn < 0 && errno == EAGAIN) {
+                                unsigned char *nb = realloc(out_buf, out_buf_len + (size_t)n);
+                                if (nb) {
+                                    out_buf = nb;
+                                    memcpy(out_buf + out_buf_len, out, (size_t)n);
+                                    out_buf_len += (size_t)n;
+                                }
+                            }
+                        }
+                    }
                 }
                 if (op == WS_OP_TEXT) {
                     fwrite(out, 1, (size_t)n, stderr); fflush(stderr);
@@ -925,6 +981,7 @@ static int cmd_pipe(int argc, char *argv[]) {
                 }
                 if (op == WS_OP_EXIT && n == 1) {
                     remote_exit = (int)out[0];
+                    zep_log_debug("pipe-admin: rx EXIT=%d buf=%zu\n", remote_exit, out_buf_len);
                 }
             }
         }
@@ -952,6 +1009,22 @@ static int cmd_pipe(int argc, char *argv[]) {
         }
 
         if (ws_done) break;
+    }
+
+    /* Drain remaining stdout buffer */
+    if (out_buf_len > 0) {
+        fcntl(STDOUT_FILENO, F_SETFL, out_flags);
+        ssize_t wn;
+        while (out_buf_len > 0) {
+            wn = write(STDOUT_FILENO, out_buf, out_buf_len);
+            if (wn <= 0) break;
+            memmove(out_buf, out_buf + wn, out_buf_len - (size_t)wn);
+            out_buf_len -= (size_t)wn;
+            rcvd_stdout += (uint64_t)wn;
+        }
+        free(out_buf);
+    } else {
+        fcntl(STDOUT_FILENO, F_SETFL, out_flags);
     }
 
     free(inbuf);

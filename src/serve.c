@@ -64,6 +64,7 @@ struct node_ws {
     int pipe_starting;
     int pipe_thread_exited;
     int pipe_bridge_active;
+    int pipe_admin_fd;
     pthread_cond_t pipe_ready;
     /* Pipes for inter-thread data transfer */
     int pipe_admin_to_node[2];
@@ -412,10 +413,12 @@ static ssize_t ws_send_frame_gtls(struct node_ws *nw, unsigned char opcode,
      * Our thread writes plaintext to app.socket (sv[0]=nw->sock). MHD reads
      * from mhd.socket, encrypts via GnuTLS, sends to client. No GnuTLS calls
      * from our thread — avoids race with MHD's internal polling thread. */
-    ssize_t sent = 0;
-    while ((size_t)sent < flen) {
-        ssize_t n = send(nw->sock, frame + sent, flen - (size_t)sent, MSG_NOSIGNAL);
-        zep_log_debug("ws_send_frame: sock=%d sent=%zd total=%zu errno=%d\n", nw->sock, n, flen, errno);
+   static int send_log = 0;
+     ssize_t sent = 0;
+     while ((size_t)sent < flen) {
+         ssize_t n = send(nw->sock, frame + sent, flen - (size_t)sent, MSG_NOSIGNAL);
+         if (++send_log % 20 == 1)
+          zep_log_debug("ws_send_frame: sock=%d sent=%zd total=%zu errno=%d\n", nw->sock, n, flen, errno);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
                 fd_set wfds; FD_ZERO(&wfds); FD_SET(nw->sock, &wfds);
@@ -439,13 +442,14 @@ static ssize_t ws_recv_node(struct node_ws *nw, unsigned char *buf, size_t buf_s
     for (;;) {
         ssize_t n = recv(nw->sock, buf, buf_size, 0);
         zep_log_debug("ws_recv_node: sock=%d n=%zd errno=%d\n", nw->sock, n, errno);
-        if (n >= 0) return n;
-        if (errno == EINTR) continue;
+         if (n > 0) return n;
+         if (n == 0) return -1;
+         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) return n;
         /* Non-blocking socket: select + retry, but also handle the race
          * where select says data is available but recv still gets EAGAIN. */
         fd_set rfds; FD_ZERO(&rfds); FD_SET(nw->sock, &rfds);
-        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
         int sel = select(nw->sock + 1, &rfds, NULL, NULL, &tv);
         if (sel <= 0) return -1;
         /* select says data available — try recv again */
@@ -1135,25 +1139,14 @@ static void *node_ws_thread(void *arg) {
             pending_head = 0;
             pending_tail = 0;
         }
-        /* Check if pipe is starting — exit so bridge can take over */
+        /* Check if connection closed */
         pthread_mutex_lock(&nw->lock);
-        int exiting = nw->pipe_starting;
         int closed = nw->ws_closed;
         pthread_mutex_unlock(&nw->lock);
         if (closed) {
             if (g_logging & LOG_LEVEL_DEBUG) {
                 zep_log_debug("ws: node %s closed by new connection\n", nw->cn);
             }
-            break;
-        }
-        if (exiting) {
-            if (g_logging & LOG_LEVEL_DEBUG) {
-                zep_log_debug("ws: node %s exiting for pipe bridge\n", nw->cn);
-            }
-            pthread_mutex_lock(&nw->lock);
-            nw->pipe_thread_exited = 1;
-            pthread_cond_signal(&nw->pipe_ready);
-            pthread_mutex_unlock(&nw->lock);
             break;
         }
 
@@ -1170,16 +1163,18 @@ static void *node_ws_thread(void *arg) {
             last_ping = now;
         }
 
-        /* Periodic scheduler: check if any labels are due */
-        if (strcmp(role_buf, "master") == 0 && cluster_buf[0] && mapping_buf[0]) {
+        /* Periodic scheduler: suppressed during pipe bridge */
+        if (!nw->pipe_bridge_active &&
+            strcmp(role_buf, "master") == 0 && cluster_buf[0] && mapping_buf[0]) {
             if (now - last_scheduler >= 30) {
        scheduler_run(nw, cluster_buf, pending_snaps, pending_labels, &pending_tail, mapping_buf);
                 last_scheduler = now;
             }
         }
 
-        /* Periodic pull check for clients */
-        if (strcmp(role_buf, "client") == 0 && cluster_buf[0] && nw->cn[0]) {
+        /* Periodic pull check for clients: suppressed during pipe bridge */
+        if (!nw->pipe_bridge_active &&
+            strcmp(role_buf, "client") == 0 && cluster_buf[0] && nw->cn[0]) {
             if (now - last_scheduler >= 30) {
                 node_ws_pull_trigger(nw, cluster_buf, role_buf);
                 last_scheduler = now;
@@ -1189,12 +1184,57 @@ static void *node_ws_thread(void *arg) {
         if (sel > 0 && FD_ISSET(nw->sock, &rfds)) {
                 ssize_t plen = ws_recv_frame_full(nw, buf, WS_SUBCHUNK, out, WS_SUBCHUNK, &buf[0]);
                 unsigned char opcode = buf[0] & 0x0F;
+                static int recv_log = 0;
+                if (++recv_log % 20 == 1)
+                  zep_log_debug("ws: event_loop recv plen=%zd op=%02x cn=%s\n", plen, opcode, nw->cn);
                 if (plen < 0) {
                     zep_log_debug( "ws: recv_frame_full failed plen=%zd cn=%s\n", plen, nw->cn);
-                    break;
+                    continue;
                 }
 
-            if (opcode == WS_OP_CLOSE) break;
+            if (opcode == WS_OP_CLOSE) {
+                /* Forward CLOSE to admin during pipe bridge */
+                if (nw->pipe_bridge_active && nw->pipe_admin_fd >= 0) {
+                    unsigned char fbuf[WS_SUBCHUNK + 14];
+                    size_t flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_CLOSE, NULL, 0);
+                    if (flen > 0) send(nw->pipe_admin_fd, fbuf, flen, MSG_NOSIGNAL);
+                }
+                break;
+            }
+
+            /* Pipe bridge active: forward all node frames to admin socket */
+            if (nw->pipe_bridge_active) {
+ zep_log_debug("ws: pipe fwd node->admin op=%02x plen=%zd\n", opcode, plen);
+                unsigned char fbuf[WS_SUBCHUNK + 14];
+                size_t flen = ws_build_frame(fbuf, sizeof(fbuf), opcode, out, (size_t)plen);
+                if (flen > 0 && nw->pipe_admin_fd >= 0) {
+                    ssize_t sent = 0;
+                    while ((size_t)sent < flen) {
+                        ssize_t n = send(nw->pipe_admin_fd, fbuf + sent, flen - (size_t)sent, MSG_NOSIGNAL);
+                        if (n <= 0) break;
+                        sent += n;
+                    }
+                }
+                /* After EXIT frame, close pipe to admin so it exits cleanly */
+                if (opcode == WS_OP_EXIT) {
+ zep_log_debug("ws: pipe got EXIT, sending CLOSE to admin fd=%d\n", nw->pipe_admin_fd);
+                    flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_CLOSE, NULL, 0);
+                    if (flen > 0 && nw->pipe_admin_fd >= 0) {
+                        ssize_t sent = 0;
+                        while ((size_t)sent < flen) {
+                            ssize_t n = send(nw->pipe_admin_fd, fbuf + sent, flen - (size_t)sent, MSG_NOSIGNAL);
+                            if (n <= 0) break;
+                            sent += n;
+                        }
+                    }
+                }
+                continue;
+            }
+            /* Pipe bridge NOT active but we got a pipe frame — data lost */
+            if (opcode == WS_OP_EXIT || opcode == WS_OP_BIN || opcode == WS_OP_EOF)
+                zep_log_debug("ws: pipe UNFORWARDED op=%02x plen=%zd active=%d fd=%d\n",
+                    opcode, plen, nw->pipe_bridge_active, nw->pipe_admin_fd);
+
             if (opcode == WS_OP_PING) {
                 ws_send_frame_gtls(nw, WS_OP_PONG, out, (size_t)plen);
                 continue;
@@ -2051,6 +2091,20 @@ static void *node_ws_thread(void *arg) {
                                         continue;
                                     }
                                     if (op == WS_OP_PONG) continue;
+                                    /* Pipe bridge active: forward frames to admin, not push */
+                                    if (nw->pipe_bridge_active) {
+                                        unsigned char fbuf[WS_SUBCHUNK + 14];
+                                        size_t flen = ws_build_frame(fbuf, sizeof(fbuf), op, out, (size_t)rn);
+                                        if (flen > 0 && nw->pipe_admin_fd >= 0)
+                                            send(nw->pipe_admin_fd, fbuf, flen, MSG_NOSIGNAL);
+                                        if (op == WS_OP_EXIT) {
+                                            flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_CLOSE, NULL, 0);
+                                            if (flen > 0 && nw->pipe_admin_fd >= 0)
+                                                send(nw->pipe_admin_fd, fbuf, flen, MSG_NOSIGNAL);
+                                        }
+                                        if (op == WS_OP_EXIT || op == WS_OP_EOF) break;
+                                        continue;
+                                    }
                                      if (op == WS_OP_BIN && rn > 0) {
                                          if (fwrite(out, 1, (size_t)rn, fp) != (size_t)rn) { zep_log("push: fwrite chunk failed\n"); break; }
                                          zep_log("push: wrote %zd BIN bytes to chunk %s\n", rn, chunk_part);
@@ -2115,6 +2169,20 @@ static void *node_ws_thread(void *arg) {
                                            continue;
                                        }
                                        if (op == WS_OP_PONG) continue;
+                                       /* Pipe bridge active: forward frames to admin, not push */
+                                       if (nw->pipe_bridge_active) {
+                                           unsigned char fbuf[WS_SUBCHUNK + 14];
+                                           size_t flen = ws_build_frame(fbuf, sizeof(fbuf), op, out, (size_t)rn);
+                                           if (flen > 0 && nw->pipe_admin_fd >= 0)
+                                               send(nw->pipe_admin_fd, fbuf, flen, MSG_NOSIGNAL);
+                                           if (op == WS_OP_EXIT) {
+                                               flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_CLOSE, NULL, 0);
+                                               if (flen > 0 && nw->pipe_admin_fd >= 0)
+                                                   send(nw->pipe_admin_fd, fbuf, flen, MSG_NOSIGNAL);
+                                           }
+                                           if (op == WS_OP_EXIT || op == WS_OP_EOF) break;
+                                           continue;
+                                       }
                                        if (op == WS_OP_BIN && rn > 0) {
                                            if (fwrite(out, 1, (size_t)rn, fp) != (size_t)rn) { zep_log("push: fwrite retry chunk failed\n"); break; }
                                            zep_log("push: wrote %zd BIN retry bytes to chunk %s\n", rn, chunk_part);
@@ -2949,163 +3017,71 @@ static int pipe_allowed(const char *command, const char *allowlist) {
     return result;
 }
 
-/* Admin pipe WS upgrade handler - bridges to node WS */
-static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
-                                     void *con_cls, const char *extra_in,
-                                     size_t extra_in_size, int sock,
-                                     struct MHD_UpgradeResponseHandle *urh) {
-    (void)cls; (void)conn; (void)con_cls; (void)extra_in; (void)extra_in_size;
+/* Pipe bridge thread — runs admin→node forwarding in a separate thread so
+ * MHD's internal polling thread remains free to poll the node's TLS socket. */
+static void *ws_pipe_bridge_thread(void *arg) {
+     pthread_detach(pthread_self());
+     struct node_ws *nw = (struct node_ws *)arg;
+     int sock = nw->pipe_admin_fd;
+     if (sock < 0) { return NULL; }
 
-    const char *node_cn = (const char *)cls;
-    if (!node_cn) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
-
-    ws_set_keepalive(sock);
-
-    /* Find node connection */
-    struct node_ws *nw = node_ws_find(node_cn);
-    if (!nw) {
-        zep_log( "ws: pipe request for %s — not connected\n", node_cn);
-        fflush(stderr);
-        MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
-        return;
-    }
-zep_log_debug("ws: pipe found node %s sock=%d\n", node_cn, nw->sock);
-
-    /* Check pipe_allow before taking over node thread */
-    const char *command = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "command");
-    const char *interactive = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "interactive");
-    int is_interactive = (interactive && strcmp(interactive, "1") == 0);
-    if (command) {
-
-        char pipe_allow[2048] = {0};
-        db_config_get(g_db, "pipe_allow", pipe_allow, sizeof(pipe_allow));
-        if (!pipe_allow[0]) snprintf(pipe_allow, sizeof(pipe_allow), "zfs");
-
-        if (!pipe_allowed(command, pipe_allow)) {
-            zep_log( "ws: pipe denied for '%s' to node %s\n", command, node_cn);
-            char errmsg[512];
-            int elen = snprintf(errmsg, sizeof(errmsg), "pipe: access denied for '%s'", command);
-            unsigned char fbuf[2048];
-            size_t flen;
-            flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_TEXT, (unsigned char *)errmsg, (size_t)elen);
-            if (flen > 0) send(sock, fbuf, flen, MSG_NOSIGNAL);
-            flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_EXIT, (unsigned char *)"\x01", 1);
-            if (flen > 0) send(sock, fbuf, flen, MSG_NOSIGNAL);
-            flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_CLOSE, NULL, 0);
-            if (flen > 0) send(sock, fbuf, flen, MSG_NOSIGNAL);
-            MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
-            return;
-        }
-    }
-
-    /* Signal node thread to exit so we can take over the socket */
-    pthread_mutex_lock(&nw->lock);
-    nw->pipe_starting = 1;
-    pthread_mutex_unlock(&nw->lock);
-
-    /* Wait for node thread to signal it has exited */
-    {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += 5;
-        pthread_mutex_lock(&nw->lock);
-        while (!nw->pipe_thread_exited) {
-            pthread_cond_timedwait(&nw->pipe_ready, &nw->lock, &ts);
-        }
-        pthread_mutex_unlock(&nw->lock);
-    }
-
-    /* Mark bridge as active so node thread doesn't free nw */
-    nw->pipe_bridge_active = 1;
-
-    /* Join the node thread to ensure it is fully dead */
-    pthread_join(nw->thread, NULL);
-
-   zep_log_debug("ws: node %s thread joined, pipe taking over\n", node_cn);
-
-    /* Bridge: admin socket ↔ node WS via socketpair (nw->sock) */
-    int node_fd = nw->sock;
-    int admin_raw_fd = sock;
-
-    /* Send task JSON to node */
-    if (command) {
-        cJSON *task = cJSON_CreateObject();
-        cJSON_AddStringToObject(task, "action", "pipe");
-        cJSON_AddStringToObject(task, "command", command);
-        if (is_interactive) cJSON_AddBoolToObject(task, "interactive", 1);
-        char *task_json = cJSON_PrintUnformatted(task);
-        if (task_json) {
-zep_log_debug("ws: sending task to node: %s\n", task_json);
-            ws_send_frame_gtls(nw, WS_OP_TEXT, (unsigned char *)task_json, strlen(task_json));
-            free(task_json);
-        }
-        cJSON_Delete(task);
-    }
-
-    /* Bridge: admin socket ↔ node WS */
     ws_make_blocking(sock);
-    ws_make_blocking(node_fd);
     unsigned char *admin_buf = malloc(WS_ADMIN_BUF);
     size_t admin_acc_len = 0;
-    unsigned char *node_buf = malloc(WS_SUBCHUNK);
-    unsigned char *admin_out = malloc(WS_SUBCHUNK);
-    unsigned char *node_out = malloc(WS_SUBCHUNK);
-    if (!admin_buf || !node_buf || !admin_out || !node_out) {
-        free(admin_buf); free(node_buf); free(admin_out); free(node_out);
-        MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
-        return;
-    }
+    if (!admin_buf) { return NULL; }
 
-    int admin_alive = 1, node_alive = 1;
+    int admin_alive = 1;
+    int loop_count = 0;
+    time_t last_activity = time(NULL);
     for (;;) {
+        if (++loop_count % 200 == 1)
+ zep_log_debug("ws: pipe bridge loop %d admin=%d\n", loop_count, admin_alive);
+        /* Check node still connected */
+        pthread_mutex_lock(&nw->lock);
+        int node_dead = nw->ws_closed;
+        pthread_mutex_unlock(&nw->lock);
+        if (node_dead) {
+                zep_log_debug("ws: pipe bridge node disconnected, exiting\n");
+                break;
+            }
+            if (!admin_alive) {
+                zep_log_debug("ws: pipe bridge admin disconnected, exiting\n");
+                break;
+            }
+
+        /* Idle timeout: if no data from admin for 15s, exit */
+        if (time(NULL) - last_activity > 15) {
+ zep_log_debug("ws: pipe bridge idle timeout (%llds) - no data from admin\n", (long long)(time(NULL) - last_activity));
+            break;
+        }
+
         struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
         fd_set rfds;
         FD_ZERO(&rfds);
-        int maxfd = 0;
-             if (admin_alive) { FD_SET(admin_raw_fd, &rfds); if (admin_raw_fd > maxfd) maxfd = admin_raw_fd; }
-        if (node_alive) { FD_SET(node_fd, &rfds); if (node_fd > maxfd) maxfd = node_fd; }
-        int sel = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        FD_SET(sock, &rfds);
+        int sel = select(sock + 1, &rfds, NULL, NULL, &tv);
 
-        if (sel > 0) {
-            /* Admin → Node: read raw bytes into accumulator */
-            if (admin_alive && FD_ISSET(admin_raw_fd, &rfds)) {
-                unsigned char tmp[16384];
-                ssize_t n = recv(sock, tmp, sizeof(tmp), 0);
-                if (n <= 0) {
-                    admin_alive = 0;
-                } else if (admin_acc_len + (size_t)n > WS_ADMIN_BUF) {
-                    admin_alive = 0;
-                } else {
-                    memcpy(admin_buf + admin_acc_len, tmp, (size_t)n);
-                    admin_acc_len += (size_t)n;
-                }
+        if (sel > 0 && FD_ISSET(sock, &rfds)) {
+            unsigned char tmp[16384];
+            ssize_t n = recv(sock, tmp, sizeof(tmp), 0);
+ zep_log_debug("ws: pipe bridge recv n=%zd errno=%d\n", n, n < 0 ? errno : 0);
+            if (n <= 0) {
+                admin_alive = 0;
+                zep_log_debug("ws: pipe bridge recv EOF or error n=%zd errno=%d, admin_alive=0\n", n, n < 0 ? errno : 0);
+                break; /* Exit immediately on admin disconnect */
+            } else if (admin_acc_len + (size_t)n > WS_ADMIN_BUF) {
+                admin_alive = 0;
+                zep_log_debug("ws: pipe bridge buffer overflow, admin_alive=0\n");
+                break; /* Exit immediately on buffer overflow */
+            } else {
+                memcpy(admin_buf + admin_acc_len, tmp, (size_t)n);
+                admin_acc_len += (size_t)n;
+                last_activity = time(NULL);
             }
 
-            /* Node → Admin: forward all BIN and TEXT frames */
-                     if (node_alive && FD_ISSET(node_fd, &rfds)) {
-                ssize_t plen = ws_recv_frame_full(nw, node_buf, WS_SUBCHUNK, node_out, WS_SUBCHUNK, &node_buf[0]);
-                if (plen < 0) { node_alive = 0; }
-                else {
-                    unsigned char opcode = node_buf[0] & 0x0F;
-                    if (opcode == WS_OP_CLOSE) {
-                        node_alive = 0;
-                    }
-                    else if (opcode == WS_OP_PING) {
-                        ws_send_frame_gtls(nw, WS_OP_PONG, node_out, (size_t)plen);
-                    }
-                    else if (admin_alive && (opcode == WS_OP_BIN || opcode == WS_OP_TEXT || opcode == WS_OP_EOF || opcode == WS_OP_EXIT)) {
-                        unsigned char fbuf[WS_SUBCHUNK + 14];
-                        size_t flen = ws_build_frame(fbuf, sizeof(fbuf), opcode, node_out, (size_t)plen);
-                        if (flen > 0) {
-                            ssize_t sent = 0;
-                            while ((size_t)sent < flen) {
-                                ssize_t n = send(sock, fbuf + sent, flen - (size_t)sent, MSG_NOSIGNAL);
-                                if (n <= 0) break;
-                                sent += n;
-                            }
-                        }
-                    }
-                }
+            /* If admin disconnected, break out of main loop */
+            if (!admin_alive) {
+                break;
             }
         }
 
@@ -3134,46 +3110,139 @@ zep_log_debug("ws: sending task to node: %s\n", task_json);
             if (admin_acc_len < ftot) break;
 
             if (aop == WS_OP_CLOSE) {
-                if (node_alive)
-                    ws_send_frame_gtls(nw, WS_OP_CLOSE, NULL, 0);
                 admin_alive = 0;
             } else if (aop == WS_OP_PING) {
                 unsigned char fbuf[WS_SUBCHUNK + 14];
-                size_t flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_PONG, admin_buf + hlen, (size_t)plen_val);
+                size_t flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_PONG,
+                    admin_buf + hlen, (size_t)plen_val);
                 if (flen > 0) send(sock, fbuf, flen, MSG_NOSIGNAL);
-            } else if (node_alive && (aop == WS_OP_BIN || aop == WS_OP_TEXT || aop == WS_OP_EOF || aop == WS_OP_EXIT)) {
-                if (ws_send_frame_gtls(nw, aop, admin_buf + hlen, (size_t)plen_val) < 0)
-                    node_alive = 0;
+            } else if (aop == WS_OP_BIN || aop == WS_OP_TEXT || aop == WS_OP_EOF || aop == WS_OP_EXIT) {
+                if (ws_send_frame_gtls(nw, aop, admin_buf + hlen, (size_t)plen_val) < 0) {
+                    /* MHD socketpair send failed — node likely disconnected */
+                }
             }
 
             memmove(admin_buf, admin_buf + ftot, admin_acc_len - ftot);
             admin_acc_len -= ftot;
         }
+    }
 
-        if (!admin_alive && node_alive) {
-            ws_send_frame_gtls(nw, WS_OP_CLOSE, NULL, 0);
+ zep_log_debug("ws: pipe bridge ended admin=%d loops=%d\n", admin_alive, loop_count);
+    /* Cleanup: clear pipe bridge flags */
+    pthread_mutex_lock(&nw->lock);
+    nw->pipe_bridge_active = 0;
+    nw->pipe_admin_fd = -1;
+    pthread_mutex_unlock(&nw->lock);
+
+    /* Send CLOSE to admin before exiting */
+    if (admin_alive && sock >= 0) {
+        unsigned char fbuf[WS_SUBCHUNK + 14];
+        size_t flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_CLOSE, NULL, 0);
+        if (flen > 0) {
+            ssize_t sent = 0;
+            while ((size_t)sent < flen) {
+                ssize_t n = send(sock, fbuf + sent, flen - (size_t)sent, MSG_NOSIGNAL);
+                if (n <= 0) break;
+                sent += n;
+            }
         }
-
-        if (!admin_alive || !node_alive) break;
     }
 
-zep_log_debug("ws: pipe bridge ended admin=%d node=%d\n", admin_alive, node_alive);
-
-    {
-        unsigned char cbuf[14];
-        size_t clen = ws_build_frame(cbuf, sizeof(cbuf), WS_OP_CLOSE, NULL, 0);
-        send(sock, cbuf, clen, MSG_NOSIGNAL);
-    }
-    MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
-
-    free(admin_buf); free(node_buf); free(admin_out); free(node_out);
-
-    /* Free nw — node thread skipped free due to pipe_bridge_active */
-    free(nw);
-
-    /* Don't unregister node — it reconnects on its own */
+    free(admin_buf);
+    /* Note: sock (pipe_admin_fd) is owned by MHD — don't close it */
+    return NULL;
 }
 
+/* Admin pipe WS upgrade handler - bridges to node WS */
+static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
+                                      void *con_cls, const char *extra_in,
+                                      size_t extra_in_size, int sock,
+                                      struct MHD_UpgradeResponseHandle *urh) {
+    (void)cls; (void)conn; (void)con_cls; (void)extra_in; (void)extra_in_size;
+
+    const char *node_cn = (const char *)cls;
+    if (!node_cn) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
+
+    ws_set_keepalive(sock);
+
+    /* Find node connection */
+    struct node_ws *nw = node_ws_find(node_cn);
+    if (!nw) {
+        zep_log( "ws: pipe request for %s — not connected\n", node_cn);
+        fflush(stderr);
+        MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
+        return;
+    }
+ zep_log_debug("ws: pipe found node %s sock=%d\n", node_cn, nw->sock);
+
+    /* Check pipe_allow */
+    const char *command = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "command");
+    const char *interactive = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "interactive");
+    int is_interactive = (interactive && strcmp(interactive, "1") == 0);
+    if (command) {
+
+        char pipe_allow[2048] = {0};
+        db_config_get(g_db, "pipe_allow", pipe_allow, sizeof(pipe_allow));
+        if (!pipe_allow[0]) snprintf(pipe_allow, sizeof(pipe_allow), "zfs");
+
+        if (!pipe_allowed(command, pipe_allow)) {
+            zep_log( "ws: pipe denied for '%s' to node %s\n", command, node_cn);
+            char errmsg[512];
+            int elen = snprintf(errmsg, sizeof(errmsg), "pipe: access denied for '%s'", command);
+            unsigned char fbuf[2048];
+            size_t flen;
+            flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_TEXT, (unsigned char *)errmsg, (size_t)elen);
+            if (flen > 0) send(sock, fbuf, flen, MSG_NOSIGNAL);
+            flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_EXIT, (unsigned char *)"\x01", 1);
+            if (flen > 0) send(sock, fbuf, flen, MSG_NOSIGNAL);
+            flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_CLOSE, NULL, 0);
+            if (flen > 0) send(sock, fbuf, flen, MSG_NOSIGNAL);
+            MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
+            return;
+        }
+    }
+
+    /* Activate cooperative pipe bridge — serve.c event loop forwards node→admin,
+     * bridge thread handles admin→node.  Spawn in a new thread so MHD's internal
+     * polling thread remains free to poll the node's TLS socket. */
+    pthread_mutex_lock(&nw->lock);
+    nw->pipe_bridge_active = 1;
+    nw->pipe_admin_fd = sock;
+    pthread_mutex_unlock(&nw->lock);
+
+    /* Send task JSON to node */
+    if (command) {
+        cJSON *task = cJSON_CreateObject();
+        cJSON_AddStringToObject(task, "action", "pipe");
+        cJSON_AddStringToObject(task, "command", command);
+        if (is_interactive) cJSON_AddBoolToObject(task, "interactive", 1);
+        char *task_json = cJSON_PrintUnformatted(task);
+        if (task_json) {
+ zep_log_debug("ws: sending pipe task to node: %s\n", task_json);
+            ws_send_frame_gtls(nw, WS_OP_TEXT, (unsigned char *)task_json, strlen(task_json));
+            free(task_json);
+        }
+        cJSON_Delete(task);
+    }
+
+ zep_log_debug("ws: pipe admin→node bridge starting (admin_fd=%d)\n", sock);
+
+    /* Spawn bridge thread — MHD resumes internal polling immediately */
+    pthread_t bridge_thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED);
+    if (pthread_create(&bridge_thread, &attr, ws_pipe_bridge_thread, nw) != 0) {
+        zep_log( "ws: pipe bridge thread create failed\n");
+        pthread_mutex_lock(&nw->lock);
+        nw->pipe_bridge_active = 0;
+        nw->pipe_admin_fd = -1;
+        pthread_mutex_unlock(&nw->lock);
+        MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
+    }
+    pthread_attr_destroy(&attr);
+    // thread not detached — MHD joins on connection cleanup
+}
 static enum MHD_Result ws_handle_node(struct MHD_Connection *conn,
                                        const char *cn) {
 zep_log_debug("ws: node upgrade request for %s\n", cn);
@@ -3682,6 +3751,8 @@ zep_log_debug("config set: key=%s body_len=%zu body=%.*s\n",
 
     /* ── WebSocket: admin pipe connection ── */
     if (strncmp(ctx->target_url, "/v1/ws/pipe", 11) == 0) {
+        if (strcmp(ctx->role, "admin") != 0)
+            return send_error(conn, 403, "Admin role required", ctx);
         const char *node_cn = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "node");
         if (!node_cn || !node_cn[0]) return send_error(conn, 400, "Missing node parameter", ctx);
         return ws_handle_pipe(conn, node_cn);
