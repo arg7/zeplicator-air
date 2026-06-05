@@ -268,6 +268,7 @@ static int ws_node_connect(struct ws_node_conn *c, const char *server_url, const
     }
     freeaddrinfo(res);
     { struct timeval tv = { .tv_sec = 90, .tv_usec = 0 }; setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
+    { int bufsz = 1024 * 1024; setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz)); setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz)); }
 
     c->sock = sock;
 
@@ -979,6 +980,17 @@ process_text_frame:
                             argv_buf[argc2] = NULL;
                             if (argc2 == 0) { free(cmd_copy); cJSON_Delete(task); continue; }
 
+                            char *wrapped_cmd = NULL;
+                            const char *exec_cmd = cmd_str;
+                            int force_pipe = 0;
+                            if (cfg->pipe_buf_cmd[0]) {
+                                if (asprintf(&wrapped_cmd, "%s | %s", cmd_str, cfg->pipe_buf_cmd) >= 0) {
+                                    exec_cmd = wrapped_cmd;
+                                    force_pipe = 1;
+                                }
+                            }
+                            int use_pipe = has_pipe || force_pipe;
+
                             cJSON *interactive = cJSON_GetObjectItem(task, "interactive");
                             int is_interactive = (interactive && cJSON_IsTrue(interactive));
 
@@ -987,14 +999,15 @@ process_text_frame:
                                 pid_t pid = forkpty(&pty_master, NULL, NULL, NULL);
                                 if (pid < 0) {
                                     free(cmd_copy);
+                                    free(wrapped_cmd);
                                     zep_log( "ws-node: forkpty() failed\n");
                                     cJSON_Delete(task);
                                     continue;
                                 }
 
                                 if (pid == 0) {
-                                    if (has_pipe)
-                                        execl("/bin/sh", "sh", "-c", cmd_str, (char *)NULL);
+                                    if (use_pipe)
+                                        execl("/bin/sh", "sh", "-c", exec_cmd, (char *)NULL);
                                     else
                                         execvp(argv_buf[0], argv_buf);
                                     dprintf(STDERR_FILENO, "exec: %s\n", strerror(errno));
@@ -1002,12 +1015,13 @@ process_text_frame:
                                 }
 
                                 free(cmd_copy);
+                                free(wrapped_cmd);
                                 fcntl(pty_master, F_SETFL, fcntl(pty_master, F_GETFL) | O_NONBLOCK);
 
                                 int pty_alive = 1;
                                 int ws_alive = 1;
 
-                                zep_log_debug( "ws-node: interactive pipe started: %s pid=%d\n", cmd_str, (int)pid);
+                                zep_log_debug( "ws-node: interactive pipe started: %s pid=%d\n", exec_cmd, (int)pid);
 
                                 int ws_fd = conn->sock;
                                 int ws_flags = fcntl(ws_fd, F_GETFL, 0);
@@ -1101,6 +1115,8 @@ process_text_frame:
                             int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2];
                             if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
                                 zep_log( "ws-node: pipe() failed\n");
+                                free(cmd_copy);
+                                free(wrapped_cmd);
                                 cJSON_Delete(task);
                                 continue;
                             }
@@ -1108,6 +1124,7 @@ process_text_frame:
                             pid_t pid = fork();
                             if (pid < 0) {
                                 free(cmd_copy);
+                                free(wrapped_cmd);
                                 zep_log( "ws-node: fork() failed\n");
                                 close(stdin_pipe[0]); close(stdin_pipe[1]);
                                 close(stdout_pipe[0]); close(stdout_pipe[1]);
@@ -1126,8 +1143,8 @@ process_text_frame:
                                 close(stdin_pipe[0]);
                                 close(stdout_pipe[1]);
                                 close(stderr_pipe[1]);
-                                if (has_pipe) {
-                                    execl("/bin/sh", "sh", "-c", cmd_str, (char *)NULL);
+                                if (use_pipe) {
+                                    execl("/bin/sh", "sh", "-c", exec_cmd, (char *)NULL);
                                     dprintf(STDERR_FILENO, "exec: /bin/sh: %s\n", strerror(errno));
                                 } else {
                                     execvp(argv_buf[0], argv_buf);
@@ -1152,7 +1169,8 @@ process_text_frame:
                             unsigned char *pending_data = NULL;
                             ssize_t pending_len = 0;
 
-                            zep_log_debug( "ws-node: pipe started: %s pid=%d\n", cmd_str, (int)pid);
+                            zep_log_debug( "ws-node: pipe started: %s pid=%d\n", exec_cmd, (int)pid);
+                            free(wrapped_cmd);
 
                             int ws_fd = conn->sock;
                             int ws_flags = fcntl(ws_fd, F_GETFL, 0);

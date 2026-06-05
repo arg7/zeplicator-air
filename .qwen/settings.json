@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sudo *)",
+      "Bash(true)",
+      "Bash(grep *)",
+      "Bash(zfs *)",
+      "Bash(pkill *)",
+      "Bash(sleep *)",
+      "Bash(kill *)",
+      "Bash(make)",
+      "Bash(md5sum *)",
+      "Bash(time *)",
+      "Bash(chmod *)",
+      "Bash(cp *)",
+      "Bash(fuser *)",
+      "Bash(lsof *)",
+      "Bash(touch *)",
+      "Bash(python3 *)",
+      "Bash(strings *)"
+    ]
+  },
+  "$version": 4
+}

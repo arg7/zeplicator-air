@@ -242,6 +242,8 @@ static ws_conn_t *ws_connect(const char *server_url, const char *path) {
     }
     freeaddrinfo(res);
 
+    { int bufsz = 1024 * 1024; setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz)); setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz)); }
+
     /* TLS */
     SSL_CTX *ctx = NULL;
     SSL *ssl = NULL;

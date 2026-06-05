@@ -186,6 +186,7 @@ err_t db_config_load(sqlite3 *db, zep_config_t *cfg) {
     db_config_get(db, "debug_inject_zfs_pipeline_cmd", cfg->debug_inject_zfs_pipeline_cmd, sizeof(cfg->debug_inject_zfs_pipeline_cmd));
     db_config_get(db, "debug_inject_pull_cmd", cfg->debug_inject_pull_cmd, sizeof(cfg->debug_inject_pull_cmd));
     db_config_get(db, "pipe_allow", cfg->pipe_allow, sizeof(cfg->pipe_allow));
+    db_config_get(db, "pipe_buf_cmd", cfg->pipe_buf_cmd, sizeof(cfg->pipe_buf_cmd));
 
     if (!cfg->pipe_allow[0]) snprintf(cfg->pipe_allow, sizeof(cfg->pipe_allow), "zfs");
 

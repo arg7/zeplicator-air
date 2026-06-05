@@ -529,6 +529,12 @@ static void ws_set_keepalive(int fd) {
 #endif
 }
 
+static void ws_set_sockbuf(int fd) {
+    int bufsz = 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
+}
+
 
 struct node_ws_thread_ctx {
     struct node_ws *nw;
@@ -1227,6 +1233,10 @@ static void *node_ws_thread(void *arg) {
                             sent += n;
                         }
                     }
+                    pthread_mutex_lock(&nw->lock);
+                    nw->pipe_bridge_active = 0;
+                    nw->pipe_admin_fd = -1;
+                    pthread_mutex_unlock(&nw->lock);
                 }
                 continue;
             }
@@ -2813,6 +2823,7 @@ static void ws_node_upgrade_handler(void *cls, struct MHD_Connection *conn,
     if (!cn) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
 
     ws_set_keepalive(sock);
+    ws_set_sockbuf(sock);
 
     struct node_ws *nw = node_ws_register(cn, sock);
     if (!nw) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
@@ -3049,8 +3060,8 @@ static void *ws_pipe_bridge_thread(void *arg) {
                 break;
             }
 
-        /* Idle timeout: if no data from admin for 15s, exit */
-        if (time(NULL) - last_activity > 15) {
+        /* Idle timeout: if no data from admin for 300s, exit */
+        if (time(NULL) - last_activity > 300) {
  zep_log_debug("ws: pipe bridge idle timeout (%llds) - no data from admin\n", (long long)(time(NULL) - last_activity));
             break;
         }
@@ -3128,25 +3139,8 @@ static void *ws_pipe_bridge_thread(void *arg) {
     }
 
  zep_log_debug("ws: pipe bridge ended admin=%d loops=%d\n", admin_alive, loop_count);
-    /* Cleanup: clear pipe bridge flags */
-    pthread_mutex_lock(&nw->lock);
-    nw->pipe_bridge_active = 0;
-    nw->pipe_admin_fd = -1;
-    pthread_mutex_unlock(&nw->lock);
-
-    /* Send CLOSE to admin before exiting */
-    if (admin_alive && sock >= 0) {
-        unsigned char fbuf[WS_SUBCHUNK + 14];
-        size_t flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_CLOSE, NULL, 0);
-        if (flen > 0) {
-            ssize_t sent = 0;
-            while ((size_t)sent < flen) {
-                ssize_t n = send(sock, fbuf + sent, flen - (size_t)sent, MSG_NOSIGNAL);
-                if (n <= 0) break;
-                sent += n;
-            }
-        }
-    }
+    /* pipe_bridge_active and pipe_admin_fd are cleared by the event loop
+     * after forwarding EXIT to admin — not here. */
 
     free(admin_buf);
     /* Note: sock (pipe_admin_fd) is owned by MHD — don't close it */
@@ -3164,6 +3158,7 @@ static void ws_pipe_upgrade_handler(void *cls, struct MHD_Connection *conn,
     if (!node_cn) { MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE); return; }
 
     ws_set_keepalive(sock);
+    ws_set_sockbuf(sock);
 
     /* Find node connection */
     struct node_ws *nw = node_ws_find(node_cn);

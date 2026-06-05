@@ -5,7 +5,7 @@ LDFLAGS  = $(shell pkg-config --libs openssl libcurl sqlite3 libcjson libmicroht
 SERV_LDFLAGS = $(LDFLAGS) $(shell pkg-config --libs gnutls) -fsanitize=address
 
 ifdef RELEASE
-  CFLAGS   := -Wall -Wextra -Werror -g -O2 -std=c11 -D_GNU_SOURCE
+  CFLAGS   := -Wall -Wextra -Werror -g -O2 -std=c11 -D_GNU_SOURCE -Wno-format-truncation
   CFLAGS  += $(shell pkg-config --cflags openssl libcurl sqlite3 libcjson libmicrohttpd)
   LDFLAGS  = $(shell pkg-config --libs openssl libcurl sqlite3 libcjson libmicrohttpd) -lzstd -lm
   SERV_LDFLAGS = $(LDFLAGS) $(shell pkg-config --libs gnutls)

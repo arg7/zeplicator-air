@@ -65,6 +65,7 @@ typedef struct {
     char debug_inject_zfs_pipeline_cmd[128];
     char debug_inject_pull_cmd[128];
     char pipe_allow[2048];
+    char pipe_buf_cmd[128];
     int  send_all_snap;
     int  resume;
     size_t chunk_size;
