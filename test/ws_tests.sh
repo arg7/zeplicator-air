@@ -31,6 +31,7 @@ NODE_CNF_DIR="/tmp/zep-discovery-cnf"
 
 MASTER_DB="/var/lib/zep-air/home/za-master/za-master.db"
 CLIENT1_DB="/var/lib/zep-air/home/za-client-1/za-client-1.db"
+CLIENT2_DB="/var/lib/zep-air/home/za-client-2/za-client-2.db"
 SERVER_DB="/var/lib/zep-air/server.db"
 PKI="/var/lib/zep-air/pki"
 
@@ -49,6 +50,9 @@ bad() { echo -e "  ${RED}FAIL${NC} $1"; fail=$((fail+1)); }
 cleanup() {
     # Stop server and cron
     $SUDO cluster/cluster-ctl.sh --env "$ENV_FILE" stop 2>/dev/null || true
+    # Kill client-2 cron
+    kill $CLIENT2_PID 2>/dev/null || true
+    pkill -f "za-client-2.*cron" 2>/dev/null || true
     # Kill anything lingering
     pkill -9 zep-air-serve || true
     pkill -9 zep-air || true
@@ -178,7 +182,7 @@ echo -e "${CYAN}=== Step 5: Start server + cron daemon ===${NC}"
 $SUDO rm -f "$SERV_LOG" /tmp/zep-server.log /tmp/zep-za-master.log 2>/dev/null || true
 
 # Start server with verbose logging — stderr goes to log, stdout stays clean
-ASAN_OPTIONS=detect_leaks=0 $SERV --logging DEBUG,INFO,WARN,ERROR,AUDIT --port "$SERVER_PORT" \
+$SERV --logging DEBUG,INFO,WARN,ERROR,AUDIT --port "$SERVER_PORT" \
     --cert "$PKI/server.crt" --key "$PKI/server.key" \
     --ca "$PKI/ca.crt" --db "$SERVER_DB" \
     --storage "/var/lib/zep-air/store" \
@@ -677,6 +681,17 @@ kill $CLIENT_PID 2>/dev/null || true
 pkill -f "za-client-1.*cron" 2>/dev/null || true
 
 ###############################################################################
+# 8d. Start client-2 cron daemon (3 active WS connections)
+###############################################################################
+echo -e "${CYAN}=== Step 8d: Client-2 cron daemon ===${NC}"
+
+nohup sudo -u za-client-2 sh -c "\"$ZEP\" --db \"$CLIENT2_DB\" cron --daemon --interval 5 2> /tmp/zep-za-client-2.log" </dev/null >/dev/null 2>&1 &
+CLIENT2_PID=$!
+disown $CLIENT2_PID 2>/dev/null || true
+echo "  Client-2 cron daemon started (PID $CLIENT2_PID)"
+sleep 2
+
+###############################################################################
 # 9. Dump full server log for debugging
 ###############################################################################
 echo -e "${CYAN}=== Step 9: Discovery+scheduler+pull log entries ===${NC}"
@@ -736,7 +751,8 @@ fi
 echo -e "${CYAN}=== Step 11: Compression + buffering verification ===${NC}"
 
 # Verify push compression was used on master
-push_count=$(grep -c "push_send.*zstd -c -1" /tmp/zep-za-master.log 2>/dev/null || echo 0)
+push_count=$(grep -c "push_send.*zstd -c -1" /tmp/zep-za-master.log 2>/dev/null)
+push_count=${push_count:-0}
 if [[ "$push_count" -ge 1 ]]; then
     ok "push_zip_cmd (zstd -c -1) used: $push_count push_send events"
 else
@@ -744,7 +760,8 @@ else
 fi
 
 # Verify pull compression was used on client
-recv_count=$(grep -c "pull recv_cmd=zstd -d" /tmp/zep-za-client-1.log 2>/dev/null || echo 0)
+recv_count=$(grep -c "pull recv_cmd=zstd -d" /tmp/zep-za-client-1.log 2>/dev/null)
+recv_count=${recv_count:-0}
 if [[ "$recv_count" -ge 1 ]]; then
     ok "pull_unzip_cmd (zstd -d) used: $recv_count pull(s)"
 else
@@ -761,15 +778,26 @@ fi
 
 ###############################################################################
 # 12. Pipe tests — admin→server→node subprocess bridge
-# NOTE: Disabled pending ws_pipe_upgrade_handler fix in serve.c.
-# The pipe bridge currently kills the node WS thread, which causes MHD
-# to close the socketpair. The bridge then sends the pipe task to the
-# dead socket — the node never receives it. Requires rework to either
-# keep the socket alive or target the reconnected node.
 ###############################################################################
-# shellcheck disable=SC2317
-_pipe_tests_disabled() {
-echo -e "${CYAN}=== Step 12: Pipe tests (SKIPPED — bridge fix needed) ===${NC}"
+echo -e "${CYAN}=== Step 12: Pipe tests ===${NC}"
+
+# Wait for all background tasks to settle (rotation triggers new pushes)
+echo "  Waiting for background tasks to settle..."
+SETTLE_TIMEOUT=60
+elapsed=0
+while [[ $elapsed -lt $SETTLE_TIMEOUT ]]; do
+    pending=$($SUDO sqlite3 "$SERVER_DB" \
+        "SELECT COUNT(*) FROM snapshots WHERE (push_status='pending' OR push_status='resuming') AND direction='push';" 2>/dev/null || echo 0)
+    if [[ "$pending" -eq 0 ]]; then
+        echo "  All tasks settled after ${elapsed}s ($pending pending)"
+        break
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+done
+if [[ "$pending" -ne 0 ]]; then
+    echo "  WARNING: $pending tasks still pending after ${SETTLE_TIMEOUT}s"
+fi
 
 PIPE_ADM="--server https://master.zep.lan:$SERVER_PORT --cert $PKI/admin.crt --key $PKI/admin.key --ca $PKI/ca.crt"
 
@@ -790,13 +818,15 @@ fi
 echo -e "${CYAN}=== Step 12b: Pipe zfs send valid stream ===${NC}"
 last_snap=$($SUDO zfs list -t snap -o name -s creation za-master-pool/master 2>/dev/null | tail -1 | tr -d '[:space:]')
 if [ -n "$last_snap" ]; then
-    timeout 12s "$ADMIN" $PIPE_ADM pipe --node za-master "zfs send $last_snap" 2>/dev/null \
-        | $SUDO zstream dump -v >/dev/null 2>&1
+    tmp=$(mktemp)
+    timeout 30s "$ADMIN" $PIPE_ADM pipe --node za-master "zfs send $last_snap" 2>/dev/null > "$tmp" || true
+    $SUDO zstream dump -v < "$tmp" >/dev/null 2>&1
     if [[ $? -eq 0 ]]; then
         ok "pipe zfs send valid stream ($last_snap)"
     else
         bad "pipe zfs send stream invalid"
     fi
+    rm -f "$tmp"
 else
     bad "no snapshot found for pipe zfs send"
 fi
@@ -804,7 +834,7 @@ fi
 # Test 12c: Pipe pipeline — zfs list | zstd -c → zstd -d
 echo -e "${CYAN}=== Step 12c: Pipe send pipeline (zfs list | zstd -c) ===${NC}"
 out=$(timeout 12s "$ADMIN" $PIPE_ADM pipe --node za-master \
-    "zfs list -H -o name -t snap za-master-pool/master | zstd -c" 2>/dev/null | zstd -d 2>/dev/null)
+    "bash -c 'zfs list -H -o name -t snap za-master-pool/master | zstd -c'" 2>/dev/null | zstd -d 2>/dev/null)
 if echo "$out" | grep -q '@'; then
     ok "pipe send pipeline returned snapshots"
 else
@@ -812,20 +842,19 @@ else
 fi
 
 # Test 12d: Pipe recv pipeline — echo | zstd -c → zstd -d | head -c 5
+# Temporarily extend pipe_allow to include head
 echo -e "${CYAN}=== Step 12d: Pipe recv pipeline (zstd -d | head -c 5) ===${NC}"
 $ADMIN $PIPE_ADM config set pipe_allow "zfs,head" >/dev/null 2>&1
 sleep 1
 out=$(echo "hello world!" | zstd -c | timeout 12s "$ADMIN" $PIPE_ADM pipe --node za-master \
     "zstd -d | head -c 5" 2>/dev/null)
+# Restore pipe_allow to zfs only
 $ADMIN $PIPE_ADM config set pipe_allow zfs >/dev/null 2>&1
 if echo "$out" | grep -q "hello"; then
     ok "pipe recv pipeline returned 'hello'"
 else
     bad "pipe recv pipeline failed: got '$out'"
 fi
-}
-# Uncomment when pipe bridge fix is ready:
-# _pipe_tests_disabled
 
 ###############################################################################
 # Cleanup
