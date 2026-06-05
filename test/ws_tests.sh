@@ -62,7 +62,26 @@ cleanup() {
 cache_exists() { [[ -f "$CACHE_ARCHIVE" ]]; }
 
 warm_cache() {
-    echo "  (cache warm skipped)"
+    echo -e "${CYAN}=== Warming cache ===${NC}"
+    # Kill lingering zep processes
+    $SUDO cluster/cluster-ctl.sh --env "$ENV_FILE" stop 2>/dev/null || true
+    pkill -9 zep-air-serve 2>/dev/null || true
+    pkill -9 zep-air 2>/dev/null || true
+    sleep 1
+    # Export pools so loopback img files are not in use
+    for p in $ZFS_POOLS; do
+        zpool export "$p" 2>/dev/null || true
+    done
+    sleep 1
+    # Remove old archive, create fresh tar.xz
+    $SUDO rm -f "$CACHE_ARCHIVE"
+    $SUDO sh -c "cd / && tar -cJf $CACHE_ARCHIVE var/lib/zep-air/" 2>&1
+    echo "  Cache written: $CACHE_ARCHIVE ($(du -h "$CACHE_ARCHIVE" | cut -f1))"
+    # Re-import pools so the test can run against them
+    for p in $ZFS_POOLS; do
+        zpool import -d "$ZEP_BASE" "$p" 2>/dev/null || true
+    done
+    sleep 1
 }
 
 restore_cache() {
