@@ -374,6 +374,26 @@ static ssize_t ws_parse_frame(const unsigned char *buf, size_t buf_len,
     return (ssize_t)payload_len;
 }
 
+static size_t ws_build_frame_header(unsigned char *buf, size_t buf_size,
+                                     unsigned char opcode, size_t payload_len) {
+    size_t header_len = 2;
+    if (payload_len >= 126) header_len += payload_len < 65536 ? 2 : 8;
+    if (buf_size < header_len) return 0;
+    buf[0] = 0x80 | opcode;
+    if (payload_len < 126) {
+        buf[1] = (unsigned char)payload_len;
+    } else if (payload_len < 65536) {
+        buf[1] = 126;
+        buf[2] = (unsigned char)((payload_len >> 8) & 0xFF);
+        buf[3] = (unsigned char)(payload_len & 0xFF);
+    } else {
+        buf[1] = 127;
+        for (int i = 0; i < 8; i++)
+            buf[2 + i] = (unsigned char)((payload_len >> (56 - i * 8)) & 0xFF);
+    }
+    return header_len;
+}
+
 static size_t ws_build_frame(unsigned char *buf, size_t buf_size,
                               unsigned char opcode, const unsigned char *payload, size_t payload_len) {
     size_t header_len = 2;
@@ -1211,24 +1231,29 @@ static void *node_ws_thread(void *arg) {
             /* Pipe bridge active: forward all node frames to admin socket */
             if (nw->pipe_bridge_active) {
  zep_log_debug("ws: pipe fwd node->admin op=%02x plen=%zd\n", opcode, plen);
-                unsigned char fbuf[WS_SUBCHUNK + 14];
-                size_t flen = ws_build_frame(fbuf, sizeof(fbuf), opcode, out, (size_t)plen);
-                if (flen > 0 && nw->pipe_admin_fd >= 0) {
-                    ssize_t sent = 0;
-                    while ((size_t)sent < flen) {
-                        ssize_t n = send(nw->pipe_admin_fd, fbuf + sent, flen - (size_t)sent, MSG_NOSIGNAL);
-                        if (n <= 0) break;
-                        sent += n;
+                if (nw->pipe_admin_fd >= 0) {
+                    unsigned char hdr[14];
+                    size_t hlen = ws_build_frame_header(hdr, sizeof(hdr), opcode, (size_t)plen);
+                    send(nw->pipe_admin_fd, hdr, hlen, MSG_NOSIGNAL);
+                    if (plen > 0) {
+                        ssize_t sent = 0;
+                        while ((size_t)sent < (size_t)plen) {
+                            ssize_t n = send(nw->pipe_admin_fd, out + sent,
+                                             (size_t)plen - (size_t)sent, MSG_NOSIGNAL);
+                            if (n <= 0) break;
+                            sent += n;
+                        }
                     }
                 }
                 /* After EXIT frame, close pipe to admin so it exits cleanly */
                 if (opcode == WS_OP_EXIT) {
  zep_log_debug("ws: pipe got EXIT, sending CLOSE to admin fd=%d\n", nw->pipe_admin_fd);
-                    flen = ws_build_frame(fbuf, sizeof(fbuf), WS_OP_CLOSE, NULL, 0);
-                    if (flen > 0 && nw->pipe_admin_fd >= 0) {
+                    unsigned char cfbuf[14];
+                    size_t cflen = ws_build_frame(cfbuf, sizeof(cfbuf), WS_OP_CLOSE, NULL, 0);
+                    if (cflen > 0 && nw->pipe_admin_fd >= 0) {
                         ssize_t sent = 0;
-                        while ((size_t)sent < flen) {
-                            ssize_t n = send(nw->pipe_admin_fd, fbuf + sent, flen - (size_t)sent, MSG_NOSIGNAL);
+                        while ((size_t)sent < cflen) {
+                            ssize_t n = send(nw->pipe_admin_fd, cfbuf + sent, cflen - (size_t)sent, MSG_NOSIGNAL);
                             if (n <= 0) break;
                             sent += n;
                         }

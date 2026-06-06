@@ -1176,7 +1176,13 @@ process_text_frame:
                             int ws_flags = fcntl(ws_fd, F_GETFL, 0);
                             fcntl(ws_fd, F_SETFL, ws_flags | O_NONBLOCK);
 
-                            while (ws_alive && (child_stdout_open || child_stderr_open || pending_len > 0)) {
+                            unsigned char snd_buf[2][WS_NODE_FRAME_MAX + 14];
+                            size_t snd_len[2] = {0, 0};
+                            size_t snd_off[2] = {0, 0};
+                            int snd_active = -1;
+                            int snd_ready = -1;
+
+                            while (ws_alive && (child_stdout_open || child_stderr_open || pending_len > 0 || snd_active >= 0 || snd_ready >= 0)) {
                                 fd_set rfds, wfds;
                                 FD_ZERO(&rfds);
                                 FD_ZERO(&wfds);
@@ -1188,6 +1194,7 @@ process_text_frame:
                                     FD_SET(child_stdin, &wfds);
                                     if (child_stdin > maxfd) maxfd = child_stdin;
                                 }
+                                if (snd_active >= 0) { FD_SET(ws_fd, &wfds); if (ws_fd > maxfd) maxfd = ws_fd; }
 
                                 struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
                                 int sel = select(maxfd + 1, &rfds, &wfds, NULL, &tv);
@@ -1250,8 +1257,22 @@ process_text_frame:
                                     if (child_stdout_open && FD_ISSET(child_stdout, &rfds)) {
                                         ssize_t nr = read(child_stdout, out, WS_NODE_FRAME_MAX);
                                         if (nr > 0) {
-                                            if (ws_node_send_frame(conn, WS_NODE_OP_BIN, out, (size_t)nr) < 0)
-                                                ws_alive = 0;
+                                            int idx = -1;
+                                            for (int bi = 0; bi < 2; bi++)
+                                                if (bi != snd_active && bi != snd_ready) { idx = bi; break; }
+                                            if (idx >= 0) {
+                                                size_t blen = ws_node_build_frame(snd_buf[idx], sizeof(snd_buf[idx]),
+                                                    WS_NODE_OP_BIN, out, (size_t)nr);
+                                                snd_len[idx] = blen;
+                                                snd_off[idx] = 0;
+                                                if (snd_active < 0) snd_active = idx;
+                                                else snd_ready = idx;
+                                                zep_log_debug( "ws-node: pipe read stdout nr=%zd idx=%d active=%d ready=%d flen=%zu\n",
+                                                    nr, idx, snd_active, snd_ready, blen);
+                                            } else {
+                                                zep_log_debug( "ws-node: pipe read stdout nr=%zd SKIP (no free buf active=%d ready=%d)\n",
+                                                    nr, snd_active, snd_ready);
+                                            }
                                         } else if (nr <= 0) {
                                             ws_node_send_frame(conn, WS_NODE_OP_EOF, NULL, 0);
                                             close(child_stdout);
@@ -1268,6 +1289,31 @@ process_text_frame:
                                             ws_node_send_frame(conn, WS_NODE_OP_EOF, NULL, 0);
                                             close(child_stderr);
                                             child_stderr_open = 0;
+                                        }
+                                    }
+
+                                    /* Pipeline: send pending WS frame to server */
+                                    if (snd_active >= 0 && FD_ISSET(ws_fd, &wfds)) {
+                                        int remaining = (int)(snd_len[snd_active] - snd_off[snd_active]);
+                                        ssize_t nw = SSL_write(conn->ssl, snd_buf[snd_active] + snd_off[snd_active], remaining);
+                                        zep_log_debug( "ws-node: pipe snd idx=%d off=%zu len=%zu rem=%d nw=%zd err=%d\n",
+                                            snd_active, snd_off[snd_active], snd_len[snd_active], remaining, nw,
+                                            nw <= 0 ? SSL_get_error(conn->ssl, (int)nw) : 0);
+                                        if (nw > 0) {
+                                            snd_off[snd_active] += (size_t)nw;
+                                            if (snd_off[snd_active] >= snd_len[snd_active]) {
+                                                snd_off[snd_active] = 0;
+                                                snd_len[snd_active] = 0;
+                                                int prev = snd_active;
+                                                snd_active = snd_ready;
+                                                snd_ready = -1;
+                                                zep_log_debug( "ws-node: pipe snd done idx=%d promoted=%d→%d\n",
+                                                    prev, prev, snd_active);
+                                            }
+                                        } else if (nw <= 0) {
+                                            int ssl_err = SSL_get_error(conn->ssl, (int)nw);
+                                            if (ssl_err != SSL_ERROR_WANT_WRITE && ssl_err != SSL_ERROR_WANT_READ)
+                                                { zep_log( "ws-node: pipe snd SSL error %d, aborting\n", ssl_err); ws_alive = 0; break; }
                                         }
                                     }
                                 }

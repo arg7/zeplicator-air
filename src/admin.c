@@ -914,6 +914,7 @@ static int cmd_pipe(int argc, char *argv[]) {
             }
 
             if (FD_ISSET(wc->sock, &rfds) || ssl_pending) {
+                start_time = time(NULL);
                 ssize_t n = ws_recv_frame(wc, out, WS_SUBCHUNK, &ws_buf[0]);
                 if (n < 0) { ws_done = 1; break; }
                 unsigned char op = ws_buf[0] & 0x0F;

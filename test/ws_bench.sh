@@ -32,6 +32,14 @@ ADMIN="zep-air-admin"
 DATA_COUNT="${DATA_COUNT:-1024}"   # bs=1M blocks (1024 = 1GB)
 BENCH_TIMEOUT="${BENCH_TIMEOUT:-300}"
 
+# strace profiling (set PROFILE=1 to enable)
+PROFILE="${PROFILE:-0}"
+if [[ "$PROFILE" -eq 1 ]]; then
+    DATA_COUNT="${DATA_COUNT:-50}"      # 50MB for profiling
+    BENCH_TIMEOUT="${BENCH_TIMEOUT:-120}"
+fi
+STRACE_DIR="/tmp/strace-prof"
+
 pass=0; fail=0
 ok()  { echo -e "  ${GREEN}OK${NC}  $1"; pass=$((pass+1)); }
 bad() { echo -e "  ${RED}FAIL${NC} $1"; fail=$((fail+1)); }
@@ -167,26 +175,103 @@ DATA_SIZE_MB=$DATA_COUNT
 echo "  Streaming ${DATA_SIZE_MB} MB through WS pipe bridge..."
 echo "  Command: dd if=/dev/urandom bs=1M count=${DATA_COUNT} >/dev/null"
 
-START_TS=$(date +%s%N)
+# ── strace profiling ──
+if [[ "$PROFILE" -eq 1 ]]; then
+    NODE_PID=""
+    for i in $(seq 1 15); do
+        NODE_PID=$(ps -u za-master -o pid,comm 2>/dev/null | awk '$2=="zep-air" {print $1; exit}')
+        [[ -n "$NODE_PID" ]] && break
+        sleep 1
+    done
+    if [[ -z "$NODE_PID" ]]; then
+        echo "  ERROR: cannot find za-master zep-air PID"
+        cleanup; exit 1
+    fi
+    echo "  Profiling: node PID=$NODE_PID"
+    rm -rf "$STRACE_DIR"; mkdir -p "$STRACE_DIR"
 
-timeout "${BENCH_TIMEOUT}s" "$ADMIN" $PIPE_ADM pipe --node za-master \
-    "dd if=/dev/urandom bs=1M count=${DATA_COUNT}" 2>/dev/null >/dev/null
-EXIT_CODE=$?
+    $SUDO strace -c -T -o "$STRACE_DIR/node.out" -p "$NODE_PID" &
+    SN_PID=$!
+    sleep 1  # let strace attach settle
 
-END_TS=$(date +%s%N)
+    START_TS=$(date +%s%N)
+    timeout "${BENCH_TIMEOUT}s" strace -c -T -o "$STRACE_DIR/admin.out" \
+        "$ADMIN" $PIPE_ADM pipe --node za-master \
+        "dd if=/dev/urandom bs=1M count=${DATA_COUNT}" 2>/dev/null >/dev/null
+    EXIT_CODE=$?
+    END_TS=$(date +%s%N)
+
+    $SUDO kill $SN_PID 2>/dev/null
+    wait $SN_PID 2>/dev/null
+    sleep 1
+else
+    START_TS=$(date +%s%N)
+    timeout "${BENCH_TIMEOUT}s" "$ADMIN" $PIPE_ADM pipe --node za-master \
+        "dd if=/dev/urandom bs=1M count=${DATA_COUNT}" 2>/dev/null >/dev/null
+    EXIT_CODE=$?
+    END_TS=$(date +%s%N)
+fi
+
 ELAPSED_NS=$((END_TS - START_TS))
 ELAPSED_S=$(awk "BEGIN { printf \"%.3f\", $ELAPSED_NS / 1000000000 }")
 
 if [[ $EXIT_CODE -eq 0 ]]; then
     THROUGHPUT=$(awk "BEGIN { printf \"%.2f\", ${DATA_SIZE_MB} / $ELAPSED_S }")
     echo ""
-    echo -e "  ${GREEN}Throughput: ${THROUGHPUT} MB/s${NC}"
+    if [[ "$PROFILE" -eq 1 ]]; then
+        echo -e "  ${YELLOW}Profile throughput: ${THROUGHPUT} MB/s${NC} (strace overhead skews timing)"
+    else
+        echo -e "  ${GREEN}Throughput: ${THROUGHPUT} MB/s${NC}"
+    fi
     echo "  Data: ${DATA_SIZE_MB} MB in ${ELAPSED_S}s"
     ok "pipe benchmark completed"
 elif [[ $EXIT_CODE -eq 124 ]]; then
     bad "pipe benchmark timed out after ${BENCH_TIMEOUT}s"
 else
     bad "pipe benchmark failed (exit code $EXIT_CODE)"
+fi
+
+###############################################################################
+# 5. strace analysis (profile mode only)
+###############################################################################
+if [[ "$PROFILE" -eq 1 ]]; then
+    echo -e "${CYAN}=== Step 5: strace syscall analysis ===${NC}"
+
+    for which in node admin; do
+        f="$STRACE_DIR/$which.out"
+        [[ -f "$f" ]] || continue
+        echo ""
+        echo -e "  ${YELLOW}─── $which ───${NC}"
+        awk '
+        BEGIN { in_pct = 0 }
+        /^---/ || /^% time/ { in_pct = 1; next }
+        in_pct == 0 { next }
+        /^-----/ { in_pct = 0; if (NR>1) exit; next }
+        {
+            time_pct = $1
+            seconds = $2
+            calls = $4
+            syscall = $6
+            if (syscall == "total" && time_pct == "100.00" && calls == "") next
+            printf "    %-5s %6s  %10s  %-15s\n", time_pct"%", calls, seconds, syscall
+        }' "$f"
+    done
+
+    echo ""
+    echo "  strace files: $STRACE_DIR/{node,admin}.out"
+    echo ""
+    echo -e "${YELLOW}=== Key metrics ===${NC}"
+    for which in node admin; do
+        f="$STRACE_DIR/$which.out"
+        [[ -f "$f" ]] || continue
+        total_calls=$(awk '/^100.00/ {print $5}' "$f")
+        reads=$(awk '$6=="read" {print $4; exit}' "$f")
+        writes=$(awk '$6=="write" {print $4; exit}' "$f")
+        sends=$(awk '$6=="sendto" {print $4; exit}' "$f")
+        recvs=$(awk '$6=="recvfrom" {print $4; exit}' "$f")
+        selects=$(awk '$6=="select" {print $4; exit}' "$f")
+        echo -e "  ${YELLOW}$which${NC}: total=${total_calls} calls  read=${reads:-0} write=${writes:-0} sendto=${sends:-0} recvfrom=${recvs:-0} select=${selects:-0}"
+    done
 fi
 
 ###############################################################################
